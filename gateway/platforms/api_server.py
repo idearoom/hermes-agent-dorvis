@@ -24,6 +24,7 @@ Requires:
 """
 
 import asyncio
+import base64
 import hashlib
 import hmac
 import json
@@ -60,6 +61,16 @@ MAX_REQUEST_BYTES = 1_000_000  # 1 MB default limit for POST bodies
 CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 30.0
 MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
 MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
+_METADATA_STRING_LIMITS = {
+    "email": 320,
+    "name": 200,
+    "uid": 200,
+    "id": 200,
+    "thread_id": 200,
+    "source": 100,
+    "environment": 100,
+    "type": 100,
+}
 
 
 def _normalize_chat_content(
@@ -118,6 +129,78 @@ def _normalize_chat_content(
         return result[:MAX_NORMALIZED_TEXT_LENGTH] if len(result) > MAX_NORMALIZED_TEXT_LENGTH else result
     except Exception:
         return ""
+
+
+def _clean_metadata_string(value: Any, *, limit: int = 1000) -> str:
+    text = str(value)
+    text = "".join(ch for ch in text if (ord(ch) >= 32 and ord(ch) != 127))
+    return text[:limit]
+
+
+def _sanitize_metadata_value(value: Any, *, key: str = "") -> Any:
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    if isinstance(value, str):
+        return _clean_metadata_string(value, limit=_METADATA_STRING_LIMITS.get(key, 1000))
+    if isinstance(value, list):
+        cleaned = []
+        for item in value[:100]:
+            sanitized = _sanitize_metadata_value(item)
+            if sanitized is not None:
+                cleaned.append(sanitized)
+        return cleaned
+    if isinstance(value, dict):
+        cleaned: Dict[str, Any] = {}
+        for raw_key, raw_value in list(value.items())[:100]:
+            if not isinstance(raw_key, str):
+                continue
+            clean_key = _clean_metadata_string(raw_key, limit=100)
+            if not clean_key:
+                continue
+            sanitized = _sanitize_metadata_value(raw_value, key=clean_key)
+            if sanitized is not None:
+                cleaned[clean_key] = sanitized
+        return cleaned
+    try:
+        json.dumps(value)
+        return value
+    except (TypeError, ValueError):
+        return None
+
+
+def _sanitize_request_metadata(raw: Any) -> Dict[str, Any]:
+    if not isinstance(raw, dict):
+        return {}
+    metadata = _sanitize_metadata_value(raw)
+    if not isinstance(metadata, dict):
+        return {}
+
+    try:
+        json.dumps(metadata)
+    except (TypeError, ValueError):
+        return {}
+    return metadata
+
+
+def _decode_metadata_header(value: str) -> Dict[str, Any]:
+    if not value:
+        return {}
+    try:
+        raw = value.strip()
+        padding = "=" * (-len(raw) % 4)
+        decoded = base64.urlsafe_b64decode((raw + padding).encode("ascii"))
+        return json.loads(decoded.decode("utf-8"))
+    except Exception:
+        logger.debug("Invalid X-Hermes-Metadata header ignored")
+        return {}
+
+
+def _extract_request_metadata(request: "web.Request", body: Dict[str, Any]) -> Dict[str, Any]:
+    raw = body.get("metadata")
+    if raw is None:
+        header = request.headers.get("X-Hermes-Metadata", "")
+        raw = _decode_metadata_header(header) if header else {}
+    return _sanitize_request_metadata(raw)
 
 
 # Content part type aliases used by the OpenAI Chat Completions and Responses
@@ -713,6 +796,7 @@ class APIServerAdapter(BasePlatformAdapter):
         self,
         ephemeral_system_prompt: Optional[str] = None,
         session_id: Optional[str] = None,
+        request_metadata: Optional[Dict[str, Any]] = None,
         stream_delta_callback=None,
         tool_progress_callback=None,
         tool_start_callback=None,
@@ -743,6 +827,10 @@ class APIServerAdapter(BasePlatformAdapter):
         from gateway.run import GatewayRunner
         fallback_model = GatewayRunner._load_fallback_model()
 
+        metadata = request_metadata or {}
+        caller = metadata.get("caller") if isinstance(metadata.get("caller"), dict) else {}
+        chat = metadata.get("chat") if isinstance(metadata.get("chat"), dict) else {}
+
         agent = AIAgent(
             model=model,
             **runtime_kwargs,
@@ -759,6 +847,13 @@ class APIServerAdapter(BasePlatformAdapter):
             tool_complete_callback=tool_complete_callback,
             session_db=self._ensure_session_db(),
             fallback_model=fallback_model,
+            user_id=str(caller.get("uid") or ""),
+            user_name=str(caller.get("name") or caller.get("email") or ""),
+            chat_id=str(chat.get("id") or ""),
+            chat_name=str(chat.get("name") or ""),
+            chat_type=str(chat.get("type") or ("web" if caller or chat else "")),
+            thread_id=str(chat.get("thread_id") or ""),
+            request_metadata=metadata,
         )
         return agent
 
@@ -1768,6 +1863,7 @@ class APIServerAdapter(BasePlatformAdapter):
         previous_response_id = body.get("previous_response_id")
         conversation = body.get("conversation")
         store = body.get("store", True)
+        request_metadata = _extract_request_metadata(request, body)
 
         # conversation and previous_response_id are mutually exclusive
         if conversation and previous_response_id:
@@ -1902,6 +1998,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 tool_start_callback=_on_tool_start,
                 tool_complete_callback=_on_tool_complete,
                 agent_ref=agent_ref,
+                request_metadata=request_metadata,
             ))
 
             response_id = f"resp_{uuid.uuid4().hex[:28]}"
@@ -1930,13 +2027,16 @@ class APIServerAdapter(BasePlatformAdapter):
                 conversation_history=conversation_history,
                 ephemeral_system_prompt=instructions,
                 session_id=session_id,
+                request_metadata=request_metadata,
             )
 
         idempotency_key = request.headers.get("Idempotency-Key")
         if idempotency_key:
+            fingerprint_body = dict(body)
+            fingerprint_body["metadata"] = request_metadata
             fp = _make_request_fingerprint(
-                body,
-                keys=["input", "instructions", "previous_response_id", "conversation", "model", "tools"],
+                fingerprint_body,
+                keys=["input", "instructions", "previous_response_id", "conversation", "model", "tools", "metadata"],
             )
             try:
                 result, usage = await _idem_cache.get_or_set(idempotency_key, fp, _compute_response)
@@ -2326,6 +2426,7 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_start_callback=None,
         tool_complete_callback=None,
         agent_ref: Optional[list] = None,
+        request_metadata: Optional[Dict[str, Any]] = None,
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -2348,6 +2449,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 tool_progress_callback=tool_progress_callback,
                 tool_start_callback=tool_start_callback,
                 tool_complete_callback=tool_complete_callback,
+                request_metadata=request_metadata,
             )
             if agent_ref is not None:
                 agent_ref[0] = agent

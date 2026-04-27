@@ -948,6 +948,7 @@ class AIAgent:
         checkpoints_enabled: bool = False,
         checkpoint_max_snapshots: int = 50,
         pass_session_id: bool = False,
+        request_metadata: Dict[str, Any] = None,
     ):
         """
         Initialize the AI Agent.
@@ -1013,6 +1014,7 @@ class AIAgent:
         self._chat_name = chat_name
         self._chat_type = chat_type
         self._thread_id = thread_id
+        self._request_metadata = dict(request_metadata or {})
         self._gateway_session_key = gateway_session_key  # Stable per-chat key (e.g. agent:main:telegram:dm:123)
         # Pluggable print function — CLI replaces this with _cprint so that
         # raw ANSI status lines are routed through prompt_toolkit's renderer
@@ -1633,7 +1635,7 @@ class AIAgent:
                         "reasoning_config": reasoning_config,
                         "max_tokens": max_tokens,
                     },
-                    user_id=None,
+                    user_id=self._user_id or None,
                     parent_session_id=self._parent_session_id,
                 )
             except Exception as e:
@@ -9162,6 +9164,9 @@ class AIAgent:
             from hermes_cli.plugins import get_pre_tool_call_block_message
             block_message = get_pre_tool_call_block_message(
                 function_name, function_args, task_id=effective_task_id or "",
+                session_id=self.session_id or "",
+                tool_call_id=tool_call_id or "",
+                request_metadata=self._request_metadata,
             )
         except Exception:
             pass
@@ -9229,6 +9234,7 @@ class AIAgent:
                 session_id=self.session_id or "",
                 enabled_tools=list(self.valid_tool_names) if self.valid_tool_names else None,
                 skip_pre_tool_call_hook=True,
+                request_metadata=self._request_metadata,
             )
 
     @staticmethod
@@ -9622,6 +9628,9 @@ class AIAgent:
                 from hermes_cli.plugins import get_pre_tool_call_block_message
                 _block_msg = get_pre_tool_call_block_message(
                     function_name, function_args, task_id=effective_task_id or "",
+                    session_id=self.session_id or "",
+                    tool_call_id=getattr(tool_call, "id", "") or "",
+                    request_metadata=self._request_metadata,
                 )
             except Exception:
                 pass
@@ -9853,6 +9862,7 @@ class AIAgent:
                         session_id=self.session_id or "",
                         enabled_tools=list(self.valid_tool_names) if self.valid_tool_names else None,
                         skip_pre_tool_call_hook=True,
+                        request_metadata=self._request_metadata,
                     )
                     _spinner_result = function_result
                 except Exception as tool_error:
@@ -9873,6 +9883,7 @@ class AIAgent:
                         session_id=self.session_id or "",
                         enabled_tools=list(self.valid_tool_names) if self.valid_tool_names else None,
                         skip_pre_tool_call_hook=True,
+                        request_metadata=self._request_metadata,
                     )
                 except Exception as tool_error:
                     function_result = f"Error executing tool '{function_name}': {tool_error}"
@@ -10358,6 +10369,7 @@ class AIAgent:
                         session_id=self.session_id,
                         model=self.model,
                         platform=getattr(self, "platform", None) or "",
+                        request_metadata=self._request_metadata,
                     )
                 except Exception as exc:
                     logger.warning("on_session_start hook failed: %s", exc)
@@ -10463,6 +10475,7 @@ class AIAgent:
                 model=self.model,
                 platform=getattr(self, "platform", None) or "",
                 sender_id=getattr(self, "_user_id", None) or "",
+                request_metadata=self._request_metadata,
             )
             _ctx_parts: list[str] = []
             for r in _pre_results:
@@ -10914,6 +10927,7 @@ class AIAgent:
                             approx_input_tokens=approx_tokens,
                             request_char_count=total_chars,
                             max_tokens=self.max_tokens,
+                            request_metadata=self._request_metadata,
                         )
                     except Exception:
                         pass
@@ -12674,6 +12688,7 @@ class AIAgent:
                         usage=self._usage_summary_for_api_request_hook(response),
                         assistant_content_chars=len(_assistant_text),
                         assistant_tool_call_count=len(_assistant_tool_calls),
+                        request_metadata=self._request_metadata,
                     )
                 except Exception:
                     pass
@@ -13539,6 +13554,7 @@ class AIAgent:
                     conversation_history=list(messages),
                     model=self.model,
                     platform=getattr(self, "platform", None) or "",
+                    request_metadata=self._request_metadata,
                 )
             except Exception as exc:
                 logger.warning("post_llm_call hook failed: %s", exc)
@@ -13640,6 +13656,7 @@ class AIAgent:
                 interrupted=interrupted,
                 model=self.model,
                 platform=getattr(self, "platform", None) or "",
+                request_metadata=self._request_metadata,
             )
         except Exception as exc:
             logger.warning("on_session_end hook failed: %s", exc)

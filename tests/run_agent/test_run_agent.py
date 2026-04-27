@@ -2230,6 +2230,12 @@ class TestRunConversation:
 
     def test_request_scoped_api_hooks_fire_for_each_api_call(self, agent):
         self._setup_agent(agent)
+        request_metadata = {
+            "source": "dorvis-web",
+            "caller": {"email": "user@example.com", "uid": "user-123"},
+            "chat": {"id": "chat-456", "type": "web"},
+        }
+        agent._request_metadata = request_metadata
         tc = _mock_tool_call(name="web_search", arguments="{}", call_id="c1")
         resp1 = _mock_response(content="", finish_reason="tool_calls", tool_calls=[tc])
         resp2 = _mock_response(content="Done searching", finish_reason="stop")
@@ -2258,6 +2264,8 @@ class TestRunConversation:
         assert [call["api_call_count"] for call in pre_request_calls] == [1, 2]
         assert [call["api_call_count"] for call in post_request_calls] == [1, 2]
         assert all(call["session_id"] == agent.session_id for call in pre_request_calls)
+        assert all(call["request_metadata"] == request_metadata for call in pre_request_calls)
+        assert all(call["request_metadata"] == request_metadata for call in post_request_calls)
         assert all("message_count" in c and "messages" not in c for c in pre_request_calls)
         assert all("usage" in c and "response" not in c for c in post_request_calls)
 
