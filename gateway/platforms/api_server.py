@@ -203,6 +203,34 @@ def _extract_request_metadata(request: "web.Request", body: Dict[str, Any]) -> D
     return _sanitize_request_metadata(raw)
 
 
+def _request_identity_prompt(metadata: Dict[str, Any]) -> str:
+    caller = metadata.get("caller") if isinstance(metadata.get("caller"), dict) else {}
+    if not caller:
+        return ""
+
+    name = _clean_metadata_string(caller.get("name") or "", limit=_METADATA_STRING_LIMITS["name"]).strip()
+    email = _clean_metadata_string(caller.get("email") or "", limit=_METADATA_STRING_LIMITS["email"]).strip()
+    if not name and not email:
+        return ""
+
+    identity = name if name else email
+    if name and email:
+        identity = f"{name} <{email}>"
+    return f"Current signed-in web user: {identity}."
+
+
+def _append_request_identity_prompt(
+    ephemeral_system_prompt: Optional[str],
+    metadata: Dict[str, Any],
+) -> Optional[str]:
+    identity_prompt = _request_identity_prompt(metadata)
+    if not identity_prompt:
+        return ephemeral_system_prompt or None
+    if ephemeral_system_prompt and ephemeral_system_prompt.strip():
+        return f"{ephemeral_system_prompt.strip()}\n\n{identity_prompt}"
+    return identity_prompt
+
+
 # Content part type aliases used by the OpenAI Chat Completions and Responses
 # APIs.  We accept both spellings on input and emit a single canonical internal
 # shape (``{"type": "text", ...}`` / ``{"type": "image_url", ...}``) that the
@@ -1875,6 +1903,7 @@ class APIServerAdapter(BasePlatformAdapter):
         session_id = stored_session_id or str(uuid.uuid4())
 
         stream = bool(body.get("stream", False))
+        effective_instructions = _append_request_identity_prompt(instructions, request_metadata)
         if stream:
             # Streaming branch — emit OpenAI Responses SSE events as the
             # agent runs so frontends can render text deltas and tool
@@ -1919,7 +1948,7 @@ class APIServerAdapter(BasePlatformAdapter):
             agent_task = asyncio.ensure_future(self._run_agent(
                 user_message=user_message,
                 conversation_history=conversation_history,
-                ephemeral_system_prompt=instructions,
+                ephemeral_system_prompt=effective_instructions,
                 session_id=session_id,
                 stream_delta_callback=_on_delta,
                 tool_progress_callback=_on_tool_progress,
@@ -1943,7 +1972,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 agent_ref=agent_ref,
                 conversation_history=conversation_history,
                 user_message=user_message,
-                instructions=instructions,
+                instructions=effective_instructions,
                 conversation=conversation,
                 store=store,
                 session_id=session_id,
@@ -1953,7 +1982,7 @@ class APIServerAdapter(BasePlatformAdapter):
             return await self._run_agent(
                 user_message=user_message,
                 conversation_history=conversation_history,
-                ephemeral_system_prompt=instructions,
+                ephemeral_system_prompt=effective_instructions,
                 session_id=session_id,
                 request_metadata=request_metadata,
             )
