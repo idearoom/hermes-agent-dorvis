@@ -28,6 +28,7 @@ from gateway.platforms.api_server import (
     APIServerAdapter,
     ResponseStore,
     _IdempotencyCache,
+    _append_request_identity_prompt,
     _CORS_HEADERS,
     _derive_chat_session_id,
     check_api_server_requirements,
@@ -1221,6 +1222,46 @@ class TestResponsesEndpoint:
             assert call_kwargs["request_metadata"]["chat"]["id"] == "chat-456"
 
     @pytest.mark.asyncio
+    async def test_response_metadata_adds_identity_to_ephemeral_prompt(self, adapter):
+        """Identity metadata becomes model-visible context without touching user text."""
+        metadata = {
+            "source": "dorvis-web",
+            "environment": "staging",
+            "caller": {
+                "email": "dalton@example.com",
+                "name": "Dalton Orvis",
+                "uid": "user-123",
+            },
+            "chat": {"id": "chat-456", "type": "web"},
+        }
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (
+                    {"final_response": "ok", "messages": [], "api_calls": 1},
+                    {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+                )
+                resp = await cli.post(
+                    "/v1/responses",
+                    json={
+                        "model": "hermes-agent",
+                        "input": "hello cleanly",
+                        "instructions": "Talk like a pirate.",
+                        "metadata": metadata,
+                    },
+                )
+
+            assert resp.status == 200
+            call_kwargs = mock_run.call_args.kwargs
+            assert call_kwargs["user_message"] == "hello cleanly"
+            assert "[caller:" not in call_kwargs["user_message"]
+            assert call_kwargs["ephemeral_system_prompt"] == (
+                "Talk like a pirate.\n\n"
+                "Current signed-in web user: Dalton Orvis <dalton@example.com>."
+            )
+
+    @pytest.mark.asyncio
     async def test_response_header_metadata_used_when_body_metadata_absent(self, adapter):
         metadata = {"caller": {"email": "header@example.com", "uid": "u1"}, "chat": {"id": "c1"}}
         encoded = base64.urlsafe_b64encode(json.dumps(metadata).encode()).decode().rstrip("=")
@@ -1367,6 +1408,24 @@ class TestResponsesEndpoint:
             assert resp.status == 200
             call_kwargs = mock_run.call_args.kwargs
             assert call_kwargs["ephemeral_system_prompt"] == "Talk like a pirate."
+
+    def test_request_identity_prompt_appends_to_instructions(self):
+        prompt = _append_request_identity_prompt(
+            "Talk like a pirate.",
+            {
+                "caller": {
+                    "email": "user@example.com",
+                    "name": "User Name",
+                    "uid": "user-123",
+                },
+                "chat": {"id": "chat-456", "type": "web"},
+            },
+        )
+
+        assert prompt == "Talk like a pirate.\n\nCurrent signed-in web user: User Name <user@example.com>."
+
+    def test_request_identity_prompt_omitted_without_identity(self):
+        assert _append_request_identity_prompt("Talk like a pirate.", {}) == "Talk like a pirate."
 
     @pytest.mark.asyncio
     async def test_previous_response_id_chaining(self, adapter):
