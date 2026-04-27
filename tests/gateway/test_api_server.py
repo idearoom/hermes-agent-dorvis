@@ -1040,6 +1040,7 @@ class TestResponsesEndpoint:
             assert resp.status == 200
             call_kwargs = mock_run.call_args.kwargs
             assert call_kwargs["user_message"] == "hello cleanly"
+            assert "[caller:" not in call_kwargs["user_message"]
             assert call_kwargs["request_metadata"]["caller"]["email"] == "user@example.com"
             assert call_kwargs["request_metadata"]["chat"]["id"] == "chat-456"
 
@@ -1084,6 +1085,36 @@ class TestResponsesEndpoint:
 
             assert resp.status == 200
             assert mock_run.call_args.kwargs["request_metadata"]["caller"]["email"] == "body@example.com"
+
+    @pytest.mark.asyncio
+    async def test_response_metadata_sanitizer_drops_deeply_nested_values(self, adapter):
+        deeply_nested = "leaf"
+        for _ in range(32):
+            deeply_nested = {"next": deeply_nested}
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (
+                    {"final_response": "ok", "messages": [], "api_calls": 1},
+                    {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+                )
+                resp = await cli.post(
+                    "/v1/responses",
+                    json={
+                        "input": "hello",
+                        "metadata": {
+                            "caller": {"email": "depth@example.com", "uid": "u1"},
+                            "deep": deeply_nested,
+                        },
+                    },
+                )
+
+            assert resp.status == 200
+            request_metadata = mock_run.call_args.kwargs["request_metadata"]
+            assert request_metadata["caller"]["email"] == "depth@example.com"
+            assert request_metadata["deep"]["next"]["next"]["next"]
+            assert "leaf" not in json.dumps(request_metadata)
 
     @pytest.mark.asyncio
     async def test_response_idempotency_fingerprint_includes_metadata(self, adapter):

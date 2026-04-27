@@ -135,7 +135,9 @@ def _clean_metadata_string(value: Any, *, limit: int = 1000) -> str:
     return text[:limit]
 
 
-def _sanitize_metadata_value(value: Any, *, key: str = "") -> Any:
+def _sanitize_metadata_value(value: Any, *, key: str = "", _depth: int = 0, _max_depth: int = 16) -> Any:
+    if _depth > _max_depth:
+        return None
     if value is None or isinstance(value, (bool, int, float)):
         return value
     if isinstance(value, str):
@@ -143,7 +145,7 @@ def _sanitize_metadata_value(value: Any, *, key: str = "") -> Any:
     if isinstance(value, list):
         cleaned = []
         for item in value[:100]:
-            sanitized = _sanitize_metadata_value(item)
+            sanitized = _sanitize_metadata_value(item, _depth=_depth + 1, _max_depth=_max_depth)
             if sanitized is not None:
                 cleaned.append(sanitized)
         return cleaned
@@ -155,7 +157,7 @@ def _sanitize_metadata_value(value: Any, *, key: str = "") -> Any:
             clean_key = _clean_metadata_string(raw_key, limit=100)
             if not clean_key:
                 continue
-            sanitized = _sanitize_metadata_value(raw_value, key=clean_key)
+            sanitized = _sanitize_metadata_value(raw_value, key=clean_key, _depth=_depth + 1, _max_depth=_max_depth)
             if sanitized is not None:
                 cleaned[clean_key] = sanitized
         return cleaned
