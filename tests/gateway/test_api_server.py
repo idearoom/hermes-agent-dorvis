@@ -13,6 +13,7 @@ Tests cover:
 """
 
 import asyncio
+import base64
 import json
 import time
 import uuid
@@ -1187,6 +1188,106 @@ class TestResponsesEndpoint:
             assert data["output"][0]["type"] == "message"
             assert data["output"][0]["content"][0]["type"] == "output_text"
             assert data["output"][0]["content"][0]["text"] == "Paris is the capital of France."
+
+    @pytest.mark.asyncio
+    async def test_response_body_metadata_reaches_agent_without_mutating_input(self, adapter):
+        """Responses metadata is first-class request state, not prompt text."""
+        mock_result = {"final_response": "ok", "messages": [], "api_calls": 1}
+        metadata = {
+            "source": "dorvis-web",
+            "environment": "staging",
+            "caller": {
+                "email": "user@example.com",
+                "name": "User Name",
+                "uid": "user-123",
+            },
+            "chat": {"id": "chat-456", "type": "web"},
+        }
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (mock_result, {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0})
+                resp = await cli.post(
+                    "/v1/responses",
+                    json={"model": "hermes-agent", "input": "hello cleanly", "metadata": metadata},
+                )
+
+            assert resp.status == 200
+            call_kwargs = mock_run.call_args.kwargs
+            assert call_kwargs["user_message"] == "hello cleanly"
+            assert call_kwargs["request_metadata"]["caller"]["email"] == "user@example.com"
+            assert call_kwargs["request_metadata"]["chat"]["id"] == "chat-456"
+
+    @pytest.mark.asyncio
+    async def test_response_header_metadata_used_when_body_metadata_absent(self, adapter):
+        metadata = {"caller": {"email": "header@example.com", "uid": "u1"}, "chat": {"id": "c1"}}
+        encoded = base64.urlsafe_b64encode(json.dumps(metadata).encode()).decode().rstrip("=")
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (
+                    {"final_response": "ok", "messages": [], "api_calls": 1},
+                    {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+                )
+                resp = await cli.post(
+                    "/v1/responses",
+                    json={"input": "hello"},
+                    headers={"X-Hermes-Metadata": encoded},
+                )
+
+            assert resp.status == 200
+            assert mock_run.call_args.kwargs["request_metadata"]["caller"]["email"] == "header@example.com"
+
+    @pytest.mark.asyncio
+    async def test_response_body_metadata_wins_over_header_metadata(self, adapter):
+        header_metadata = {"caller": {"email": "header@example.com", "uid": "u1"}}
+        encoded = base64.urlsafe_b64encode(json.dumps(header_metadata).encode()).decode().rstrip("=")
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (
+                    {"final_response": "ok", "messages": [], "api_calls": 1},
+                    {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+                )
+                resp = await cli.post(
+                    "/v1/responses",
+                    json={"input": "hello", "metadata": {"caller": {"email": "body@example.com", "uid": "u2"}}},
+                    headers={"X-Hermes-Metadata": encoded},
+                )
+
+            assert resp.status == 200
+            assert mock_run.call_args.kwargs["request_metadata"]["caller"]["email"] == "body@example.com"
+
+    @pytest.mark.asyncio
+    async def test_response_idempotency_fingerprint_includes_metadata(self, adapter):
+        app = _create_app(adapter)
+        key = f"metadata-idem-{uuid.uuid4()}"
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (
+                    {"final_response": "ok", "messages": [], "api_calls": 1},
+                    {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+                )
+                for email in ("one@example.com", "two@example.com"):
+                    resp = await cli.post(
+                        "/v1/responses",
+                        json={
+                            "input": "same prompt",
+                            "metadata": {"caller": {"email": email, "uid": email}},
+                        },
+                        headers={"Idempotency-Key": key},
+                    )
+                    assert resp.status == 200
+
+            assert mock_run.await_count == 2
+            assert [
+                call.kwargs["request_metadata"]["caller"]["email"]
+                for call in mock_run.await_args_list
+            ] == ["one@example.com", "two@example.com"]
 
     @pytest.mark.asyncio
     async def test_successful_response_with_array_input(self, adapter):

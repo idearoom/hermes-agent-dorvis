@@ -649,6 +649,7 @@ def handle_function_call(
     user_task: Optional[str] = None,
     enabled_tools: Optional[List[str]] = None,
     skip_pre_tool_call_hook: bool = False,
+    request_metadata: Optional[Dict[str, Any]] = None,
 ) -> str:
     """
     Main function call dispatcher that routes calls to the tool registry.
@@ -693,6 +694,7 @@ def handle_function_call(
                     task_id=task_id or "",
                     session_id=session_id or "",
                     tool_call_id=tool_call_id or "",
+                    request_metadata=request_metadata or {},
                 )
             except Exception:
                 pass
@@ -745,6 +747,7 @@ def handle_function_call(
                 session_id=session_id or "",
                 tool_call_id=tool_call_id or "",
                 duration_ms=duration_ms,
+                request_metadata=request_metadata or {},
             )
         except Exception:
             pass
