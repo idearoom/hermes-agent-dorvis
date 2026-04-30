@@ -3567,6 +3567,7 @@ class AIAgent:
                         api_key=_parent_runtime.get("api_key") or None,
                         credential_pool=getattr(self, "_credential_pool", None),
                         parent_session_id=self.session_id,
+                        request_metadata=self._request_metadata,
                         enabled_toolsets=["memory", "skills"],
                     )
                     review_agent._memory_write_origin = "background_review"
@@ -10531,12 +10532,64 @@ class AIAgent:
         # Use original_user_message (clean input) — user_message may contain
         # injected skill content that bloats / breaks provider queries.
         _ext_prefetch_cache = ""
+        _memory_prefetch_query = original_user_message if isinstance(original_user_message, str) else ""
+        _memory_context_observed = False
+        _memory_prefetch_error = ""
+        _memory_provider_name = ""
         if self._memory_manager:
             try:
-                _query = original_user_message if isinstance(original_user_message, str) else ""
-                _ext_prefetch_cache = self._memory_manager.prefetch_all(_query) or ""
+                _providers = [
+                    getattr(_p, "name", "")
+                    for _p in getattr(self._memory_manager, "providers", [])
+                    if getattr(_p, "name", "")
+                ]
+                _external = [_p for _p in _providers if _p != "builtin"]
+                _memory_provider_name = (_external or _providers or ["memory"])[0]
             except Exception:
-                pass
+                _memory_provider_name = "memory"
+
+        def _emit_memory_context_observation(status: str, injected_block: str = "") -> None:
+            nonlocal _memory_context_observed
+            if _memory_context_observed or not self._memory_manager:
+                return
+            _memory_context_observed = True
+            try:
+                from hermes_cli.plugins import invoke_hook as _invoke_hook
+                _estimated_tokens = 0
+                if injected_block:
+                    try:
+                        _estimated_tokens = estimate_messages_tokens_rough([
+                            {"role": "user", "content": injected_block}
+                        ])
+                    except Exception:
+                        _estimated_tokens = 0
+                _payload = {
+                    "session_id": self.session_id or "",
+                    "provider": _memory_provider_name or "memory",
+                    "source": "prefetch",
+                    "query": _memory_prefetch_query,
+                    "injected_block": injected_block,
+                    "status": status,
+                    "query_char_count": len(_memory_prefetch_query),
+                    "injected_char_count": len(injected_block),
+                    "estimated_injected_tokens": _estimated_tokens,
+                    "reused_for_all_iterations": True,
+                    "request_metadata": self._request_metadata,
+                }
+                if _memory_prefetch_error:
+                    _payload["error"] = _memory_prefetch_error
+                _invoke_hook("memory_context_injected", **_payload)
+            except Exception as exc:
+                logger.debug("memory_context_injected hook failed: %s", exc)
+
+        if self._memory_manager:
+            try:
+                _ext_prefetch_cache = self._memory_manager.prefetch_all(_memory_prefetch_query) or ""
+            except Exception as exc:
+                _memory_prefetch_error = str(exc)
+                _emit_memory_context_observation("error")
+            if not _ext_prefetch_cache and not _memory_prefetch_error:
+                _emit_memory_context_observation("empty")
 
         while (api_call_count < self.max_iterations and self.iteration_budget.remaining > 0) or self._budget_grace_call:
             # Reset per-turn checkpoint dedup so each iteration can take one snapshot
@@ -10682,6 +10735,9 @@ class AIAgent:
                         _fenced = build_memory_context_block(_ext_prefetch_cache)
                         if _fenced:
                             _injections.append(_fenced)
+                            _emit_memory_context_observation("injected", _fenced)
+                        else:
+                            _emit_memory_context_observation("empty")
                     if _plugin_user_context:
                         _injections.append(_plugin_user_context)
                     if _injections:

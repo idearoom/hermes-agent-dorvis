@@ -81,6 +81,7 @@ VALID_HOOKS: Set[str] = {
     "post_llm_call",
     "pre_api_request",
     "post_api_request",
+    "memory_context_injected",
     "on_session_start",
     "on_session_end",
     "on_session_finalize",
