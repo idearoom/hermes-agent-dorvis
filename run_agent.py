@@ -9261,7 +9261,24 @@ class AIAgent:
                 callback=self.clarify_callback,
             )
         elif function_name == "delegate_task":
-            return self._dispatch_delegate_task(function_args)
+            tool_start_time = time.time()
+            result = self._dispatch_delegate_task(function_args)
+            try:
+                from hermes_cli.plugins import invoke_hook as _invoke_hook
+                _invoke_hook(
+                    "post_tool_call",
+                    tool_name=function_name,
+                    args=function_args,
+                    result=result,
+                    task_id=effective_task_id or "",
+                    session_id=self.session_id or "",
+                    tool_call_id=tool_call_id or "",
+                    duration_ms=max(0, int((time.time() - tool_start_time) * 1000)),
+                    request_metadata=self._request_metadata,
+                )
+            except Exception:
+                pass
+            return result
         else:
             return handle_function_call(
                 function_name, function_args, effective_task_id,
@@ -9834,6 +9851,21 @@ class AIAgent:
                         spinner.stop(cute_msg)
                     elif self._should_emit_quiet_tool_messages():
                         self._vprint(f"  {cute_msg}")
+                try:
+                    from hermes_cli.plugins import invoke_hook as _invoke_hook
+                    _invoke_hook(
+                        "post_tool_call",
+                        tool_name=function_name,
+                        args=function_args,
+                        result=function_result,
+                        task_id=effective_task_id or "",
+                        session_id=self.session_id or "",
+                        tool_call_id=tool_call.id,
+                        duration_ms=max(0, int(tool_duration * 1000)),
+                        request_metadata=self._request_metadata,
+                    )
+                except Exception:
+                    pass
             elif self._context_engine_tool_names and function_name in self._context_engine_tool_names:
                 # Context engine tools (lcm_grep, lcm_describe, lcm_expand, etc.)
                 spinner = None
