@@ -156,6 +156,10 @@ _DEFAULT_PAYLOADS = {
         "tool_count": 12,
         "approx_input_tokens": 2048,
         "request_char_count": 8192,
+        "request_messages": [
+            {"role": "system", "content": "You are Hermes."},
+            {"role": "user", "content": "Hello"},
+        ],
         "max_tokens": 4096,
     },
     "post_api_request": {
@@ -172,6 +176,12 @@ _DEFAULT_PAYLOADS = {
         "message_count": 4,
         "response_model": "claude-sonnet-4-6",
         "usage": {"input_tokens": 2048, "output_tokens": 512},
+        "response_message": {
+            "role": "assistant",
+            "content": "Synthetic response",
+            "tool_calls": [],
+            "finish_reason": "stop",
+        },
         "assistant_content_chars": 1200,
         "assistant_tool_call_count": 0,
     },

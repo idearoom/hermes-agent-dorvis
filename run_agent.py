@@ -4127,6 +4127,36 @@ class AIAgent:
         summary["total_tokens"] = cu.total_tokens
         return summary
 
+    @staticmethod
+    def _json_safe_for_observability(value: Any) -> Any:
+        """Return a JSON-compatible copy for plugin hook payloads."""
+        try:
+            return json.loads(json.dumps(value, ensure_ascii=False, default=str))
+        except Exception:
+            return str(value)
+
+    @classmethod
+    def _tool_calls_for_observability(cls, tool_calls: Any) -> List[Dict[str, Any]]:
+        """Normalize provider tool-call objects into serializable dicts."""
+        normalized: List[Dict[str, Any]] = []
+        for tc in tool_calls or []:
+            if isinstance(tc, dict):
+                normalized.append(cls._json_safe_for_observability(tc))
+                continue
+
+            function = getattr(tc, "function", None)
+            item: Dict[str, Any] = {
+                "id": getattr(tc, "id", None),
+                "type": getattr(tc, "type", None),
+            }
+            if function is not None:
+                item["function"] = {
+                    "name": getattr(function, "name", None),
+                    "arguments": getattr(function, "arguments", None),
+                }
+            normalized.append(cls._json_safe_for_observability(item))
+        return normalized
+
     def _dump_api_request_debug(
         self,
         api_kwargs: Dict[str, Any],
@@ -11000,6 +11030,7 @@ class AIAgent:
                             tool_count=len(self.tools or []),
                             approx_input_tokens=approx_tokens,
                             request_char_count=total_chars,
+                            request_messages=self._json_safe_for_observability(api_messages),
                             max_tokens=self.max_tokens,
                             request_metadata=self._request_metadata,
                         )
@@ -12745,6 +12776,12 @@ class AIAgent:
                     from hermes_cli.plugins import invoke_hook as _invoke_hook
                     _assistant_tool_calls = getattr(assistant_message, "tool_calls", None) or []
                     _assistant_text = assistant_message.content or ""
+                    _assistant_observation = {
+                        "role": "assistant",
+                        "content": _assistant_text,
+                        "tool_calls": self._tool_calls_for_observability(_assistant_tool_calls),
+                        "finish_reason": finish_reason,
+                    }
                     _invoke_hook(
                         "post_api_request",
                         task_id=effective_task_id,
@@ -12760,6 +12797,7 @@ class AIAgent:
                         message_count=len(api_messages),
                         response_model=getattr(response, "model", None),
                         usage=self._usage_summary_for_api_request_hook(response),
+                        response_message=self._json_safe_for_observability(_assistant_observation),
                         assistant_content_chars=len(_assistant_text),
                         assistant_tool_call_count=len(_assistant_tool_calls),
                         request_metadata=self._request_metadata,
