@@ -9218,7 +9218,22 @@ class AIAgent:
                     pass
             return result
         elif self._memory_manager and self._memory_manager.has_tool(function_name):
-            return self._memory_manager.handle_tool_call(function_name, function_args)
+            result = self._memory_manager.handle_tool_call(function_name, function_args)
+            try:
+                from hermes_cli.plugins import invoke_hook as _invoke_hook
+                _invoke_hook(
+                    "post_tool_call",
+                    tool_name=function_name,
+                    args=function_args,
+                    result=result,
+                    task_id=effective_task_id or "",
+                    session_id=self.session_id or "",
+                    tool_call_id=tool_call_id or "",
+                    request_metadata=self._request_metadata,
+                )
+            except Exception:
+                pass
+            return result
         elif function_name == "clarify":
             from tools.clarify_tool import clarify_tool as _clarify_tool
             return _clarify_tool(
@@ -9842,6 +9857,20 @@ class AIAgent:
                     logger.error("memory_manager.handle_tool_call raised for %s: %s", function_name, tool_error, exc_info=True)
                 finally:
                     tool_duration = time.time() - tool_start_time
+                    try:
+                        from hermes_cli.plugins import invoke_hook as _invoke_hook
+                        _invoke_hook(
+                            "post_tool_call",
+                            tool_name=function_name,
+                            args=function_args,
+                            result=function_result,
+                            task_id=effective_task_id or "",
+                            session_id=self.session_id or "",
+                            tool_call_id=tool_call.id,
+                            request_metadata=self._request_metadata,
+                        )
+                    except Exception:
+                        pass
                     cute_msg = _get_cute_tool_message_impl(function_name, function_args, tool_duration, result=_mem_result)
                     if spinner:
                         spinner.stop(cute_msg)
