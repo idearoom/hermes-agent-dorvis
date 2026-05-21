@@ -25,6 +25,7 @@ Requires:
 """
 
 import asyncio
+import base64
 import hashlib
 import hmac
 import json
@@ -61,6 +62,16 @@ MAX_REQUEST_BYTES = 10_000_000  # 10 MB — accommodates long agent conversation
 CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 30.0
 MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
 MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
+_METADATA_STRING_LIMITS = {
+    "email": 320,
+    "name": 200,
+    "uid": 200,
+    "id": 200,
+    "thread_id": 200,
+    "source": 100,
+    "environment": 100,
+    "type": 100,
+}
 
 
 def _coerce_port(value: Any, default: int = DEFAULT_PORT) -> int:
@@ -156,6 +167,108 @@ def _normalize_chat_content(
         return result[:MAX_NORMALIZED_TEXT_LENGTH] if len(result) > MAX_NORMALIZED_TEXT_LENGTH else result
     except Exception:
         return ""
+
+
+def _clean_metadata_string(value: Any, *, limit: int = 1000) -> str:
+    text = str(value)
+    text = "".join(ch for ch in text if (ord(ch) >= 32 and ord(ch) != 127))
+    return text[:limit]
+
+
+def _sanitize_metadata_value(value: Any, *, key: str = "", _depth: int = 0, _max_depth: int = 16) -> Any:
+    if _depth > _max_depth:
+        return None
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    if isinstance(value, str):
+        return _clean_metadata_string(value, limit=_METADATA_STRING_LIMITS.get(key, 1000))
+    if isinstance(value, list):
+        cleaned = []
+        for item in value[:100]:
+            sanitized = _sanitize_metadata_value(item, _depth=_depth + 1, _max_depth=_max_depth)
+            if sanitized is not None:
+                cleaned.append(sanitized)
+        return cleaned
+    if isinstance(value, dict):
+        cleaned: Dict[str, Any] = {}
+        for raw_key, raw_value in list(value.items())[:100]:
+            if not isinstance(raw_key, str):
+                continue
+            clean_key = _clean_metadata_string(raw_key, limit=100)
+            if not clean_key:
+                continue
+            sanitized = _sanitize_metadata_value(raw_value, key=clean_key, _depth=_depth + 1, _max_depth=_max_depth)
+            if sanitized is not None:
+                cleaned[clean_key] = sanitized
+        return cleaned
+    try:
+        json.dumps(value)
+        return value
+    except (TypeError, ValueError):
+        return None
+
+
+def _sanitize_request_metadata(raw: Any) -> Dict[str, Any]:
+    if not isinstance(raw, dict):
+        return {}
+    metadata = _sanitize_metadata_value(raw)
+    if not isinstance(metadata, dict):
+        return {}
+
+    try:
+        json.dumps(metadata)
+    except (TypeError, ValueError):
+        return {}
+    return metadata
+
+
+def _decode_metadata_header(value: str) -> Dict[str, Any]:
+    if not value:
+        return {}
+    try:
+        raw = value.strip()
+        padding = "=" * (-len(raw) % 4)
+        decoded = base64.urlsafe_b64decode((raw + padding).encode("ascii"))
+        return json.loads(decoded.decode("utf-8"))
+    except Exception:
+        logger.debug("Invalid X-Hermes-Metadata header ignored")
+        return {}
+
+
+def _extract_request_metadata(request: "web.Request", body: Dict[str, Any]) -> Dict[str, Any]:
+    raw = body.get("metadata")
+    if raw is None:
+        header = request.headers.get("X-Hermes-Metadata", "")
+        raw = _decode_metadata_header(header) if header else {}
+    return _sanitize_request_metadata(raw)
+
+
+def _request_identity_prompt(metadata: Dict[str, Any]) -> str:
+    caller = metadata.get("caller") if isinstance(metadata.get("caller"), dict) else {}
+    if not caller:
+        return ""
+
+    name = _clean_metadata_string(caller.get("name") or "", limit=_METADATA_STRING_LIMITS["name"]).strip()
+    email = _clean_metadata_string(caller.get("email") or "", limit=_METADATA_STRING_LIMITS["email"]).strip()
+    if not name and not email:
+        return ""
+
+    identity = name if name else email
+    if name and email:
+        identity = f"{name} <{email}>"
+    return f"Current signed-in web user: {identity}."
+
+
+def _append_request_identity_prompt(
+    ephemeral_system_prompt: Optional[str],
+    metadata: Dict[str, Any],
+) -> Optional[str]:
+    identity_prompt = _request_identity_prompt(metadata)
+    if not identity_prompt:
+        return ephemeral_system_prompt or None
+    if ephemeral_system_prompt and ephemeral_system_prompt.strip():
+        return f"{ephemeral_system_prompt.strip()}\n\n{identity_prompt}"
+    return identity_prompt
 
 
 # Content part type aliases used by the OpenAI Chat Completions and Responses
@@ -852,6 +965,7 @@ class APIServerAdapter(BasePlatformAdapter):
         self,
         ephemeral_system_prompt: Optional[str] = None,
         session_id: Optional[str] = None,
+        request_metadata: Optional[Dict[str, Any]] = None,
         stream_delta_callback=None,
         tool_progress_callback=None,
         tool_start_callback=None,
@@ -890,6 +1004,10 @@ class APIServerAdapter(BasePlatformAdapter):
         # same fallback behaviour as Telegram/Discord/Slack (fixes #4954).
         fallback_model = GatewayRunner._load_fallback_model()
 
+        metadata = request_metadata or {}
+        caller = metadata.get("caller") if isinstance(metadata.get("caller"), dict) else {}
+        chat = metadata.get("chat") if isinstance(metadata.get("chat"), dict) else {}
+
         agent = AIAgent(
             model=model,
             **runtime_kwargs,
@@ -908,6 +1026,13 @@ class APIServerAdapter(BasePlatformAdapter):
             fallback_model=fallback_model,
             reasoning_config=reasoning_config,
             gateway_session_key=gateway_session_key,
+            user_id=str(caller.get("uid") or ""),
+            user_name=str(caller.get("name") or caller.get("email") or ""),
+            chat_id=str(chat.get("id") or ""),
+            chat_name=str(chat.get("name") or ""),
+            chat_type=str(chat.get("type") or ("web" if caller or chat else "")),
+            thread_id=str(chat.get("thread_id") or ""),
+            request_metadata=metadata,
         )
         return agent
 
@@ -2117,6 +2242,7 @@ class APIServerAdapter(BasePlatformAdapter):
         previous_response_id = body.get("previous_response_id")
         conversation = body.get("conversation")
         store = _coerce_request_bool(body.get("store"), default=True)
+        request_metadata = _extract_request_metadata(request, body)
 
         # conversation and previous_response_id are mutually exclusive
         if conversation and previous_response_id:
@@ -2200,6 +2326,7 @@ class APIServerAdapter(BasePlatformAdapter):
         session_id = stored_session_id or str(uuid.uuid4())
 
         stream = _coerce_request_bool(body.get("stream"), default=False)
+        effective_instructions = _append_request_identity_prompt(instructions, request_metadata)
         if stream:
             # Streaming branch — emit OpenAI Responses SSE events as the
             # agent runs so frontends can render text deltas and tool
@@ -2244,13 +2371,14 @@ class APIServerAdapter(BasePlatformAdapter):
             agent_task = asyncio.ensure_future(self._run_agent(
                 user_message=user_message,
                 conversation_history=conversation_history,
-                ephemeral_system_prompt=instructions,
+                ephemeral_system_prompt=effective_instructions,
                 session_id=session_id,
                 stream_delta_callback=_on_delta,
                 tool_progress_callback=_on_tool_progress,
                 tool_start_callback=_on_tool_start,
                 tool_complete_callback=_on_tool_complete,
                 agent_ref=agent_ref,
+                request_metadata=request_metadata,
                 gateway_session_key=gateway_session_key,
             ))
             # Ensure SSE drain loops can terminate without relying on polling
@@ -2271,7 +2399,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 agent_ref=agent_ref,
                 conversation_history=conversation_history,
                 user_message=user_message,
-                instructions=instructions,
+                instructions=effective_instructions,
                 conversation=conversation,
                 store=store,
                 session_id=session_id,
@@ -2282,16 +2410,19 @@ class APIServerAdapter(BasePlatformAdapter):
             return await self._run_agent(
                 user_message=user_message,
                 conversation_history=conversation_history,
-                ephemeral_system_prompt=instructions,
+                ephemeral_system_prompt=effective_instructions,
                 session_id=session_id,
+                request_metadata=request_metadata,
                 gateway_session_key=gateway_session_key,
             )
 
         idempotency_key = request.headers.get("Idempotency-Key")
         if idempotency_key:
+            fingerprint_body = dict(body)
+            fingerprint_body["metadata"] = request_metadata
             fp = _make_request_fingerprint(
-                body,
-                keys=["input", "instructions", "previous_response_id", "conversation", "model", "tools"],
+                fingerprint_body,
+                keys=["input", "instructions", "previous_response_id", "conversation", "model", "tools", "metadata"],
             )
             try:
                 result, usage = await _idem_cache.get_or_set(idempotency_key, fp, _compute_response)
@@ -2742,6 +2873,7 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_start_callback=None,
         tool_complete_callback=None,
         agent_ref: Optional[list] = None,
+        request_metadata: Optional[Dict[str, Any]] = None,
         gateway_session_key: Optional[str] = None,
     ) -> tuple:
         """
@@ -2765,6 +2897,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 tool_progress_callback=tool_progress_callback,
                 tool_start_callback=tool_start_callback,
                 tool_complete_callback=tool_complete_callback,
+                request_metadata=request_metadata,
                 gateway_session_key=gateway_session_key,
             )
             if agent_ref is not None:

@@ -49,6 +49,23 @@ def _make_mock_parent(depth=0):
     parent.providers_order = None
     parent.provider_sort = None
     parent._session_db = None
+    parent.session_id = "parent-session"
+    parent._user_id = "user-uid"
+    parent._user_name = "User Name"
+    parent._chat_id = "chat-123"
+    parent._chat_name = "Test Chat"
+    parent._chat_type = "web"
+    parent._thread_id = None
+    parent._request_metadata = {
+        "source": "dorvis-web",
+        "environment": "staging",
+        "caller": {
+            "email": "user@example.com",
+            "name": "User Name",
+            "uid": "user-uid",
+        },
+        "chat": {"id": "chat-123", "type": "web"},
+    }
     parent._delegate_depth = depth
     parent._active_children = []
     parent._active_children_lock = threading.Lock()
@@ -581,6 +598,33 @@ class TestDelegateObservability(unittest.TestCase):
             result = json.loads(delegate_task(goal="Test error trace", parent_agent=parent))
             trace = result["results"][0]["tool_trace"]
             self.assertEqual(trace[0]["status"], "error")
+
+    def test_tool_trace_allows_null_error_field(self):
+        """Structured output with error=null is a successful tool result."""
+        parent = _make_mock_parent(depth=0)
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            mock_child.model = "claude-sonnet-4-6"
+            mock_child.session_prompt_tokens = 0
+            mock_child.session_completion_tokens = 0
+            mock_child.run_conversation.return_value = {
+                "final_response": "ok",
+                "completed": True,
+                "interrupted": False,
+                "api_calls": 1,
+                "messages": [
+                    {"role": "assistant", "tool_calls": [
+                        {"id": "tc_1", "function": {"name": "terminal", "arguments": '{"cmd": "true"}'}}
+                    ]},
+                    {"role": "tool", "tool_call_id": "tc_1", "content": '{"output":"ok","exit_code":0,"error":null}'},
+                ],
+            }
+            MockAgent.return_value = mock_child
+
+            result = json.loads(delegate_task(goal="Test ok trace", parent_agent=parent))
+            trace = result["results"][0]["tool_trace"]
+            self.assertEqual(trace[0]["status"], "ok")
 
     def test_parallel_tool_calls_paired_correctly(self):
         """Parallel tool calls should each get their own result via tool_call_id matching."""
@@ -1134,6 +1178,48 @@ class TestDelegationProviderIntegration(unittest.TestCase):
             self.assertEqual(kwargs["base_url"], "https://openrouter.ai/api/v1")
             self.assertEqual(kwargs["api_key"], "sk-or-delegation-key")
             self.assertEqual(kwargs["api_mode"], "chat_completions")
+
+    @patch("tools.delegate_tool._load_config")
+    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    def test_request_metadata_reaches_child_agent(self, mock_creds, mock_cfg):
+        """Subagent traces must inherit parent chat/user metadata."""
+        mock_cfg.return_value = {
+            "max_iterations": 45,
+            "model": "claude-sonnet-4-6",
+            "provider": "",
+        }
+        mock_creds.return_value = {
+            "model": "claude-sonnet-4-6",
+            "provider": None,
+            "base_url": None,
+            "api_key": None,
+            "api_mode": None,
+        }
+        parent = _make_mock_parent(depth=0)
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            mock_child.session_id = "child-session"
+            mock_child.run_conversation.return_value = {
+                "final_response": "done", "completed": True, "api_calls": 1
+            }
+            MockAgent.return_value = mock_child
+
+            raw = delegate_task(goal="Trace this child", parent_agent=parent)
+
+            _, kwargs = MockAgent.call_args
+            metadata = kwargs["request_metadata"]
+            self.assertEqual(metadata["caller"]["email"], "user@example.com")
+            self.assertEqual(metadata["chat"]["id"], "chat-123")
+            self.assertTrue(metadata["delegation"]["is_subagent"])
+            self.assertEqual(metadata["delegation"]["parent_session_id"], "parent-session")
+            self.assertEqual(metadata["delegation"]["task_index"], 0)
+            self.assertEqual(mock_child._request_metadata["delegation"]["child_session_id"], "child-session")
+
+            result = json.loads(raw)
+            entry = result["results"][0]
+            self.assertEqual(entry["child_session_id"], "child-session")
+            self.assertIn("subagent_id", entry)
 
     @patch("tools.delegate_tool._load_config")
     @patch("tools.delegate_tool._resolve_delegation_credentials")

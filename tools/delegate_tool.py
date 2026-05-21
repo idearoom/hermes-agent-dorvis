@@ -326,6 +326,50 @@ def _normalize_role(r: Optional[str]) -> str:
     return "leaf"
 
 
+def _string_attr(obj: Any, name: str) -> Optional[str]:
+    value = getattr(obj, name, None)
+    if isinstance(value, str) and value.strip():
+        return value
+    return None
+
+
+def _build_child_request_metadata(
+    parent_agent,
+    *,
+    subagent_id: str,
+    parent_subagent_id: Optional[str],
+    parent_session_id: Optional[str],
+    child_depth: int,
+    effective_role: str,
+    task_index: int,
+    task_count: int,
+    goal: str,
+) -> Dict[str, Any]:
+    """Copy parent request metadata and add subagent trace lineage."""
+    raw = getattr(parent_agent, "_request_metadata", None)
+    metadata: Dict[str, Any] = dict(raw) if isinstance(raw, dict) else {}
+    existing = metadata.get("delegation")
+    lineage: Dict[str, Any] = dict(existing) if isinstance(existing, dict) else {}
+    lineage.update(
+        {
+            "is_subagent": True,
+            "subagent_id": subagent_id,
+            "parent_subagent_id": parent_subagent_id,
+            "parent_session_id": parent_session_id,
+            "root_parent_session_id": (
+                lineage.get("root_parent_session_id") or parent_session_id
+            ),
+            "depth": child_depth,
+            "role": effective_role,
+            "task_index": task_index,
+            "task_count": task_count,
+            "goal_preview": (goal or "")[:200],
+        }
+    )
+    metadata["delegation"] = lineage
+    return metadata
+
+
 def _get_max_concurrent_children() -> int:
     """Read delegation.max_concurrent_children from config, falling back to
     DELEGATION_MAX_CONCURRENT_CHILDREN env var, then the default (3).
@@ -983,6 +1027,18 @@ def _build_child_agent(
 
     # Resolve the child's effective model early so it can ride on every event.
     effective_model_for_cb = model or getattr(parent_agent, "model", None)
+    parent_session_id = _string_attr(parent_agent, "session_id")
+    child_request_metadata = _build_child_request_metadata(
+        parent_agent,
+        subagent_id=subagent_id,
+        parent_subagent_id=parent_subagent_id,
+        parent_session_id=parent_session_id,
+        child_depth=child_depth,
+        effective_role=effective_role,
+        task_index=task_index,
+        task_count=task_count,
+        goal=goal,
+    )
 
     # Build progress callback to relay tool calls to parent display.
     # Identity kwargs thread the subagent_id through every emitted event so the
@@ -1121,12 +1177,18 @@ def _build_child_agent(
         ephemeral_system_prompt=child_prompt,
         log_prefix=f"[subagent-{task_index}]",
         platform=parent_agent.platform,
+        user_id=_string_attr(parent_agent, "_user_id"),
+        user_name=_string_attr(parent_agent, "_user_name"),
+        chat_id=_string_attr(parent_agent, "_chat_id"),
+        chat_name=_string_attr(parent_agent, "_chat_name"),
+        chat_type=_string_attr(parent_agent, "_chat_type"),
+        thread_id=_string_attr(parent_agent, "_thread_id"),
         skip_context_files=True,
         skip_memory=True,
         clarify_callback=None,
         thinking_callback=child_thinking_cb,
         session_db=getattr(parent_agent, "_session_db", None),
-        parent_session_id=getattr(parent_agent, "session_id", None),
+        parent_session_id=parent_session_id,
         providers_allowed=child_providers_allowed,
         providers_ignored=child_providers_ignored,
         providers_order=child_providers_order,
@@ -1134,7 +1196,12 @@ def _build_child_agent(
         openrouter_min_coding_score=child_openrouter_min_coding_score,
         tool_progress_callback=child_progress_cb,
         iteration_budget=None,  # fresh budget per subagent
+        request_metadata=child_request_metadata,
     )
+    child_session_id = _string_attr(child, "session_id")
+    if child_session_id:
+        child_request_metadata["delegation"]["child_session_id"] = child_session_id
+        child._request_metadata = dict(child_request_metadata)
     child._print_fn = getattr(parent_agent, "_print_fn", None)
     # Set delegation depth so children can't spawn grandchildren
     child._delegate_depth = child_depth
@@ -1687,6 +1754,8 @@ def _run_single_child(
             "summary": summary,
             "api_calls": api_calls,
             "duration_seconds": duration,
+            "child_session_id": _string_attr(child, "session_id"),
+            "subagent_id": _subagent_id,
             "model": _model if isinstance(_model, str) else None,
             "exit_reason": exit_reason,
             "tokens": {
@@ -1836,6 +1905,8 @@ def _run_single_child(
             "error": str(exc),
             "api_calls": 0,
             "duration_seconds": duration,
+            "child_session_id": _string_attr(child, "session_id"),
+            "subagent_id": _subagent_id,
             "_child_role": getattr(child, "_delegate_role", None),
         }
 
@@ -2271,7 +2342,10 @@ def delegate_task(
                 child_role=child_role,
                 child_summary=entry.get("summary"),
                 child_status=entry.get("status"),
+                child_session_id=entry.get("child_session_id"),
+                subagent_id=entry.get("subagent_id"),
                 duration_ms=int((entry.get("duration_seconds") or 0) * 1000),
+                request_metadata=getattr(parent_agent, "_request_metadata", None) or {},
             )
         except Exception:
             logger.debug("subagent_stop hook invocation failed", exc_info=True)

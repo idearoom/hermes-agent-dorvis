@@ -1499,7 +1499,12 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
         try:
             from hermes_cli.plugins import get_pre_tool_call_block_message
             block_message = get_pre_tool_call_block_message(
-                function_name, function_args, task_id=effective_task_id or "",
+                function_name,
+                function_args,
+                task_id=effective_task_id or "",
+                session_id=agent.session_id or "",
+                tool_call_id=tool_call_id or "",
+                request_metadata=getattr(agent, "_request_metadata", None) or {},
             )
         except Exception:
             pass
@@ -1556,7 +1561,22 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                 pass
         return result
     elif agent._memory_manager and agent._memory_manager.has_tool(function_name):
-        return agent._memory_manager.handle_tool_call(function_name, function_args)
+        result = agent._memory_manager.handle_tool_call(function_name, function_args)
+        try:
+            from hermes_cli.plugins import invoke_hook as _invoke_hook
+            _invoke_hook(
+                "post_tool_call",
+                tool_name=function_name,
+                args=function_args,
+                result=result,
+                task_id=effective_task_id or "",
+                session_id=agent.session_id or "",
+                tool_call_id=tool_call_id or "",
+                request_metadata=getattr(agent, "_request_metadata", None) or {},
+            )
+        except Exception:
+            pass
+        return result
     elif function_name == "clarify":
         from tools.clarify_tool import clarify_tool as _clarify_tool
         return _clarify_tool(
@@ -1565,7 +1585,24 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
             callback=agent.clarify_callback,
         )
     elif function_name == "delegate_task":
-        return agent._dispatch_delegate_task(function_args)
+        tool_start_time = time.time()
+        result = agent._dispatch_delegate_task(function_args)
+        try:
+            from hermes_cli.plugins import invoke_hook as _invoke_hook
+            _invoke_hook(
+                "post_tool_call",
+                tool_name=function_name,
+                args=function_args,
+                result=result,
+                task_id=effective_task_id or "",
+                session_id=agent.session_id or "",
+                tool_call_id=tool_call_id or "",
+                duration_ms=max(0, int((time.time() - tool_start_time) * 1000)),
+                request_metadata=getattr(agent, "_request_metadata", None) or {},
+            )
+        except Exception:
+            pass
+        return result
     else:
         return _ra().handle_function_call(
             function_name, function_args, effective_task_id,
@@ -1573,6 +1610,7 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
             session_id=agent.session_id or "",
             enabled_tools=list(agent.valid_tool_names) if agent.valid_tool_names else None,
             skip_pre_tool_call_hook=True,
+            request_metadata=getattr(agent, "_request_metadata", None) or {},
         )
 
 
