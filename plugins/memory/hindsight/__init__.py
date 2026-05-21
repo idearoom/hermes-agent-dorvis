@@ -1467,6 +1467,30 @@ class HindsightMemoryProvider(MemoryProvider):
             metadata["agent_identity"] = self._agent_identity
         return metadata
 
+    def _build_lineage_tags(
+        self,
+        *,
+        session_id: str | None = None,
+        parent_session_id: str | None = None,
+        chat_id: str | None = None,
+        chat_type: str | None = None,
+    ) -> list[str]:
+        tags: list[str] = []
+        resolved_session_id = str(self._session_id if session_id is None else session_id).strip()
+        resolved_parent_session_id = str(
+            self._parent_session_id if parent_session_id is None else parent_session_id
+        ).strip()
+        resolved_chat_id = str(self._chat_id if chat_id is None else chat_id).strip()
+        resolved_chat_type = str(self._chat_type if chat_type is None else chat_type).strip().lower()
+
+        if resolved_session_id:
+            tags.append(f"session:{resolved_session_id}")
+        if resolved_parent_session_id:
+            tags.append(f"parent:{resolved_parent_session_id}")
+        if resolved_chat_id and resolved_chat_type == "web":
+            tags.append(f"chat:{resolved_chat_id}")
+        return tags
+
     def _build_retain_kwargs(
         self,
         content: str,
@@ -1543,11 +1567,7 @@ class HindsightMemoryProvider(MemoryProvider):
                      sum(len(t) for t in turns_to_retain))
         content = "[" + ",".join(turns_to_retain) + "]"
 
-        lineage_tags: list[str] = []
-        if self._session_id:
-            lineage_tags.append(f"session:{self._session_id}")
-        if self._parent_session_id:
-            lineage_tags.append(f"parent:{self._parent_session_id}")
+        lineage_tags = self._build_lineage_tags()
 
         # Snapshot the state needed for the retain. The writer may run after
         # _session_turns / _turn_index are mutated by a later sync_turn().
@@ -1714,16 +1734,19 @@ class HindsightMemoryProvider(MemoryProvider):
             old_turns = list(self._session_turns)
             old_session_id = self._session_id
             old_parent_session_id = self._parent_session_id
+            old_chat_id = self._chat_id
+            old_chat_type = self._chat_type
             old_turn_index = self._turn_index
             old_metadata = self._build_metadata(
                 message_count=len(old_turns) * 2,
                 turn_index=old_turn_index,
             )
-            old_lineage_tags: list[str] = []
-            if old_session_id:
-                old_lineage_tags.append(f"session:{old_session_id}")
-            if old_parent_session_id:
-                old_lineage_tags.append(f"parent:{old_parent_session_id}")
+            old_lineage_tags = self._build_lineage_tags(
+                session_id=old_session_id,
+                parent_session_id=old_parent_session_id,
+                chat_id=old_chat_id,
+                chat_type=old_chat_type,
+            )
             old_content = "[" + ",".join(old_turns) + "]"
             # Resolve doc_id + update_mode against the OLD session BEFORE
             # we rotate _session_id, so the flush lands in the old
