@@ -139,6 +139,7 @@ VALID_HOOKS: Set[str] = {
     "pre_api_request",
     "post_api_request",
     "api_request_error",
+    "memory_context_injected",
     "on_session_start",
     "on_session_end",
     "on_session_finalize",
@@ -1766,6 +1767,7 @@ def get_pre_tool_call_block_message(
     turn_id: str = "",
     api_request_id: str = "",
     middleware_trace: Optional[List[Dict[str, Any]]] = None,
+    request_metadata: Optional[Dict[str, Any]] = None,
 ) -> Optional[str]:
     """Check ``pre_tool_call`` hooks for a blocking directive.
 
@@ -1793,6 +1795,7 @@ def get_pre_tool_call_block_message(
         turn_id=turn_id,
         api_request_id=api_request_id,
         middleware_trace=list(middleware_trace or []),
+        request_metadata=request_metadata or {},
     )
 
     for result in hook_results:

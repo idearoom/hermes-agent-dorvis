@@ -837,6 +837,7 @@ def _emit_post_tool_call_hook(
     error_type: Optional[str] = None,
     error_message: Optional[str] = None,
     middleware_trace: Optional[List[Dict[str, Any]]] = None,
+    request_metadata: Optional[Dict[str, Any]] = None,
 ) -> None:
     """Emit the ``post_tool_call`` observer hook.
 
@@ -868,6 +869,7 @@ def _emit_post_tool_call_hook(
             error_type=error_type,
             error_message=error_message,
             middleware_trace=list(middleware_trace or []),
+            request_metadata=request_metadata or {},
         )
     except Exception as _hook_err:
         logger.debug("post_tool_call hook error: %s", _hook_err)
@@ -888,6 +890,7 @@ def handle_function_call(
     tool_request_middleware_trace: Optional[List[Dict[str, Any]]] = None,
     enabled_toolsets: Optional[List[str]] = None,
     disabled_toolsets: Optional[List[str]] = None,
+    request_metadata: Optional[Dict[str, Any]] = None,
 ) -> str:
     """
     Main function call dispatcher that routes calls to the tool registry.
@@ -985,6 +988,8 @@ def handle_function_call(
                 task_id=task_id,
                 tool_call_id=tool_call_id,
                 session_id=session_id,
+                turn_id=turn_id,
+                api_request_id=api_request_id,
                 user_task=user_task,
                 enabled_tools=enabled_tools,
                 skip_pre_tool_call_hook=skip_pre_tool_call_hook,
@@ -992,6 +997,7 @@ def handle_function_call(
                 tool_request_middleware_trace=list(_tool_middleware_trace),
                 enabled_toolsets=enabled_toolsets,
                 disabled_toolsets=disabled_toolsets,
+                request_metadata=request_metadata,
             )
 
     _tool_original_args = dict(function_args)
@@ -1041,6 +1047,7 @@ def handle_function_call(
                     turn_id=turn_id or "",
                     api_request_id=api_request_id or "",
                     middleware_trace=list(_tool_middleware_trace),
+                    request_metadata=request_metadata or {},
                 )
             except Exception as _hook_err:
                 logger.debug("pre_tool_call hook error: %s", _hook_err)
@@ -1060,6 +1067,7 @@ def handle_function_call(
                     error_type="plugin_block",
                     error_message=block_message,
                     middleware_trace=list(_tool_middleware_trace),
+                    request_metadata=request_metadata or {},
                 )
                 return result
 
@@ -1156,6 +1164,7 @@ def handle_function_call(
             api_request_id=api_request_id,
             duration_ms=duration_ms,
             middleware_trace=list(_tool_middleware_trace),
+            request_metadata=request_metadata or {},
         )
 
         # Generic tool-result canonicalization seam: plugins receive the
@@ -1184,6 +1193,7 @@ def handle_function_call(
                     status=status,
                     error_type=error_type,
                     error_message=error_message,
+                    request_metadata=request_metadata or {},
                 )
                 for hook_result in hook_results:
                     if isinstance(hook_result, str):

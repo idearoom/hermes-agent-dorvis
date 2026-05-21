@@ -59,6 +59,10 @@ class TurnContext:
     plugin_user_context: str = ""
     # External-memory prefetch result, reused across loop iterations.
     ext_prefetch_cache: str = ""
+    # Metadata for the optional memory_context_injected observer hook.
+    memory_prefetch_query: str = ""
+    memory_provider_name: str = "memory"
+    memory_prefetch_error: str = ""
 
 
 def build_turn_context(
@@ -328,6 +332,7 @@ def build_turn_context(
             model=agent.model,
             platform=getattr(agent, "platform", None) or "",
             sender_id=getattr(agent, "_user_id", None) or "",
+            request_metadata=getattr(agent, "_request_metadata", None) or {},
         )
         _ctx_parts: list[str] = []
         for r in _pre_results:
@@ -366,12 +371,25 @@ def build_turn_context(
 
     # External memory provider: prefetch once before the tool loop.
     ext_prefetch_cache = ""
+    memory_prefetch_query = original_user_message if isinstance(original_user_message, str) else ""
+    memory_provider_name = "memory"
+    memory_prefetch_error = ""
     if agent._memory_manager:
         try:
-            _query = original_user_message if isinstance(original_user_message, str) else ""
-            ext_prefetch_cache = agent._memory_manager.prefetch_all(_query) or ""
+            _providers = [
+                getattr(_p, "name", "")
+                for _p in getattr(agent._memory_manager, "providers", [])
+                if getattr(_p, "name", "")
+            ]
+            _external = [_p for _p in _providers if _p != "builtin"]
+            memory_provider_name = (_external or _providers or ["memory"])[0]
         except Exception:
-            pass
+            memory_provider_name = "memory"
+
+        try:
+            ext_prefetch_cache = agent._memory_manager.prefetch_all(memory_prefetch_query) or ""
+        except Exception as exc:
+            memory_prefetch_error = str(exc)
 
     return TurnContext(
         user_message=user_message,
@@ -385,4 +403,7 @@ def build_turn_context(
         should_review_memory=should_review_memory,
         plugin_user_context=plugin_user_context,
         ext_prefetch_cache=ext_prefetch_cache,
+        memory_prefetch_query=memory_prefetch_query,
+        memory_provider_name=memory_provider_name,
+        memory_prefetch_error=memory_prefetch_error,
     )

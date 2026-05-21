@@ -304,6 +304,7 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
             session_id=agent.session_id,
             model=agent.model,
             platform=getattr(agent, "platform", None) or "",
+            request_metadata=getattr(agent, "_request_metadata", None) or {},
         )
     except Exception as exc:
         logger.warning("on_session_start hook failed: %s", exc)
@@ -431,6 +432,50 @@ def run_conversation(
     _should_review_memory = _ctx.should_review_memory
     _plugin_user_context = _ctx.plugin_user_context
     _ext_prefetch_cache = _ctx.ext_prefetch_cache
+    _memory_prefetch_query = _ctx.memory_prefetch_query
+    _memory_provider_name = _ctx.memory_provider_name
+    _memory_prefetch_error = _ctx.memory_prefetch_error
+    _memory_context_observed = False
+
+    def _emit_memory_context_observation(status: str, injected_block: str = "") -> None:
+        nonlocal _memory_context_observed
+        if _memory_context_observed or not agent._memory_manager:
+            return
+        _memory_context_observed = True
+        try:
+            from hermes_cli.plugins import invoke_hook as _invoke_hook
+
+            _estimated_tokens = 0
+            if injected_block:
+                try:
+                    _estimated_tokens = estimate_messages_tokens_rough([
+                        {"role": "user", "content": injected_block}
+                    ])
+                except Exception:
+                    _estimated_tokens = 0
+            _payload = {
+                "session_id": agent.session_id or "",
+                "task_id": effective_task_id,
+                "turn_id": turn_id,
+                "provider": _memory_provider_name or "memory",
+                "source": "prefetch",
+                "query": _memory_prefetch_query,
+                "injected_block": injected_block,
+                "status": status,
+                "query_char_count": len(_memory_prefetch_query),
+                "injected_char_count": len(injected_block),
+                "estimated_injected_tokens": _estimated_tokens,
+                "reused_for_all_iterations": True,
+                "request_metadata": getattr(agent, "_request_metadata", None) or {},
+            }
+            if _memory_prefetch_error:
+                _payload["error"] = _memory_prefetch_error
+            _invoke_hook("memory_context_injected", **_payload)
+        except Exception as exc:
+            logger.debug("memory_context_injected hook failed: %s", exc)
+
+    if agent._memory_manager and not _ext_prefetch_cache:
+        _emit_memory_context_observation("error" if _memory_prefetch_error else "empty")
 
     # Main conversation loop counters (pure locals consumed by the loop below).
     api_call_count = 0
@@ -617,6 +662,7 @@ def run_conversation(
                 if _ext_prefetch_cache:
                     _fenced = build_memory_context_block(_ext_prefetch_cache)
                     if _fenced:
+                        _emit_memory_context_observation("injected", _fenced)
                         _injections.append(_fenced)
                 if _plugin_user_context:
                     _injections.append(_plugin_user_context)
@@ -948,6 +994,7 @@ def run_conversation(
                             started_at=api_start_time,
                             middleware_trace=list(_llm_middleware_trace),
                             request=_request_payload,
+                            request_metadata=getattr(agent, "_request_metadata", None) or {},
                         )
                 except Exception:
                     pass
@@ -3343,6 +3390,13 @@ def run_conversation(
                     )
                     _assistant_text = assistant_message.content or ""
                     _api_ended_at = api_start_time + api_duration
+                    _response_payload = agent._api_response_payload_for_hook(
+                        response,
+                        assistant_message,
+                        finish_reason=finish_reason,
+                    )
+                    _response_message = dict(_response_payload.get("assistant_message") or {})
+                    _response_message["finish_reason"] = finish_reason
                     _invoke_hook(
                         "post_api_request",
                         task_id=effective_task_id,
@@ -3361,15 +3415,13 @@ def run_conversation(
                         finish_reason=finish_reason,
                         message_count=len(api_messages),
                         response_model=getattr(response, "model", None),
-                        response=agent._api_response_payload_for_hook(
-                            response,
-                            assistant_message,
-                            finish_reason=finish_reason,
-                        ),
+                        response=_response_payload,
                         usage=agent._usage_summary_for_api_request_hook(response),
                         assistant_message=assistant_message,
+                        response_message=_response_message,
                         assistant_content_chars=len(_assistant_text),
                         assistant_tool_call_count=len(_assistant_tool_calls),
+                        request_metadata=getattr(agent, "_request_metadata", None) or {},
                     )
             except Exception:
                 pass

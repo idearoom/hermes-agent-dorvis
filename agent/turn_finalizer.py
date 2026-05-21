@@ -275,6 +275,7 @@ def finalize_turn(
                 session_id=agent.session_id or "",
                 model=agent.model,
                 platform=getattr(agent, "platform", None) or "",
+                request_metadata=getattr(agent, "_request_metadata", None) or {},
             )
             for _hook_result in _transform_results:
                 if isinstance(_hook_result, str) and _hook_result:
@@ -421,6 +422,7 @@ def finalize_turn(
             interrupted=interrupted,
             model=agent.model,
             platform=getattr(agent, "platform", None) or "",
+            request_metadata=getattr(agent, "_request_metadata", None) or {},
         )
     except Exception as exc:
         logger.warning("on_session_end hook failed: %s", exc)
