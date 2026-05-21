@@ -716,6 +716,41 @@ class TestSyncTurn:
         assert "session1" in item["tags"]
         assert "session:test-session" in item["tags"]
 
+    def test_sync_turn_adds_web_chat_tag(self, provider_with_config):
+        chat_id = "4dffcb7c-4747-40db-a4fb-9f36e5cef420"
+        p = provider_with_config()
+        p.initialize(
+            session_id="web-session",
+            platform="api_server",
+            chat_id=chat_id,
+            chat_type="web",
+        )
+        p._client = _make_mock_client()
+
+        p.sync_turn("hello", "hi")
+        p._retain_queue.join()
+
+        item = p._client.aretain_batch.call_args.kwargs["items"][0]
+        assert "session:web-session" in item["tags"]
+        assert f"chat:{chat_id}" in item["tags"]
+
+    def test_sync_turn_does_not_add_chat_tag_for_non_web_chat(self, provider_with_config):
+        p = provider_with_config()
+        p.initialize(
+            session_id="discord-session",
+            platform="discord",
+            chat_id="1485316232612941897",
+            chat_type="thread",
+        )
+        p._client = _make_mock_client()
+
+        p.sync_turn("hello", "hi")
+        p._retain_queue.join()
+
+        item = p._client.aretain_batch.call_args.kwargs["items"][0]
+        assert "session:discord-session" in item["tags"]
+        assert "chat:1485316232612941897" not in item["tags"]
+
     def test_sync_turn_uses_aretain_batch(self, provider):
         """sync_turn should use aretain_batch with retain_async."""
         provider.sync_turn("hello", "hi")
@@ -933,6 +968,25 @@ class TestShutdownRace:
 
 
 class TestSessionSwitchBufferFlush:
+    def test_buffered_web_turns_flush_with_chat_tag(self, provider_with_config):
+        chat_id = "4dffcb7c-4747-40db-a4fb-9f36e5cef420"
+        p = provider_with_config(retain_every_n_turns=3, retain_async=False)
+        p.initialize(
+            session_id="web-session",
+            platform="api_server",
+            chat_id=chat_id,
+            chat_type="web",
+        )
+        p._client = _make_mock_client()
+
+        p.sync_turn("turn1-user", "turn1-asst")
+        p.on_session_switch("new-sid", parent_session_id="web-session", reset=True)
+        p._retain_queue.join()
+
+        item = p._client.aretain_batch.call_args.kwargs["items"][0]
+        assert "session:web-session" in item["tags"]
+        assert f"chat:{chat_id}" in item["tags"]
+
     def test_buffered_turns_flushed_before_clear(self, provider_with_config):
         """retain_every_n_turns > 1 must not silently drop partial buffers
         on session switch. Whatever's in _session_turns at switch time
@@ -1548,4 +1602,3 @@ class TestShutdown:
         embedded.close.assert_called_once()
         assert embedded._client is None
         assert provider._client is None
-
