@@ -83,6 +83,22 @@ def _parse_int_setting(value: Any, default: int) -> int:
         return default
 
 
+def _parse_bool_setting(value: Any, default: bool = False) -> bool:
+    """Parse a boolean config/env value."""
+    if value is None or value == "":
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "y", "on"}:
+        return True
+    if text in {"0", "false", "no", "n", "off"}:
+        return False
+    return default
+
+
 def _check_local_runtime() -> tuple[bool, str | None]:
     """Return whether local embedded Hindsight imports cleanly.
 
@@ -582,6 +598,8 @@ class HindsightMemoryProvider(MemoryProvider):
         self._recall_types: list[str] | None = None
         self._recall_prompt_preamble = ""
         self._recall_max_input_chars = 800
+        self._same_turn_recall_when_prefetch_empty = False
+        self._same_turn_recall_platforms: list[str] = []
 
         # Bank
         self._bank_mission = ""
@@ -857,6 +875,8 @@ class HindsightMemoryProvider(MemoryProvider):
             {"key": "recall_tags", "description": "Tags to filter when searching memories (comma-separated)", "default": ""},
             {"key": "recall_tags_match", "description": "Tag matching mode for recall", "default": "any", "choices": ["any", "all", "any_strict", "all_strict"]},
             {"key": "auto_recall", "description": "Automatically recall memories before each turn", "default": True},
+            {"key": "same_turn_recall_when_prefetch_empty", "description": "Synchronously recall before the LLM when no warmed prefetch result is available", "default": False},
+            {"key": "same_turn_recall_platforms", "description": "Platforms allowed to use same-turn recall fallback (comma-separated or JSON array; empty = all)", "default": ""},
             {"key": "auto_retain", "description": "Automatically retain conversation turns", "default": True},
             {"key": "retain_every_n_turns", "description": "Retain every N turns (1 = every turn)", "default": 1},
             {"key": "retain_async","description": "Process retain asynchronously on the Hindsight server", "default": True},
@@ -1190,6 +1210,13 @@ class HindsightMemoryProvider(MemoryProvider):
         self._recall_types = self._config.get("recall_types") or None
         self._recall_prompt_preamble = self._config.get("recall_prompt_preamble", "")
         self._recall_max_input_chars = int(self._config.get("recall_max_input_chars", 800))
+        self._same_turn_recall_when_prefetch_empty = _parse_bool_setting(
+            self._config.get("same_turn_recall_when_prefetch_empty"),
+            False,
+        )
+        self._same_turn_recall_platforms = _normalize_retain_tags(
+            self._config.get("same_turn_recall_platforms")
+        )
         self._retain_async = self._config.get("retain_async", True)
 
         _client_version = "unknown"
@@ -1278,6 +1305,48 @@ class HindsightMemoryProvider(MemoryProvider):
             f"hindsight_retain to store facts."
         )
 
+    def _auto_recall_query(self, query: str) -> str:
+        query = query or ""
+        if self._recall_max_input_chars and len(query) > self._recall_max_input_chars:
+            query = query[:self._recall_max_input_chars]
+        return query
+
+    def _same_turn_recall_allowed(self) -> bool:
+        if not self._same_turn_recall_when_prefetch_empty:
+            return False
+        if self._memory_mode == "tools":
+            return False
+        if not self._auto_recall:
+            return False
+        if self._shutting_down.is_set():
+            return False
+        if not self._same_turn_recall_platforms:
+            return True
+        platform = (self._platform or "").strip()
+        return platform in self._same_turn_recall_platforms
+
+    def _recall_context_text(self, query: str) -> str:
+        if self._prefetch_method == "reflect":
+            logger.debug("Prefetch: calling reflect (bank=%s, query_len=%d)", self._bank_id, len(query))
+            resp = self._run_hindsight_operation(lambda client: client.areflect(bank_id=self._bank_id, query=query, budget=self._budget))
+            return resp.text or ""
+
+        recall_kwargs: dict = {
+            "bank_id": self._bank_id, "query": query,
+            "budget": self._budget, "max_tokens": self._recall_max_tokens,
+        }
+        if self._recall_tags:
+            recall_kwargs["tags"] = self._recall_tags
+            recall_kwargs["tags_match"] = self._recall_tags_match
+        if self._recall_types:
+            recall_kwargs["types"] = self._recall_types
+        logger.debug("Prefetch: calling recall (bank=%s, query_len=%d, budget=%s)",
+                     self._bank_id, len(query), self._budget)
+        resp = self._run_hindsight_operation(lambda client: client.arecall(**recall_kwargs))
+        num_results = len(resp.results) if resp.results else 0
+        logger.debug("Prefetch: recall returned %d results", num_results)
+        return "\n".join(f"- {r.text}" for r in resp.results if r.text) if resp.results else ""
+
     def prefetch(self, query: str, *, session_id: str = "") -> str:
         if self._prefetch_thread and self._prefetch_thread.is_alive():
             logger.debug("Prefetch: waiting for background thread to complete")
@@ -1286,8 +1355,16 @@ class HindsightMemoryProvider(MemoryProvider):
             result = self._prefetch_result
             self._prefetch_result = ""
         if not result:
-            logger.debug("Prefetch: no results available")
-            return ""
+            if self._same_turn_recall_allowed():
+                try:
+                    logger.debug("Prefetch: no warmed result; running same-turn recall")
+                    result = self._recall_context_text(self._auto_recall_query(query))
+                except Exception as e:
+                    logger.debug("Hindsight same-turn prefetch failed: %s", e, exc_info=True)
+                    result = ""
+            if not result:
+                logger.debug("Prefetch: no results available")
+                return ""
         logger.debug("Prefetch: returning %d chars of context", len(result))
         header = self._recall_prompt_preamble or (
             "# Hindsight Memory (persistent cross-session context)\n"
@@ -1306,32 +1383,11 @@ class HindsightMemoryProvider(MemoryProvider):
         if self._shutting_down.is_set():
             logger.debug("Prefetch: skipped (shutting down)")
             return
-        # Truncate query to max chars
-        if self._recall_max_input_chars and len(query) > self._recall_max_input_chars:
-            query = query[:self._recall_max_input_chars]
+        query = self._auto_recall_query(query)
 
         def _run():
             try:
-                if self._prefetch_method == "reflect":
-                    logger.debug("Prefetch: calling reflect (bank=%s, query_len=%d)", self._bank_id, len(query))
-                    resp = self._run_hindsight_operation(lambda client: client.areflect(bank_id=self._bank_id, query=query, budget=self._budget))
-                    text = resp.text or ""
-                else:
-                    recall_kwargs: dict = {
-                        "bank_id": self._bank_id, "query": query,
-                        "budget": self._budget, "max_tokens": self._recall_max_tokens,
-                    }
-                    if self._recall_tags:
-                        recall_kwargs["tags"] = self._recall_tags
-                        recall_kwargs["tags_match"] = self._recall_tags_match
-                    if self._recall_types:
-                        recall_kwargs["types"] = self._recall_types
-                    logger.debug("Prefetch: calling recall (bank=%s, query_len=%d, budget=%s)",
-                                 self._bank_id, len(query), self._budget)
-                    resp = self._run_hindsight_operation(lambda client: client.arecall(**recall_kwargs))
-                    num_results = len(resp.results) if resp.results else 0
-                    logger.debug("Prefetch: recall returned %d results", num_results)
-                    text = "\n".join(f"- {r.text}" for r in resp.results if r.text) if resp.results else ""
+                text = self._recall_context_text(query)
                 if text:
                     with self._prefetch_lock:
                         self._prefetch_result = text

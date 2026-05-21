@@ -2256,6 +2256,7 @@ class TestConcurrentToolExecution:
                 session_id=agent.session_id,
                 enabled_tools=list(agent.valid_tool_names),
                 skip_pre_tool_call_hook=True,
+                request_metadata={},
             )
             assert result == "result"
 
@@ -2751,6 +2752,12 @@ class TestRunConversation:
 
     def test_request_scoped_api_hooks_fire_for_each_api_call(self, agent):
         self._setup_agent(agent)
+        request_metadata = {
+            "source": "dorvis-web",
+            "caller": {"email": "user@example.com", "uid": "user-1"},
+            "chat": {"id": "chat-1", "type": "web"},
+        }
+        agent._request_metadata = request_metadata
         tc = _mock_tool_call(name="web_search", arguments="{}", call_id="c1")
         resp1 = _mock_response(content="", finish_reason="tool_calls", tool_calls=[tc])
         resp2 = _mock_response(content="Done searching", finish_reason="stop")
@@ -2779,9 +2786,49 @@ class TestRunConversation:
         assert [call["api_call_count"] for call in pre_request_calls] == [1, 2]
         assert [call["api_call_count"] for call in post_request_calls] == [1, 2]
         assert all(call["session_id"] == agent.session_id for call in pre_request_calls)
+        assert all(call["request_metadata"] == request_metadata for call in pre_request_calls)
+        assert all(call["request_metadata"] == request_metadata for call in post_request_calls)
         assert all("message_count" in c and isinstance(c.get("request_messages"), list) for c in pre_request_calls)
         assert any(msg.get("role") == "user" and msg.get("content") == "search something" for msg in pre_request_calls[0]["request_messages"])
         assert all("usage" in c and "response" in c and "assistant_message" in c for c in post_request_calls)
+        assert all("response_message" in c for c in post_request_calls)
+
+    def test_memory_context_injected_hook_carries_metadata(self, agent):
+        self._setup_agent(agent)
+        request_metadata = {
+            "source": "dorvis-web",
+            "caller": {"email": "user@example.com", "uid": "user-1"},
+            "chat": {"id": "chat-1", "type": "web"},
+        }
+        agent._request_metadata = request_metadata
+        agent._memory_manager = MagicMock()
+        agent._memory_manager.providers = [SimpleNamespace(name="hindsight")]
+        agent._memory_manager.prefetch_all.return_value = "remembered fact"
+        resp = _mock_response(content="Final answer", finish_reason="stop")
+        agent.client.chat.completions.create.return_value = resp
+
+        hook_calls = []
+
+        def _record_hook(name, **kwargs):
+            hook_calls.append((name, kwargs))
+            return []
+
+        with (
+            patch("hermes_cli.plugins.invoke_hook", side_effect=_record_hook),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("what do you remember?")
+
+        assert result["final_response"] == "Final answer"
+        memory_calls = [kw for name, kw in hook_calls if name == "memory_context_injected"]
+        assert len(memory_calls) == 1
+        payload = memory_calls[0]
+        assert payload["provider"] == "hindsight"
+        assert payload["status"] == "injected"
+        assert "remembered fact" in payload["injected_block"]
+        assert payload["request_metadata"] == request_metadata
 
     def test_content_with_tool_calls_stays_silent_for_non_cli_quiet_mode(self, agent):
         self._setup_agent(agent)

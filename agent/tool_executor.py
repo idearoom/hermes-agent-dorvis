@@ -127,7 +127,12 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         try:
             from hermes_cli.plugins import get_pre_tool_call_block_message
             block_message = get_pre_tool_call_block_message(
-                function_name, function_args, task_id=effective_task_id or "",
+                function_name,
+                function_args,
+                task_id=effective_task_id or "",
+                session_id=agent.session_id or "",
+                tool_call_id=getattr(tool_call, "id", "") or "",
+                request_metadata=getattr(agent, "_request_metadata", None) or {},
             )
         except Exception:
             block_message = None
@@ -502,7 +507,12 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         try:
             from hermes_cli.plugins import get_pre_tool_call_block_message
             _block_msg = get_pre_tool_call_block_message(
-                function_name, function_args, task_id=effective_task_id or "",
+                function_name,
+                function_args,
+                task_id=effective_task_id or "",
+                session_id=agent.session_id or "",
+                tool_call_id=getattr(tool_call, "id", "") or "",
+                request_metadata=getattr(agent, "_request_metadata", None) or {},
             )
         except Exception:
             pass
@@ -689,6 +699,21 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     spinner.stop(cute_msg)
                 elif agent._should_emit_quiet_tool_messages():
                     agent._vprint(f"  {cute_msg}")
+            try:
+                from hermes_cli.plugins import invoke_hook as _invoke_hook
+                _invoke_hook(
+                    "post_tool_call",
+                    tool_name=function_name,
+                    args=function_args,
+                    result=function_result,
+                    task_id=effective_task_id or "",
+                    session_id=agent.session_id or "",
+                    tool_call_id=tool_call.id,
+                    duration_ms=max(0, int(tool_duration * 1000)),
+                    request_metadata=getattr(agent, "_request_metadata", None) or {},
+                )
+            except Exception:
+                pass
         elif agent._context_engine_tool_names and function_name in agent._context_engine_tool_names:
             # Context engine tools (lcm_grep, lcm_describe, lcm_expand, etc.)
             spinner = None
@@ -736,6 +761,21 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     spinner.stop(cute_msg)
                 elif agent._should_emit_quiet_tool_messages():
                     agent._vprint(f"  {cute_msg}")
+            try:
+                from hermes_cli.plugins import invoke_hook as _invoke_hook
+                _invoke_hook(
+                    "post_tool_call",
+                    tool_name=function_name,
+                    args=function_args,
+                    result=function_result,
+                    task_id=effective_task_id or "",
+                    session_id=agent.session_id or "",
+                    tool_call_id=tool_call.id,
+                    duration_ms=max(0, int(tool_duration * 1000)),
+                    request_metadata=getattr(agent, "_request_metadata", None) or {},
+                )
+            except Exception:
+                pass
         elif agent.quiet_mode:
             spinner = None
             if agent._should_emit_quiet_tool_messages() and agent._should_start_quiet_spinner():
@@ -752,6 +792,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     session_id=agent.session_id or "",
                     enabled_tools=list(agent.valid_tool_names) if agent.valid_tool_names else None,
                     skip_pre_tool_call_hook=True,
+                    request_metadata=getattr(agent, "_request_metadata", None) or {},
                 )
                 _spinner_result = function_result
             except Exception as tool_error:
@@ -772,6 +813,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     session_id=agent.session_id or "",
                     enabled_tools=list(agent.valid_tool_names) if agent.valid_tool_names else None,
                     skip_pre_tool_call_hook=True,
+                    request_metadata=getattr(agent, "_request_metadata", None) or {},
                 )
             except Exception as tool_error:
                 function_result = f"Error executing tool '{function_name}': {tool_error}"

@@ -127,6 +127,32 @@ def _ra():
     return run_agent
 
 
+def _json_safe_for_observability(value: Any) -> Any:
+    """Return a JSON-compatible copy for plugin hook payloads."""
+    try:
+        return json.loads(json.dumps(value, ensure_ascii=False, default=str))
+    except Exception:
+        return str(value)
+
+
+def _tool_calls_for_observability(tool_calls: Any) -> List[Dict[str, Any]]:
+    """Normalize provider tool-call objects into serializable dicts."""
+    normalized: List[Dict[str, Any]] = []
+    for tool_call in tool_calls or []:
+        function = getattr(tool_call, "function", None)
+        normalized.append(
+            {
+                "id": getattr(tool_call, "id", None),
+                "type": getattr(tool_call, "type", None) or "function",
+                "function": {
+                    "name": getattr(function, "name", None) if function else None,
+                    "arguments": getattr(function, "arguments", None) if function else None,
+                },
+            }
+        )
+    return _json_safe_for_observability(normalized)
+
+
 def _restore_or_build_system_prompt(agent, system_message, conversation_history):
     """Restore the cached system prompt from the session DB or build it fresh.
 
@@ -209,6 +235,7 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
             session_id=agent.session_id,
             model=agent.model,
             platform=getattr(agent, "platform", None) or "",
+            request_metadata=getattr(agent, "_request_metadata", None) or {},
         )
     except Exception as exc:
         logger.warning("on_session_start hook failed: %s", exc)
@@ -587,6 +614,7 @@ def run_conversation(
             model=agent.model,
             platform=getattr(agent, "platform", None) or "",
             sender_id=getattr(agent, "_user_id", None) or "",
+            request_metadata=getattr(agent, "_request_metadata", None) or {},
         )
         _ctx_parts: list[str] = []
         for r in _pre_results:
@@ -651,12 +679,64 @@ def run_conversation(
     # Use original_user_message (clean input) — user_message may contain
     # injected skill content that bloats / breaks provider queries.
     _ext_prefetch_cache = ""
+    _memory_prefetch_query = original_user_message if isinstance(original_user_message, str) else ""
+    _memory_context_observed = False
+    _memory_prefetch_error = ""
+    _memory_provider_name = ""
     if agent._memory_manager:
         try:
-            _query = original_user_message if isinstance(original_user_message, str) else ""
-            _ext_prefetch_cache = agent._memory_manager.prefetch_all(_query) or ""
+            _providers = [
+                getattr(_p, "name", "")
+                for _p in getattr(agent._memory_manager, "providers", [])
+                if getattr(_p, "name", "")
+            ]
+            _external = [_p for _p in _providers if _p != "builtin"]
+            _memory_provider_name = (_external or _providers or ["memory"])[0]
         except Exception:
-            pass
+            _memory_provider_name = "memory"
+
+    def _emit_memory_context_observation(status: str, injected_block: str = "") -> None:
+        nonlocal _memory_context_observed
+        if _memory_context_observed or not agent._memory_manager:
+            return
+        _memory_context_observed = True
+        try:
+            from hermes_cli.plugins import invoke_hook as _invoke_hook
+            _estimated_tokens = 0
+            if injected_block:
+                try:
+                    _estimated_tokens = estimate_messages_tokens_rough([
+                        {"role": "user", "content": injected_block}
+                    ])
+                except Exception:
+                    _estimated_tokens = 0
+            _payload = {
+                "session_id": agent.session_id or "",
+                "provider": _memory_provider_name or "memory",
+                "source": "prefetch",
+                "query": _memory_prefetch_query,
+                "injected_block": injected_block,
+                "status": status,
+                "query_char_count": len(_memory_prefetch_query),
+                "injected_char_count": len(injected_block),
+                "estimated_injected_tokens": _estimated_tokens,
+                "reused_for_all_iterations": True,
+                "request_metadata": getattr(agent, "_request_metadata", None) or {},
+            }
+            if _memory_prefetch_error:
+                _payload["error"] = _memory_prefetch_error
+            _invoke_hook("memory_context_injected", **_payload)
+        except Exception as exc:
+            logger.debug("memory_context_injected hook failed: %s", exc)
+
+    if agent._memory_manager:
+        try:
+            _ext_prefetch_cache = agent._memory_manager.prefetch_all(_memory_prefetch_query) or ""
+        except Exception as exc:
+            _memory_prefetch_error = str(exc)
+            _emit_memory_context_observation("error")
+        if not _ext_prefetch_cache and not _memory_prefetch_error:
+            _emit_memory_context_observation("empty")
 
     # Optional opt-in runtime: if api_mode == codex_app_server, hand the
     # turn to the codex app-server subprocess (terminal/file ops/patching
@@ -830,6 +910,7 @@ def run_conversation(
                 if _ext_prefetch_cache:
                     _fenced = build_memory_context_block(_ext_prefetch_cache)
                     if _fenced:
+                        _emit_memory_context_observation("injected", _fenced)
                         _injections.append(_fenced)
                 if _plugin_user_context:
                     _injections.append(_plugin_user_context)
@@ -1112,12 +1193,15 @@ def run_conversation(
                         base_url=agent.base_url,
                         api_mode=agent.api_mode,
                         api_call_count=api_call_count,
-                        request_messages=list(request_messages) if isinstance(request_messages, list) else [],
+                        request_messages=_json_safe_for_observability(
+                            list(request_messages) if isinstance(request_messages, list) else []
+                        ),
                         message_count=len(api_messages),
                         tool_count=len(agent.tools or []),
                         approx_input_tokens=approx_tokens,
                         request_char_count=total_chars,
                         max_tokens=agent.max_tokens,
+                        request_metadata=getattr(agent, "_request_metadata", None) or {},
                     )
                 except Exception:
                     pass
@@ -3140,6 +3224,12 @@ def run_conversation(
                 from hermes_cli.plugins import invoke_hook as _invoke_hook
                 _assistant_tool_calls = getattr(assistant_message, "tool_calls", None) or []
                 _assistant_text = assistant_message.content or ""
+                _assistant_observation = {
+                    "role": "assistant",
+                    "content": _assistant_text,
+                    "tool_calls": _tool_calls_for_observability(_assistant_tool_calls),
+                    "finish_reason": finish_reason,
+                }
                 _invoke_hook(
                     "post_api_request",
                     task_id=effective_task_id,
@@ -3157,8 +3247,10 @@ def run_conversation(
                     response=response,
                     usage=agent._usage_summary_for_api_request_hook(response),
                     assistant_message=assistant_message,
+                    response_message=_json_safe_for_observability(_assistant_observation),
                     assistant_content_chars=len(_assistant_text),
                     assistant_tool_call_count=len(_assistant_tool_calls),
+                    request_metadata=getattr(agent, "_request_metadata", None) or {},
                 )
             except Exception:
                 pass
@@ -4295,6 +4387,7 @@ def run_conversation(
             interrupted=interrupted,
             model=agent.model,
             platform=getattr(agent, "platform", None) or "",
+            request_metadata=getattr(agent, "_request_metadata", None) or {},
         )
     except Exception as exc:
         logger.warning("on_session_end hook failed: %s", exc)
