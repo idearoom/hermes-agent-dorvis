@@ -2389,6 +2389,7 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                 turn_id=getattr(agent, "_current_turn_id", "") or "",
                 api_request_id=getattr(agent, "_current_api_request_id", "") or "",
                 middleware_trace=list(_tool_middleware_trace),
+                request_metadata=getattr(agent, "_request_metadata", None) or {},
             )
         except Exception:
             block_message = None
@@ -2409,6 +2410,7 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                 error_type="plugin_block",
                 error_message=block_message,
                 middleware_trace=list(_tool_middleware_trace),
+                request_metadata=getattr(agent, "_request_metadata", None) or {},
             )
         except Exception:
             pass
@@ -2431,6 +2433,7 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                 api_request_id=getattr(agent, "_current_api_request_id", "") or "",
                 duration_ms=int((time.monotonic() - tool_start_time) * 1000),
                 middleware_trace=list(_tool_middleware_trace),
+                request_metadata=getattr(agent, "_request_metadata", None) or {},
             )
         except Exception:
             pass
@@ -2536,6 +2539,7 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                 enabled_toolsets=getattr(agent, "enabled_toolsets", None),
                 disabled_toolsets=getattr(agent, "disabled_toolsets", None),
                 tool_request_middleware_trace=list(_tool_middleware_trace),
+                request_metadata=getattr(agent, "_request_metadata", None) or {},
             )
 
     from hermes_cli.middleware import run_tool_execution_middleware

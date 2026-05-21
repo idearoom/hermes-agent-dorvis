@@ -493,6 +493,7 @@ class AIAgent:
         checkpoint_max_total_size_mb: int = 500,
         checkpoint_max_file_size_mb: int = 10,
         pass_session_id: bool = False,
+        request_metadata: Dict[str, Any] = None,
     ):
         """Forwarder — see ``agent.agent_init.init_agent``."""
         from agent.agent_init import init_agent
@@ -569,6 +570,7 @@ class AIAgent:
             checkpoint_max_total_size_mb=checkpoint_max_total_size_mb,
             checkpoint_max_file_size_mb=checkpoint_max_file_size_mb,
             pass_session_id=pass_session_id,
+            request_metadata=request_metadata,
         )
 
     def _get_session_db_for_recall(self):
@@ -2636,6 +2638,7 @@ class AIAgent:
                     "message": error_message,
                 },
                 request=self._api_request_payload_for_hook(api_kwargs),
+                request_metadata=getattr(self, "_request_metadata", None) or {},
             )
         except Exception:
             pass

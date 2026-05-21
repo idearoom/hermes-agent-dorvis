@@ -157,6 +157,7 @@ VALID_HOOKS: Set[str] = {
     "pre_api_request",
     "post_api_request",
     "api_request_error",
+    "memory_context_injected",
     "on_session_start",
     "on_session_end",
     "on_session_finalize",
@@ -2107,6 +2108,7 @@ def _get_pre_tool_call_directive_details(
     turn_id: str = "",
     api_request_id: str = "",
     middleware_trace: Optional[List[Dict[str, Any]]] = None,
+    request_metadata: Optional[Dict[str, Any]] = None,
 ) -> _PreToolCallDirective:
     """Check ``pre_tool_call`` hooks for a blocking or approval directive.
 
@@ -2152,6 +2154,7 @@ def _get_pre_tool_call_directive_details(
         turn_id=turn_id,
         api_request_id=api_request_id,
         middleware_trace=list(middleware_trace or []),
+        request_metadata=request_metadata or {},
     )
 
     for result in hook_results:
@@ -2184,6 +2187,7 @@ def get_pre_tool_call_directive(
     turn_id: str = "",
     api_request_id: str = "",
     middleware_trace: Optional[List[Dict[str, Any]]] = None,
+    request_metadata: Optional[Dict[str, Any]] = None,
 ) -> tuple[Optional[str], Optional[str]]:
     """Check ``pre_tool_call`` hooks for a blocking or approval directive.
 
@@ -2196,6 +2200,7 @@ def get_pre_tool_call_directive(
         tool_name, args, task_id=task_id, session_id=session_id,
         tool_call_id=tool_call_id, turn_id=turn_id,
         api_request_id=api_request_id, middleware_trace=middleware_trace,
+        request_metadata=request_metadata,
     )
     return (details.action, details.message)
 
@@ -2209,6 +2214,7 @@ def get_pre_tool_call_block_message(
     turn_id: str = "",
     api_request_id: str = "",
     middleware_trace: Optional[List[Dict[str, Any]]] = None,
+    request_metadata: Optional[Dict[str, Any]] = None,
 ) -> Optional[str]:
     """Back-compat shim: return only a ``block`` message (or ``None``).
 
@@ -2221,6 +2227,7 @@ def get_pre_tool_call_block_message(
         tool_name, args, task_id=task_id, session_id=session_id,
         tool_call_id=tool_call_id, turn_id=turn_id,
         api_request_id=api_request_id, middleware_trace=middleware_trace,
+        request_metadata=request_metadata,
     )
     return message if directive == "block" else None
 
@@ -2234,6 +2241,7 @@ def resolve_pre_tool_block(
     turn_id: str = "",
     api_request_id: str = "",
     middleware_trace: Optional[List[Dict[str, Any]]] = None,
+    request_metadata: Optional[Dict[str, Any]] = None,
 ) -> Optional[str]:
     """Resolve the pre_tool_call directive to a final block message (or None).
 
@@ -2253,6 +2261,7 @@ def resolve_pre_tool_block(
         tool_name, args, task_id=task_id, session_id=session_id,
         tool_call_id=tool_call_id, turn_id=turn_id,
         api_request_id=api_request_id, middleware_trace=middleware_trace,
+        request_metadata=request_metadata,
     )
     if details.action == "block":
         return details.message
