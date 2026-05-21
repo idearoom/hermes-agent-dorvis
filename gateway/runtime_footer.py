@@ -32,6 +32,33 @@ _DEFAULT_FIELDS: tuple[str, ...] = ("model", "context_pct", "cwd")
 _SEP = " · "
 
 
+def _format_token_count(n: int | float | None) -> str:
+    """Return a compact token count for footer display."""
+    try:
+        value = int(n or 0)
+    except (TypeError, ValueError):
+        value = 0
+    if value <= 0:
+        return ""
+    if value >= 1_000_000:
+        return f"{value / 1_000_000:.1f}M tok"
+    if value >= 1_000:
+        return f"{value / 1_000:.1f}k tok"
+    return f"{value:,} tok"
+
+
+def _format_cost(amount: float | int | None, status: str | None = None) -> str:
+    """Return a compact estimated/actual cost for footer display."""
+    try:
+        value = float(amount) if amount is not None else 0.0
+    except (TypeError, ValueError):
+        value = 0.0
+    if value <= 0:
+        return ""
+    prefix = "~" if (status or "").lower() == "estimated" else ""
+    return f"{prefix}${value:.4f}"
+
+
 def _home_relative_cwd(cwd: str) -> str:
     """Return *cwd* with ``$HOME`` collapsed to ``~``.  Empty string if unset."""
     if not cwd:
@@ -95,6 +122,9 @@ def format_runtime_footer(
     context_length: Optional[int],
     cwd: Optional[str] = None,
     fields: Iterable[str] = _DEFAULT_FIELDS,
+    total_tokens: int = 0,
+    estimated_cost_usd: float | None = None,
+    cost_status: str | None = None,
 ) -> str:
     """Render the footer line, or return "" if no fields have data.
 
@@ -111,6 +141,22 @@ def format_runtime_footer(
             if context_length and context_length > 0 and context_tokens >= 0:
                 pct = max(0, min(100, round((context_tokens / context_length) * 100)))
                 parts.append(f"{pct}%")
+        elif field in ("context_tokens", "context"):
+            used = _format_token_count(context_tokens)
+            if used:
+                if context_length and context_length > 0:
+                    total = _format_token_count(context_length)
+                    parts.append(f"ctx {used}/{total}")
+                else:
+                    parts.append(f"ctx {used}")
+        elif field == "tokens":
+            display = _format_token_count(total_tokens)
+            if display:
+                parts.append(display)
+        elif field == "cost":
+            display = _format_cost(estimated_cost_usd, cost_status)
+            if display:
+                parts.append(display)
         elif field == "cwd":
             rel = _home_relative_cwd(cwd or os.environ.get("TERMINAL_CWD", ""))
             if rel:
@@ -130,6 +176,9 @@ def build_footer_line(
     context_tokens: int,
     context_length: Optional[int],
     cwd: Optional[str] = None,
+    total_tokens: int = 0,
+    estimated_cost_usd: float | None = None,
+    cost_status: str | None = None,
 ) -> str:
     """Top-level entry point used by gateway/run.py.
 
@@ -146,4 +195,7 @@ def build_footer_line(
         context_length=context_length,
         cwd=cwd,
         fields=cfg.get("fields") or _DEFAULT_FIELDS,
+        total_tokens=total_tokens,
+        estimated_cost_usd=estimated_cost_usd,
+        cost_status=cost_status,
     )
