@@ -137,6 +137,34 @@ def test_format_footer_custom_field_order():
     assert out == "50% · gpt-5.4"
 
 
+def test_format_footer_tokens_and_cost_fields():
+    out = format_runtime_footer(
+        model="openai/gpt-5.4",
+        context_tokens=68_000,
+        context_length=100_000,
+        total_tokens=123_456,
+        estimated_cost_usd=0.1234,
+        cost_status="estimated",
+        cwd="",
+        fields=("context_tokens", "tokens", "cost"),
+    )
+    assert out == "ctx 68.0k tok/100.0k tok · 123.5k tok · ~$0.1234"
+
+
+def test_format_footer_actual_cost_omits_estimate_prefix():
+    out = format_runtime_footer(
+        model="openai/gpt-5.4",
+        context_tokens=0,
+        context_length=None,
+        total_tokens=0,
+        estimated_cost_usd=0.5,
+        cost_status="actual",
+        cwd="",
+        fields=("cost",),
+    )
+    assert out == "$0.5000"
+
+
 def test_format_footer_unknown_field_silently_ignored():
     out = format_runtime_footer(
         model="openai/gpt-5.4",
@@ -260,3 +288,18 @@ def test_build_footer_no_data_returns_empty_even_when_enabled():
     # With no TERMINAL_CWD env either
     if not os.environ.get("TERMINAL_CWD"):
         assert out == ""
+
+
+def test_build_footer_passes_usage_fields():
+    out = build_footer_line(
+        user_config={"display": {"runtime_footer": {"enabled": True, "fields": ["tokens", "cost"]}}},
+        platform_key="telegram",
+        model="openai/gpt-5.4",
+        context_tokens=0,
+        context_length=None,
+        total_tokens=2500,
+        estimated_cost_usd=0.0123,
+        cost_status="estimated",
+        cwd="",
+    )
+    assert out == "2.5k tok · ~$0.0123"
