@@ -230,8 +230,11 @@ class TestExtractCacheBustingConfig:
                     "threshold": 0.6,
                     "codex_gpt55_autoraise": False,
                     "target_ratio": 0.3,
+                    "protect_first_n": 1,
                     "protect_last_n": 25,
                     "codex_app_server_auto": "hermes",
+                    "abort_on_summary_failure": True,
+                    "quality_gate_enabled": True,
                     "some_other_key": "ignored",
                 }
             }
@@ -240,8 +243,11 @@ class TestExtractCacheBustingConfig:
         assert out["compression.threshold"] == 0.6
         assert out["compression.codex_gpt55_autoraise"] is False
         assert out["compression.target_ratio"] == 0.3
+        assert out["compression.protect_first_n"] == 1
         assert out["compression.protect_last_n"] == 25
         assert out["compression.codex_app_server_auto"] == "hermes"
+        assert out["compression.abort_on_summary_failure"] is True
+        assert out["compression.quality_gate_enabled"] is True
 
     def test_reads_checkpoint_subkeys(self):
         from gateway.run import GatewayRunner
