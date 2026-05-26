@@ -1476,6 +1476,15 @@ def init_agent(
     compression_in_place = is_truthy_value(
         _compression_cfg.get("in_place"), default=False
     )
+    compression_quality_gate_enabled = str(
+        _compression_cfg.get("quality_gate_enabled", False)
+    ).lower() in {"true", "1", "yes"}
+    compression_quality_gate_min_savings_pct = float(
+        _compression_cfg.get("quality_gate_min_savings_pct", 10.0)
+    )
+    compression_quality_gate_max_post_threshold_ratio = float(
+        _compression_cfg.get("quality_gate_max_post_threshold_ratio", 0.80)
+    )
 
     # Read optional explicit context_length override for the auxiliary
     # compression model. Custom endpoints often cannot report this via
@@ -1715,6 +1724,9 @@ def init_agent(
             api_mode=agent.api_mode,
             abort_on_summary_failure=compression_abort_on_summary_failure,
             max_tokens=agent.max_tokens,
+            quality_gate_enabled=compression_quality_gate_enabled,
+            quality_gate_min_savings_pct=compression_quality_gate_min_savings_pct,
+            quality_gate_max_post_threshold_ratio=compression_quality_gate_max_post_threshold_ratio,
         )
     _bind_session_state = getattr(agent.context_compressor, "bind_session_state", None)
     if callable(_bind_session_state):
