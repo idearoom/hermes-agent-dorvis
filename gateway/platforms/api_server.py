@@ -93,6 +93,7 @@ MAX_REQUEST_BYTES = 10_000_000  # 10 MB — accommodates long agent conversation
 CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 30.0
 MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
 MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
+CONTEXT_COMPACTION_PREFIX = "[CONTEXT COMPACTION"
 _METADATA_STRING_LIMITS = {
     "email": 320,
     "name": 200,
@@ -2429,6 +2430,7 @@ class APIServerAdapter(BasePlatformAdapter):
         agent_error: Optional[str] = None
         usage: Dict[str, int] = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
         terminal_snapshot_persisted = False
+        response_session_id = session_id
 
         def _persist_response_snapshot(
             response_env: Dict[str, Any],
@@ -2444,7 +2446,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "response": response_env,
                 "conversation_history": conversation_history_snapshot,
                 "instructions": instructions,
-                "session_id": session_id,
+                "session_id": response_session_id,
             })
             if conversation:
                 self._response_store.set_conversation(conversation, response_id)
@@ -2729,6 +2731,8 @@ class APIServerAdapter(BasePlatformAdapter):
             try:
                 result, agent_usage = await agent_task
                 usage = agent_usage or usage
+                if isinstance(result, dict):
+                    response_session_id = result.get("session_id") or response_session_id
                 # If the agent produced a final_response but no text
                 # deltas were streamed (e.g. some providers only emit
                 # the full response at the end), emit a single fallback
@@ -3184,6 +3188,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 "total_tokens": usage.get("total_tokens", 0),
             },
         }
+        response_session_id = (
+            result.get("session_id") if isinstance(result, dict) else None
+        ) or session_id
 
         # Store the complete response object for future chaining / GET retrieval
         if store:
@@ -3191,14 +3198,14 @@ class APIServerAdapter(BasePlatformAdapter):
                 "response": response_data,
                 "conversation_history": full_history,
                 "instructions": effective_instructions,
-                "session_id": session_id,
+                "session_id": response_session_id,
             })
             # Update conversation mapping so the next request with the same
             # conversation name automatically chains to this response
             if conversation:
                 self._response_store.set_conversation(conversation, response_id)
 
-        response_headers = {"X-Hermes-Session-Id": session_id}
+        response_headers = {"X-Hermes-Session-Id": response_session_id}
         if gateway_session_key:
             response_headers["X-Hermes-Session-Key"] = gateway_session_key
         return web.json_response(response_data, headers=response_headers)
@@ -3475,6 +3482,24 @@ class APIServerAdapter(BasePlatformAdapter):
     # ------------------------------------------------------------------
 
     @staticmethod
+    def _messages_include_compaction_summary(messages: List[Dict[str, Any]]) -> bool:
+        """True when the agent result is already a compacted full transcript."""
+        for msg in messages:
+            content = msg.get("content")
+            if isinstance(content, str):
+                if content.lstrip().startswith(CONTEXT_COMPACTION_PREFIX):
+                    return True
+            elif isinstance(content, list):
+                for part in content:
+                    if (
+                        isinstance(part, dict)
+                        and isinstance(part.get("text"), str)
+                        and part["text"].lstrip().startswith(CONTEXT_COMPACTION_PREFIX)
+                    ):
+                        return True
+        return False
+
+    @staticmethod
     def _build_response_conversation_history(
         conversation_history: List[Dict[str, Any]],
         user_message: Any,
@@ -3492,7 +3517,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 user_message,
                 result,
             )
-            if turn_start:
+            if turn_start or APIServerAdapter._messages_include_compaction_summary(agent_messages):
                 return list(agent_messages)
 
             full_history = prior

@@ -1079,6 +1079,83 @@ class TestAbortOnSummaryFailure:
         assert len(result) < len(msgs)
 
 
+class TestCompressionQualityGate:
+    def _make_msgs(self):
+        return [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "initial request"},
+            {"role": "assistant", "content": "ack"},
+            {"role": "user", "content": "inspect enclosed-chicken-coop and preserve mesh-left"},
+            {"role": "assistant", "content": "ran tools"},
+            {"role": "user", "content": "latest ask: keep the 80 inch enclosed section rule"},
+            {"role": "assistant", "content": "working"},
+            {"role": "user", "content": "continue from staging only"},
+        ]
+
+    def _make_compressor(self):
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            return ContextCompressor(
+                model="test",
+                quiet_mode=True,
+                protect_first_n=1,
+                protect_last_n=2,
+                quality_gate_enabled=True,
+            )
+
+    def _summary_with_ledger(self):
+        return """## Active Task
+continue from staging only
+
+## State Ledger
+active_task: continue from staging only
+latest_user_ask: continue from staging only
+constraints: staging only; preserve 80 inch rule
+decisions: no LLM judge
+key_ids: enclosed-chicken-coop, mesh-left
+artifacts: staging branch
+completed_actions: inspected prior turns
+tool_outcomes: authoring diff pending
+blockers: None
+next_goal: continue replay
+retrieval_pointers: Dakota-style staging chat
+
+## Goal
+Validate compression."""
+
+    def test_quality_gate_accepts_summary_with_state_ledger(self):
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = self._summary_with_ledger()
+
+        c = self._make_compressor()
+        msgs = self._make_msgs()
+
+        with patch("agent.context_compressor.call_llm", return_value=mock_response):
+            result = c.compress(msgs, current_tokens=90000)
+
+        assert result != msgs
+        assert c._last_compress_aborted is False
+        assert c._last_quality_gate_passed is True
+        assert c._last_quality_gate_reasons == []
+        assert all(c._last_ledger_fields_present.values())
+        assert any("## State Ledger" in str(m.get("content")) for m in result)
+
+    def test_quality_gate_rejects_summary_without_state_ledger(self):
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = "summary text without ledger"
+
+        c = self._make_compressor()
+        msgs = self._make_msgs()
+
+        with patch("agent.context_compressor.call_llm", return_value=mock_response):
+            result = c.compress(msgs, current_tokens=90000)
+
+        assert result == msgs
+        assert c._last_compress_aborted is True
+        assert c._last_quality_gate_passed is False
+        assert "missing_ledger_fields" in c._last_quality_gate_reasons
+
 class TestSummaryPrefixNormalization:
     def test_legacy_prefix_is_replaced(self):
         summary = ContextCompressor._with_summary_prefix("[CONTEXT SUMMARY]: did work")

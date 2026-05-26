@@ -144,6 +144,22 @@ def _collect_path_mentions(text: str, relevant_files: list[str], *, limit: int =
         _dedupe_append(relevant_files, match.rstrip(".,:;"), limit=limit)
 
 
+STATE_LEDGER_KEYS = (
+    "active_task",
+    "latest_user_ask",
+    "constraints",
+    "decisions",
+    "key_ids",
+    "artifacts",
+    "completed_actions",
+    "tool_outcomes",
+    "blockers",
+    "next_goal",
+    "retrieval_pointers",
+)
+_SUMMARY_UNAVAILABLE_MARKER = "Summary generation was unavailable"
+
+
 def _content_length_for_budget(raw_content: Any) -> int:
     """Return the effective char-length of a message's content for token budgeting.
 
@@ -552,6 +568,14 @@ class ContextCompressor(ContextEngine):
         self.last_compression_rough_tokens = 0
         self.last_rough_tokens_when_real_prompt_fit = 0
         self.awaiting_real_usage_after_compression = False
+        self._last_quality_gate_passed = None
+        self._last_quality_gate_reasons = []
+        self._last_ledger_fields_present = {}
+        self._last_pruned_tool_result_count = 0
+        self._last_pre_compression_tokens = None
+        self._last_post_compression_tokens = None
+        self._last_pre_compression_message_count = 0
+        self._last_post_compression_message_count = 0
 
     def on_session_end(self, session_id: str, messages: List[Dict[str, Any]]) -> None:
         """Clear per-session compaction state at a real session boundary.
@@ -612,6 +636,9 @@ class ContextCompressor(ContextEngine):
         provider: str = "",
         api_mode: str = "",
         abort_on_summary_failure: bool = False,
+        quality_gate_enabled: bool = False,
+        quality_gate_min_savings_pct: float = 10.0,
+        quality_gate_max_post_threshold_ratio: float = 0.80,
     ):
         self.model = model
         self.base_url = base_url
@@ -628,6 +655,11 @@ class ContextCompressor(ContextEngine):
         # When False (default = historical behavior), insert a
         # deterministic "summary unavailable" handoff and drop the middle window.
         self.abort_on_summary_failure = abort_on_summary_failure
+        self.quality_gate_enabled = quality_gate_enabled
+        self.quality_gate_min_savings_pct = max(0.0, min(float(quality_gate_min_savings_pct), 100.0))
+        self.quality_gate_max_post_threshold_ratio = max(
+            0.10, min(float(quality_gate_max_post_threshold_ratio), 1.0)
+        )
 
         self.context_length = get_model_context_length(
             model, base_url=base_url, api_key=api_key,
@@ -696,6 +728,14 @@ class ContextCompressor(ContextEngine):
         # succeeded.  Silent recovery would hide the broken config.
         self._last_aux_model_failure_error: Optional[str] = None
         self._last_aux_model_failure_model: Optional[str] = None
+        self._last_quality_gate_passed: Optional[bool] = None
+        self._last_quality_gate_reasons: List[str] = []
+        self._last_ledger_fields_present: Dict[str, bool] = {}
+        self._last_pruned_tool_result_count: int = 0
+        self._last_pre_compression_tokens: Optional[int] = None
+        self._last_post_compression_tokens: Optional[int] = None
+        self._last_pre_compression_message_count: int = 0
+        self._last_post_compression_message_count: int = 0
 
     def update_from_response(self, usage: Dict[str, Any]):
         """Update tracked token usage from API response."""
@@ -1336,6 +1376,22 @@ cancelled task. Example: "User asked: 'Stop the i18n refactor and just
 verify the current diff' — earlier i18n in-flight work is cancelled."
 If no outstanding task exists, write "None."]
 
+## State Ledger
+[Machine-checkable continuity ledger. Keep every key below exactly as written,
+one `key: value` pair per line. Values may be compact, but must not be blank.
+Use "None" when a key truly does not apply.]
+active_task: [current unfulfilled task]
+latest_user_ask: [latest user request in this compacted context]
+constraints: [important constraints and preferences]
+decisions: [important decisions made so far]
+key_ids: [stable IDs, selectors, branch names, row IDs, chat IDs, keys]
+artifacts: [files, branches, URLs, DB rows, or other artifacts]
+completed_actions: [concise completed work]
+tool_outcomes: [tool calls/results that matter for continuation]
+blockers: [current blockers or None]
+next_goal: [next concrete goal]
+retrieval_pointers: [where to recover raw details if needed]
+
 ## Goal
 [What the user is trying to accomplish overall]
 
@@ -1582,6 +1638,91 @@ The user has requested that this compaction PRIORITISE preserving all informatio
         """Normalize summary text to the current compaction handoff format."""
         text = cls._strip_summary_prefix(summary)
         return f"{SUMMARY_PREFIX}\n{text}" if text else SUMMARY_PREFIX
+
+    @staticmethod
+    def _content_text(content: Any) -> str:
+        return _content_text_for_contains(content)
+
+    @classmethod
+    def _extract_state_ledger_fields(cls, summary: str) -> Dict[str, bool]:
+        """Return presence/non-empty status for every required ledger key."""
+        body = cls._strip_summary_prefix(summary or "")
+        fields = {key: False for key in STATE_LEDGER_KEYS}
+        in_ledger = False
+        for raw_line in body.splitlines():
+            line = raw_line.strip()
+            if line.startswith("## "):
+                in_ledger = line.lower() == "## state ledger"
+                continue
+            if not in_ledger or ":" not in line:
+                continue
+            key, value = line.split(":", 1)
+            key = key.strip()
+            if key in fields and value.strip():
+                fields[key] = True
+        return fields
+
+    @classmethod
+    def _latest_user_text(cls, messages: List[Dict[str, Any]]) -> str:
+        for msg in reversed(messages):
+            if msg.get("role") == "user":
+                return cls._content_text(msg.get("content")).strip()
+        return ""
+
+    @classmethod
+    def _all_message_text(cls, messages: List[Dict[str, Any]]) -> str:
+        return "\n".join(cls._content_text(m.get("content")) for m in messages)
+
+    def _evaluate_compression_quality(
+        self,
+        *,
+        original_messages: List[Dict[str, Any]],
+        compressed_messages: List[Dict[str, Any]],
+        summary: str,
+        pre_tokens: int,
+        post_tokens: int,
+        pre_message_count: int,
+        post_message_count: int,
+    ) -> tuple[bool, List[str], Dict[str, bool]]:
+        """Deterministic quality gate for stateful compaction.
+
+        This intentionally avoids an LLM judge.  It checks for structural
+        continuity, meaningful shrinkage, and the latest user ask surviving
+        into the live post-compaction context.
+        """
+        reasons: List[str] = []
+        ledger_fields = self._extract_state_ledger_fields(summary)
+
+        if not summary:
+            reasons.append("missing_summary")
+        if _SUMMARY_UNAVAILABLE_MARKER in (summary or ""):
+            reasons.append("fallback_summary_marker")
+        if not all(ledger_fields.values()):
+            reasons.append("missing_ledger_fields")
+
+        if pre_tokens and post_tokens:
+            saved = pre_tokens - post_tokens
+            savings_pct = (saved / pre_tokens * 100) if pre_tokens > 0 else 0.0
+            if savings_pct < self.quality_gate_min_savings_pct:
+                reasons.append("insufficient_token_savings")
+            if post_tokens >= self.threshold_tokens:
+                reasons.append("post_tokens_at_or_above_threshold")
+            elif post_tokens > int(self.threshold_tokens * self.quality_gate_max_post_threshold_ratio):
+                reasons.append("post_tokens_too_high")
+
+        if post_message_count >= pre_message_count and post_tokens >= pre_tokens:
+            reasons.append("no_message_or_token_shrink")
+
+        latest_user = self._latest_user_text(original_messages)
+        if latest_user:
+            live_text = self._all_message_text(compressed_messages)
+            # Full-text match catches normal user messages.  The prefix match
+            # gives multimodal/long prompts a stable deterministic anchor.
+            anchor = latest_user[:240]
+            if latest_user not in live_text and anchor not in live_text:
+                reasons.append("latest_user_ask_missing")
+
+        return not reasons, reasons, ledger_fields
 
     @staticmethod
     def _is_context_summary_content(content: Any) -> bool:
@@ -1936,6 +2077,15 @@ The user has requested that this compaction PRIORITISE preserving all informatio
         self._last_aux_model_failure_error = None
         self._last_aux_model_failure_model = None
         self._last_compress_aborted = False
+        self._last_quality_gate_passed = None
+        self._last_quality_gate_reasons = []
+        self._last_ledger_fields_present = {}
+        self._last_pruned_tool_result_count = 0
+        self._last_pre_compression_tokens = current_tokens
+        self._last_post_compression_tokens = None
+        self._last_pre_compression_message_count = len(messages)
+        self._last_post_compression_message_count = 0
+        original_messages = messages
 
         # Manual /compress (force=True) bypasses the failure cooldown so the
         # user can retry immediately after an auto-compress abort.  Without
@@ -1962,6 +2112,7 @@ The user has requested that this compaction PRIORITISE preserving all informatio
         )
         if pruned_count and not self.quiet_mode:
             logger.info("Pre-compression: pruned %d old tool result(s)", pruned_count)
+        self._last_pruned_tool_result_count = pruned_count
 
         # Phase 2: Determine boundaries
         compress_start = self._protect_head_size(messages)
@@ -2037,6 +2188,7 @@ The user has requested that this compaction PRIORITISE preserving all informatio
             )
 
         # Phase 3: Generate structured summary
+        previous_summary_before = self._previous_summary
         summary = self._generate_summary(turns_to_summarize, focus_topic=focus_topic)
 
         # If summary generation failed, behavior splits on
@@ -2146,8 +2298,6 @@ The user has requested that this compaction PRIORITISE preserving all informatio
                 _merge_summary_into_tail = False
             compressed.append(msg)
 
-        self.compression_count += 1
-
         compressed = self._sanitize_tool_pairs(compressed)
 
         # Replace image parts in all compressed messages before the newest
@@ -2160,6 +2310,41 @@ The user has requested that this compaction PRIORITISE preserving all informatio
 
         new_estimate = estimate_messages_tokens_rough(compressed)
         saved_estimate = display_tokens - new_estimate
+        self._last_post_compression_tokens = new_estimate
+        self._last_post_compression_message_count = len(compressed)
+
+        if self.quality_gate_enabled:
+            passed, reasons, ledger_fields = self._evaluate_compression_quality(
+                original_messages=original_messages,
+                compressed_messages=compressed,
+                summary=summary or "",
+                pre_tokens=display_tokens,
+                post_tokens=new_estimate,
+                pre_message_count=n_messages,
+                post_message_count=len(compressed),
+            )
+            self._last_quality_gate_passed = passed
+            self._last_quality_gate_reasons = reasons
+            self._last_ledger_fields_present = ledger_fields
+            if not passed:
+                self._last_compress_aborted = True
+                self._last_summary_error = (
+                    "compression quality gate failed: " + ", ".join(reasons)
+                )
+                self._previous_summary = previous_summary_before
+                if not self.quiet_mode:
+                    logger.warning(
+                        "Compression quality gate failed — preserving original "
+                        "messages unchanged. reasons=%s",
+                        ",".join(reasons),
+                    )
+                return original_messages
+        else:
+            self._last_quality_gate_passed = True
+            self._last_quality_gate_reasons = []
+            self._last_ledger_fields_present = self._extract_state_ledger_fields(summary or "")
+
+        self.compression_count += 1
 
         # Anti-thrashing: track compression effectiveness
         savings_pct = (saved_estimate / display_tokens * 100) if display_tokens > 0 else 0

@@ -1923,6 +1923,59 @@ class TestResponsesEndpoint:
             assert stored_history.count({"role": "user", "content": "Now add 1 more"}) == 1
 
     @pytest.mark.asyncio
+    async def test_previous_response_id_stores_compacted_transcript_as_authoritative(self, adapter):
+        """After compression, previous_response_id must resume compacted history."""
+        prior_history = [
+            {"role": "user", "content": "old large turn"},
+            {"role": "assistant", "content": "old answer"},
+        ]
+        adapter._response_store.put(
+            "resp_prev",
+            {
+                "response": {"id": "resp_prev", "status": "completed"},
+                "conversation_history": list(prior_history),
+                "session_id": "root-session",
+            },
+        )
+        compacted_history = [
+            {"role": "system", "content": "system prompt"},
+            {
+                "role": "assistant",
+                "content": "[CONTEXT COMPACTION - REFERENCE ONLY]\n## State Ledger\nactive_task: Continue",
+            },
+            {"role": "user", "content": "Now add 1 more"},
+            {"role": "assistant", "content": "3"},
+        ]
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (
+                    {
+                        "final_response": "3",
+                        "messages": list(compacted_history),
+                        "session_id": "compressed-session",
+                        "api_calls": 1,
+                    },
+                    {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                )
+                resp = await cli.post(
+                    "/v1/responses",
+                    json={
+                        "model": "hermes-agent",
+                        "input": "Now add 1 more",
+                        "previous_response_id": "resp_prev",
+                    },
+                )
+                assert resp.status == 200
+                data = await resp.json()
+
+        stored = adapter._response_store.get(data["id"])
+        assert stored["conversation_history"] == compacted_history
+        assert stored["session_id"] == "compressed-session"
+        assert prior_history[0] not in stored["conversation_history"]
+
+    @pytest.mark.asyncio
     async def test_previous_response_id_outputs_only_current_turn_items(self, adapter):
         """Response output must not replay previous tool artifacts."""
         prior_history = [
@@ -2436,6 +2489,76 @@ class TestResponsesStreaming:
         assert stored_history == expected_history
         assert stored_history.count(prior_history[0]) == 1
         assert stored_history.count({"role": "user", "content": "Now add 1 more"}) == 1
+
+    @pytest.mark.asyncio
+    async def test_streamed_previous_response_id_stores_compacted_session(self, adapter):
+        prior_history = [
+            {"role": "user", "content": "old large turn"},
+            {"role": "assistant", "content": "old answer"},
+        ]
+        adapter._response_store.put(
+            "resp_prev",
+            {
+                "response": {"id": "resp_prev", "status": "completed"},
+                "conversation_history": list(prior_history),
+                "session_id": "root-session",
+            },
+        )
+        compacted_history = [
+            {"role": "system", "content": "system prompt"},
+            {
+                "role": "assistant",
+                "content": "[CONTEXT COMPACTION - REFERENCE ONLY]\n## State Ledger\nactive_task: Continue",
+            },
+            {"role": "user", "content": "Now add 1 more"},
+            {"role": "assistant", "content": "3"},
+        ]
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            async def _mock_run_agent(**kwargs):
+                cb = kwargs.get("stream_delta_callback")
+                if cb:
+                    cb("3")
+                return (
+                    {
+                        "final_response": "3",
+                        "messages": list(compacted_history),
+                        "session_id": "compressed-session",
+                        "api_calls": 1,
+                    },
+                    {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                )
+
+            with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent):
+                resp = await cli.post(
+                    "/v1/responses",
+                    json={
+                        "model": "hermes-agent",
+                        "input": "Now add 1 more",
+                        "previous_response_id": "resp_prev",
+                        "stream": True,
+                    },
+                )
+                body = await resp.text()
+
+        assert resp.status == 200
+        response_id = None
+        for line in body.splitlines():
+            if line.startswith("data: "):
+                try:
+                    payload = json.loads(line[len("data: "):])
+                except json.JSONDecodeError:
+                    continue
+                if payload.get("type") == "response.completed":
+                    response_id = payload["response"]["id"]
+                    break
+
+        assert response_id
+        stored = adapter._response_store.get(response_id)
+        assert stored["conversation_history"] == compacted_history
+        assert stored["session_id"] == "compressed-session"
+        assert prior_history[0] not in stored["conversation_history"]
 
     @pytest.mark.asyncio
     async def test_stream_cancelled_persists_incomplete_snapshot(self, adapter):

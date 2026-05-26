@@ -61,6 +61,46 @@ def _compression_lock_holder(agent: Any) -> str:
     )
 
 
+def _compression_diagnostics(agent: Any) -> dict[str, Any]:
+    compressor = getattr(agent, "context_compressor", None)
+    if not compressor:
+        return {}
+    return {
+        "threshold_tokens": getattr(compressor, "threshold_tokens", None),
+        "threshold_percent": getattr(compressor, "threshold_percent", None),
+        "target_ratio": getattr(compressor, "summary_target_ratio", None),
+        "tail_token_budget": getattr(compressor, "tail_token_budget", None),
+        "protect_first_n": getattr(compressor, "protect_first_n", None),
+        "protect_last_n": getattr(compressor, "protect_last_n", None),
+        "compression_count": getattr(compressor, "compression_count", None),
+        "summary_success": not bool(getattr(compressor, "_last_summary_error", None)),
+        "summary_error": getattr(compressor, "_last_summary_error", None),
+        "summary_fallback_used": getattr(compressor, "_last_summary_fallback_used", None),
+        "summary_dropped_count": getattr(compressor, "_last_summary_dropped_count", None),
+        "compress_aborted": getattr(compressor, "_last_compress_aborted", None),
+        "quality_gate_enabled": getattr(compressor, "quality_gate_enabled", None),
+        "quality_gate_passed": getattr(compressor, "_last_quality_gate_passed", None),
+        "quality_gate_reasons": getattr(compressor, "_last_quality_gate_reasons", None),
+        "ledger_fields_present": getattr(compressor, "_last_ledger_fields_present", None),
+        "pruned_tool_results": getattr(compressor, "_last_pruned_tool_result_count", None),
+        "post_compression_tokens": getattr(compressor, "_last_post_compression_tokens", None),
+    }
+
+
+def _emit_compression_hook(agent: Any, hook_name: str, **payload: Any) -> None:
+    try:
+        from hermes_cli.plugins import invoke_hook
+
+        invoke_hook(
+            hook_name,
+            session_id=getattr(agent, "session_id", "") or "",
+            request_metadata=getattr(agent, "_request_metadata", None) or {},
+            **payload,
+        )
+    except Exception as exc:
+        logger.debug("%s hook failed: %s", hook_name, exc)
+
+
 def check_compression_model_feasibility(agent: Any) -> None:
     """Warn at session start if the auxiliary compression model's context
     window is smaller than the main model's compression threshold.
@@ -324,6 +364,15 @@ def compress_context(
         f"{approx_tokens:,}" if approx_tokens else "unknown", agent.model,
         focus_topic,
     )
+    _emit_compression_hook(
+        agent,
+        "context_compression_started",
+        pre_message_count=_pre_msg_count,
+        pre_tokens=approx_tokens,
+        model=getattr(agent, "model", None),
+        focus_topic=focus_topic,
+        **_compression_diagnostics(agent),
+    )
     agent._emit_status(
         "🗜️ Compacting context — summarizing earlier conversation so I can continue..."
     )
@@ -458,6 +507,15 @@ def compress_context(
                 "No messages were dropped — conversation continues unchanged. "
                 "Run /compress to retry, or /new to start a fresh session."
             )
+        _emit_compression_hook(
+            agent,
+            "context_compression_aborted",
+            pre_message_count=_pre_msg_count,
+            post_message_count=len(compressed),
+            pre_tokens=approx_tokens,
+            abort_reason=_err,
+            **_compression_diagnostics(agent),
+        )
         _existing_sp = getattr(agent, "_cached_system_prompt", None)
         if not _existing_sp:
             _existing_sp = agent._build_system_prompt(system_message)
@@ -616,6 +674,20 @@ def compress_context(
         reset_file_dedup(task_id)
     except Exception:
         pass
+
+    _emit_compression_hook(
+        agent,
+        "context_compression_completed",
+        old_session_id=locals().get("old_session_id"),
+        new_session_id=getattr(agent, "session_id", None),
+        pre_message_count=_pre_msg_count,
+        post_message_count=len(compressed),
+        pre_tokens=approx_tokens,
+        post_tokens=_compressed_est,
+        model=getattr(agent, "model", None),
+        focus_topic=focus_topic,
+        **_compression_diagnostics(agent),
+    )
 
     logger.info(
         "context compression done: session=%s messages=%d->%d rough_tokens=~%s awaiting_real_usage=true",
