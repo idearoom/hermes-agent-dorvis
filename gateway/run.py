@@ -14975,7 +14975,13 @@ class GatewayRunner:
         ("compression", "enabled"),
         ("compression", "threshold"),
         ("compression", "target_ratio"),
+        ("compression", "protect_first_n"),
         ("compression", "protect_last_n"),
+        ("compression", "abort_on_summary_failure"),
+        ("compression", "quality_gate_enabled"),
+        ("compression", "quality_gate_min_savings_pct"),
+        ("compression", "quality_gate_max_post_threshold_ratio"),
+        ("compression", "hygiene_hard_message_limit"),
         ("agent", "disabled_toolsets"),
     )
 

@@ -48,6 +48,12 @@ def test_transform_llm_output_in_valid_hooks():
     assert "transform_llm_output" in VALID_HOOKS
 
 
+def test_context_compression_hooks_are_valid():
+    assert "context_compression_started" in VALID_HOOKS
+    assert "context_compression_completed" in VALID_HOOKS
+    assert "context_compression_aborted" in VALID_HOOKS
+
+
 def test_hook_receives_expected_kwargs(tmp_path, monkeypatch):
     """Hook callback should see response_text + session_id + model + platform."""
     hermes_home = tmp_path / "hermes_test"
