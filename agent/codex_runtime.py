@@ -180,6 +180,65 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
     """Execute one streaming Responses API request and return the final response."""
     import httpx as _httpx
 
+    def _estimate_tokens_from_value(value: Any) -> int:
+        if value is None:
+            return 0
+        if isinstance(value, str):
+            return (len(value) + 3) // 4
+        try:
+            rendered = json.dumps(
+                value,
+                default=lambda obj: getattr(obj, "__dict__", str(obj)),
+                ensure_ascii=False,
+            )
+        except Exception:
+            rendered = str(value)
+        return (len(rendered) + 3) // 4
+
+    def _estimated_usage_from_recovered_stream() -> SimpleNamespace:
+        try:
+            from agent.chat_completion_helpers import estimate_request_context_tokens
+            input_tokens = estimate_request_context_tokens(api_kwargs)
+        except Exception:
+            input_tokens = _estimate_tokens_from_value(api_kwargs)
+        output_source = "".join(agent._codex_streamed_text_parts)
+        output_tokens = _estimate_tokens_from_value(output_source)
+        if output_tokens <= 0 and collected_output_items:
+            output_tokens = _estimate_tokens_from_value(collected_output_items)
+        input_tokens = max(1, input_tokens)
+        output_tokens = max(1, output_tokens)
+        return SimpleNamespace(
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            total_tokens=input_tokens + output_tokens,
+            input_tokens_details=SimpleNamespace(cached_tokens=0, cache_creation_tokens=0),
+        )
+
+    def _response_from_collected_stream_events():
+        if collected_output_items:
+            return SimpleNamespace(
+                output=list(collected_output_items),
+                usage=_estimated_usage_from_recovered_stream(),
+                status="completed",
+                model=api_kwargs.get("model"),
+            )
+        if agent._codex_streamed_text_parts and not has_tool_calls:
+            assembled = "".join(agent._codex_streamed_text_parts)
+            return SimpleNamespace(
+                output=[
+                    SimpleNamespace(
+                        type="message",
+                        role="assistant",
+                        status="completed",
+                        content=[SimpleNamespace(type="output_text", text=assembled)],
+                    )
+                ],
+                usage=_estimated_usage_from_recovered_stream(),
+                status="completed",
+                model=api_kwargs.get("model"),
+            )
+        return None
+
     active_client = client or agent._ensure_primary_openai_client(reason="codex_stream_direct")
     max_stream_retries = 1
     has_tool_calls = False
@@ -252,23 +311,23 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                 # Backfill from collected items or synthesize from deltas.
                 _out = getattr(final_response, "output", None)
                 if isinstance(_out, list) and not _out:
-                    if collected_output_items:
-                        final_response.output = list(collected_output_items)
+                    recovered_response = _response_from_collected_stream_events()
+                    if recovered_response and collected_output_items:
+                        final_response.output = recovered_response.output
+                        if not getattr(final_response, "usage", None):
+                            final_response.usage = recovered_response.usage
                         logger.debug(
                             "Codex stream: backfilled %d output items from stream events",
                             len(collected_output_items),
                         )
-                    elif agent._codex_streamed_text_parts and not has_tool_calls:
-                        assembled = "".join(agent._codex_streamed_text_parts)
-                        final_response.output = [SimpleNamespace(
-                            type="message",
-                            role="assistant",
-                            status="completed",
-                            content=[SimpleNamespace(type="output_text", text=assembled)],
-                        )]
+                    elif recovered_response:
+                        final_response.output = recovered_response.output
+                        if not getattr(final_response, "usage", None):
+                            final_response.usage = recovered_response.usage
                         logger.debug(
                             "Codex stream: synthesized output from %d text deltas (%d chars)",
-                            len(agent._codex_streamed_text_parts), len(assembled),
+                            len(agent._codex_streamed_text_parts),
+                            len("".join(agent._codex_streamed_text_parts)),
                         )
                 return final_response
         except (_httpx.RemoteProtocolError, _httpx.ReadTimeout, _httpx.ConnectError, ConnectionError) as exc:
@@ -334,6 +393,18 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                     err_text,
                 )
                 return agent._run_codex_create_stream_fallback(api_kwargs, client=active_client)
+            raise
+        except TypeError as exc:
+            err_text = str(exc)
+            if "'NoneType' object is not iterable" in err_text or "NoneType" in err_text and "iterable" in err_text:
+                recovered_response = _response_from_collected_stream_events()
+                if recovered_response is not None:
+                    logger.warning(
+                        "Codex Responses stream terminal event had null output; "
+                        "recovered from collected stream events. %s",
+                        agent._client_log_context(),
+                    )
+                    return recovered_response
             raise
 
 

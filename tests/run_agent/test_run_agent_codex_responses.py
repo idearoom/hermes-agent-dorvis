@@ -174,6 +174,29 @@ class _FakeResponsesStream:
         return self._final_response
 
 
+class _FakeResponsesStreamWithTerminalTypeError:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+    def __iter__(self):
+        yield SimpleNamespace(type="response.output_text.delta", delta="stream ok")
+        yield SimpleNamespace(
+            type="response.output_item.done",
+            item=SimpleNamespace(
+                type="message",
+                status="completed",
+                content=[SimpleNamespace(type="output_text", text="stream ok")],
+            ),
+        )
+        raise TypeError("'NoneType' object is not iterable")
+
+    def get_final_response(self):
+        raise AssertionError("terminal TypeError should be recovered from collected events")
+
+
 class _FakeCreateStream:
     def __init__(self, events):
         self._events = list(events)
@@ -446,6 +469,25 @@ def test_run_codex_stream_falls_back_to_create_after_stream_completion_error(mon
     assert calls["stream"] == 2
     assert calls["create"] == 1
     assert response.output[0].content[0].text == "create fallback ok"
+
+
+def test_run_codex_stream_recovers_when_completed_event_has_null_output(monkeypatch):
+    agent = _build_agent(monkeypatch)
+
+    agent.client = SimpleNamespace(
+        responses=SimpleNamespace(
+            stream=lambda **kwargs: _FakeResponsesStreamWithTerminalTypeError(),
+            create=lambda **kwargs: _codex_message_response("fallback"),
+        )
+    )
+
+    response = agent._run_codex_stream(_codex_request_kwargs())
+
+    assert response.status == "completed"
+    assert response.output[0].content[0].text == "stream ok"
+    assert response.usage.input_tokens > 0
+    assert response.usage.output_tokens > 0
+    assert response.usage.total_tokens == response.usage.input_tokens + response.usage.output_tokens
 
 
 def test_run_codex_stream_fallback_parses_create_stream_events(monkeypatch):
