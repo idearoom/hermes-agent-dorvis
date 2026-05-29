@@ -15,9 +15,27 @@ name: IdeaRoom GHCR Publish
 
 on:
   push:
+    # No path filter on purpose: idearoom-agents derives its base-image tag
+    # from the reference/hermes-agent-dorvis submodule gitlink, so EVERY commit
+    # on main must publish a sha-<commit> image or a pin could 404. A no-op
+    # build with a warm gha cache is cheap -- the push step just tags existing
+    # blobs.
     branches: [main]
   pull_request:
+    # PR builds are validation-only (no push), so only run them when the change
+    # can actually affect the image. Mirrors docker-publish.yml's filter. The
+    # image bakes source via `COPY . .`, hence **/*.py; web/ui-tui- or docs-only
+    # PRs skip pre-merge validation and are covered by the unfiltered main build
+    # on merge (or a manual workflow_dispatch).
     branches: [main]
+    paths:
+      - '**/*.py'
+      - 'pyproject.toml'
+      - 'uv.lock'
+      - 'Dockerfile'
+      - 'docker/**'
+      - '.github/workflows/idearoom-ghcr-publish.yml'
+      - '.github/actions/hermes-smoke-test/**'
   workflow_dispatch:
 
 permissions:
