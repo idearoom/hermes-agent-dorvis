@@ -1,0 +1,110 @@
+name: IdeaRoom GHCR Publish
+
+# Publish the IdeaRoom dorvis fork's runtime image to GHCR so idearoom-agents
+# can build its thin AWS Fargate overlay FROM it, instead of re-mirroring this
+# entire Dockerfile in idearoom-agents/Dockerfile.hermes. That mirror has
+# already drifted once on the tini -> s6-overlay switch; owning the container
+# contract here (one place) removes the drift risk. See idearoom Linear AE-38.
+#
+# This workflow is ADDITIVE to and independent of docker-publish.yml: that one
+# is hard-gated to `NousResearch/hermes-agent` and pushes multi-arch to Docker
+# Hub, so it never runs on this fork, and upstream merges won't touch this
+# IdeaRoom-named file. Here we publish arm64-only to GHCR -- the only consumers
+# are AWS Fargate (arm64), the M4 Mac Mini runtime, and idearoom-agents' image
+# build, which forces linux/arm64.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+# Never cancel a push/dispatch build: idearoom-agents pins the base image by
+# `sha-<commit>`, so every commit on main must get its own immutable tag. PR
+# runs (build + smoke only, no push) collapse to the latest commit.
+concurrency:
+  group: idearoom-ghcr-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  IMAGE_NAME: ghcr.io/idearoom/hermes-agent-dorvis
+
+jobs:
+  build-publish:
+    # Only the IdeaRoom fork publishes to its GHCR namespace; a no-op elsewhere
+    # (including NousResearch, were this file ever to reach it via a merge).
+    if: github.repository == 'idearoom/hermes-agent-dorvis'
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 45
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          submodules: recursive
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f  # v3
+
+      # Build once natively on arm64 and load into the local daemon so the smoke
+      # test runs against the exact image before anything is pushed. The push
+      # step below is a cache hit on every layer.
+      - name: Build image (arm64, for smoke test)
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f  # v7.1.0
+        with:
+          context: .
+          file: Dockerfile
+          load: true
+          platforms: linux/arm64
+          tags: ${{ env.IMAGE_NAME }}:smoke
+          cache-from: type=gha,scope=ghcr-arm64
+          cache-to: type=gha,mode=max,scope=ghcr-arm64
+
+      - name: Smoke test image
+        uses: ./.github/actions/hermes-smoke-test
+        with:
+          image: ${{ env.IMAGE_NAME }}:smoke
+
+      # Everything below pushes -- skipped on pull_request (build + smoke only).
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121  # v4.1.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # `sha-<full-sha>` on every push/dispatch (immutable -- what idearoom-agents
+      # pins to); `latest` only advances on a main push.
+      - name: Compute tags
+        id: tags
+        if: github.event_name != 'pull_request'
+        run: |
+          set -euo pipefail
+          {
+            echo "tags<<EOF"
+            echo "${IMAGE_NAME}:sha-${GITHUB_SHA}"
+            if [ "${GITHUB_REF}" = "refs/heads/main" ]; then
+              echo "${IMAGE_NAME}:latest"
+            fi
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build + push (arm64, cache hit from smoke build)
+        if: github.event_name != 'pull_request'
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f  # v7.1.0
+        with:
+          context: .
+          file: Dockerfile
+          push: true
+          platforms: linux/arm64
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=https://github.com/idearoom/hermes-agent-dorvis
+          tags: ${{ steps.tags.outputs.tags }}
+          cache-from: type=gha,scope=ghcr-arm64
+          cache-to: type=gha,mode=max,scope=ghcr-arm64
