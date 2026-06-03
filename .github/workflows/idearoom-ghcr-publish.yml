@@ -37,6 +37,14 @@ on:
       - '.github/workflows/idearoom-ghcr-publish.yml'
       - '.github/actions/hermes-smoke-test/**'
   workflow_dispatch:
+    inputs:
+      sha:
+        description: >-
+          Exact hermes-agent-dorvis commit to build and publish as sha-<commit>
+          (e.g. the reference/hermes-agent-dorvis gitlink idearoom-agents pins).
+          Leave blank to publish this branch's HEAD.
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -63,6 +71,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
         with:
+          ref: ${{ inputs.sha || github.sha }}
           submodules: recursive
 
       - name: Set up Docker Buildx
@@ -97,16 +106,22 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       # `sha-<full-sha>` on every push/dispatch (immutable -- what idearoom-agents
-      # pins to); `latest` only advances on a main push.
+      # pins to). On a manual dispatch the SHA is the `sha` input when given (so
+      # an explicit pin can be backfilled), else the checked-out commit. `latest`
+      # only advances on an actual push to main -- never on a manual backfill,
+      # which would otherwise point latest at an old commit.
       - name: Compute tags
         id: tags
         if: github.event_name != 'pull_request'
+        env:
+          TARGET_SHA: ${{ inputs.sha || github.sha }}
+          EVENT_NAME: ${{ github.event_name }}
         run: |
           set -euo pipefail
           {
             echo "tags<<EOF"
-            echo "${IMAGE_NAME}:sha-${GITHUB_SHA}"
-            if [ "${GITHUB_REF}" = "refs/heads/main" ]; then
+            echo "${IMAGE_NAME}:sha-${TARGET_SHA}"
+            if [ "${EVENT_NAME}" = "push" ] && [ "${GITHUB_REF}" = "refs/heads/main" ]; then
               echo "${IMAGE_NAME}:latest"
             fi
             echo "EOF"
@@ -121,7 +136,7 @@ jobs:
           push: true
           platforms: linux/arm64
           labels: |
-            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.revision=${{ inputs.sha || github.sha }}
             org.opencontainers.image.source=https://github.com/idearoom/hermes-agent-dorvis
           tags: ${{ steps.tags.outputs.tags }}
           cache-from: type=gha,scope=ghcr-arm64
