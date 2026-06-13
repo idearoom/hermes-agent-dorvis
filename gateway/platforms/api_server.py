@@ -647,6 +647,35 @@ class ResponseStore:
         return row[0] if row else 0
 
 
+def make_response_store():
+    """Select the Responses API store backend (IdeaRoom D6 / AE-61).
+
+    Postgres when ``HERMES_RESPONSE_STORE_DSN`` is set (the AWS Hermes task points
+    it at RDS — SQLite on the EFS agent home is ~1000x slower under concurrency);
+    otherwise the SQLite ``ResponseStore`` unchanged (local dev, Mac Mini). A
+    Postgres init failure falls back to SQLite with a loud error rather than
+    leaving the gateway unbootable.
+    """
+    dsn = os.getenv("HERMES_RESPONSE_STORE_DSN", "").strip()
+    if dsn:
+        try:
+            from gateway.platforms.response_store_pg import PgResponseStore
+
+            store = PgResponseStore(dsn, max_size=MAX_STORED_RESPONSES)
+            logger.info(
+                "ResponseStore: using Postgres backend (HERMES_RESPONSE_STORE_DSN set)"
+            )
+            return store
+        except Exception:
+            logger.error(
+                "ResponseStore: Postgres backend init FAILED — falling back to SQLite. "
+                "SQLite on an EFS/NFS agent home is slow under concurrency (AE-61 D6); "
+                "check HERMES_RESPONSE_STORE_DSN and RDS reachability.",
+                exc_info=True,
+            )
+    return ResponseStore()
+
+
 # ---------------------------------------------------------------------------
 # CORS middleware
 # ---------------------------------------------------------------------------
@@ -868,7 +897,7 @@ class APIServerAdapter(BasePlatformAdapter):
         self._app: Optional["web.Application"] = None
         self._runner: Optional["web.AppRunner"] = None
         self._site: Optional["web.TCPSite"] = None
-        self._response_store = ResponseStore()
+        self._response_store = make_response_store()
         # Active run streams: run_id -> asyncio.Queue of SSE event dicts
         self._run_streams: Dict[str, "asyncio.Queue[Optional[Dict]]"] = {}
         # Creation timestamps for orphaned-run TTL sweep
