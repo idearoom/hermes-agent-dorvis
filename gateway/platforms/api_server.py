@@ -1228,8 +1228,15 @@ class APIServerAdapter(BasePlatformAdapter):
 
     async def _handle_health(self, request: "web.Request") -> "web.Response":
         """GET /health — simple health check."""
+        from gateway.status import get_source_revision
+
         return web.json_response(
-            {"status": "ok", "platform": "hermes-agent", "version": _hermes_version()}
+            {
+                "status": "ok",
+                "platform": "hermes-agent",
+                "version": _hermes_version(),
+                "source_revision": get_source_revision(),
+            }
         )
 
     async def _handle_health_detailed(self, request: "web.Request") -> "web.Response":
@@ -1239,13 +1246,14 @@ class APIServerAdapter(BasePlatformAdapter):
         dashboard can display full status without needing a shared PID file or
         /proc access.  No authentication required.
         """
-        from gateway.status import read_runtime_status
+        from gateway.status import get_source_revision, read_runtime_status
 
         runtime = read_runtime_status() or {}
         return web.json_response({
             "status": "ok",
             "platform": "hermes-agent",
             "version": _hermes_version(),
+            "source_revision": get_source_revision(),
             "gateway_state": runtime.get("gateway_state"),
             "platforms": runtime.get("platforms", {}),
             "active_agents": runtime.get("active_agents", 0),

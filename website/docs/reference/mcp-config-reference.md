@@ -34,6 +34,7 @@ mcp_servers:
     timeout: 120
     connect_timeout: 60
     supports_parallel_tool_calls: false
+    hermes_context: false  # opt in to Hermes-owned _meta on tools/call
     tools:
       include: []
       exclude: []
@@ -57,6 +58,7 @@ mcp_servers:
 | `timeout` | number | both | Tool call timeout |
 | `connect_timeout` | number | both | Initial connection timeout |
 | `supports_parallel_tool_calls` | bool | both | Allow tools from this server to run concurrently |
+| `hermes_context` | bool or mapping | both | Opt in to Hermes-owned request metadata on tool calls |
 | `tools` | mapping | both | Filtering and utility-tool policy |
 | `auth` | string | HTTP | Authentication method. Set to `oauth` to enable OAuth 2.1 with PKCE |
 | `sampling` | mapping | both | Server-initiated LLM request policy (see MCP guide) |
@@ -153,6 +155,37 @@ Behavior:
 - no discovery
 - no tool registration
 - config remains in place for later reuse
+
+## Hermes runtime context
+
+Most MCP servers should leave `hermes_context` unset or `false`. For trusted
+internal servers that need to key work by the active Hermes conversation, enable
+it per server:
+
+```yaml
+mcp_servers:
+  sandbox:
+    url: "https://sandbox.internal/mcp"
+    hermes_context:
+      enabled: true
+```
+
+When enabled and a tool call has a runtime `task_id`, Hermes sends it in the MCP
+request metadata, not in model-controlled tool arguments:
+
+```json
+{
+  "_meta": {
+    "hermes": {
+      "task_id": "..."
+    }
+  }
+}
+```
+
+Use this for internal orchestrators such as chat-scoped sandboxes. It is off by
+default so strict third-party MCP servers continue to receive only the arguments
+their schemas declare.
 
 ## Empty result behavior
 

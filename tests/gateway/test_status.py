@@ -8,6 +8,12 @@ from types import SimpleNamespace
 from gateway import status
 
 
+def _clear_source_revision_cache():
+    resolver = getattr(status, "_resolve_source_revision_cached", None)
+    if resolver is not None:
+        resolver.cache_clear()
+
+
 class TestGatewayPidState:
     def test_write_pid_file_records_gateway_metadata(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
@@ -246,6 +252,45 @@ class TestGatewayPidState:
 
 
 class TestGatewayRuntimeStatus:
+    def test_get_source_revision_prefers_env_commit(self, monkeypatch):
+        _clear_source_revision_cache()
+        monkeypatch.setenv("HERMES_SOURCE_COMMIT", "sha-" + ("A" * 40))
+
+        revision = status.get_source_revision()
+
+        assert revision == {
+            "commit": "a" * 40,
+            "source": "env:HERMES_SOURCE_COMMIT",
+        }
+
+    def test_get_source_revision_falls_back_to_git(self, monkeypatch):
+        _clear_source_revision_cache()
+        monkeypatch.delenv("HERMES_SOURCE_COMMIT", raising=False)
+
+        def fake_run(cmd, capture_output=False, text=False, timeout=None):
+            assert cmd[0:3] == ["git", "-C", str(Path(status.__file__).resolve().parents[1])]
+            assert cmd[3:] == ["rev-parse", "HEAD"]
+            return SimpleNamespace(returncode=0, stdout=("b" * 40) + "\n", stderr="")
+
+        monkeypatch.setattr(status.subprocess, "run", fake_run)
+
+        revision = status.get_source_revision()
+
+        assert revision == {"commit": "b" * 40, "source": "git"}
+
+    def test_get_source_revision_returns_unknown_when_unavailable(self, monkeypatch):
+        _clear_source_revision_cache()
+        monkeypatch.delenv("HERMES_SOURCE_COMMIT", raising=False)
+
+        def fake_run(cmd, capture_output=False, text=False, timeout=None):
+            return SimpleNamespace(returncode=1, stdout="", stderr="not a git repo")
+
+        monkeypatch.setattr(status.subprocess, "run", fake_run)
+
+        revision = status.get_source_revision()
+
+        assert revision == {"commit": None, "source": "unknown"}
+
     def test_write_json_file_uses_atomic_json_write(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         calls = []
@@ -310,6 +355,16 @@ class TestGatewayRuntimeStatus:
         assert payload["argv"] == ["/new/path/hermes", "gateway", "run"]
         assert payload["pid"] == os.getpid()
         assert payload["start_time"] == 2000
+
+    def test_write_runtime_status_records_source_revision(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        source_revision = {"commit": "c" * 40, "source": "env:HERMES_SOURCE_COMMIT"}
+        monkeypatch.setattr(status, "get_source_revision", lambda: source_revision)
+
+        status.write_runtime_status(gateway_state="running")
+
+        payload = status.read_runtime_status()
+        assert payload["source_revision"] == source_revision
 
     def test_write_runtime_status_records_platform_failure(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))

@@ -345,6 +345,43 @@ def _get_dialog_policy_config() -> Tuple[str, float]:
         return DEFAULT_DIALOG_POLICY, DEFAULT_DIALOG_TIMEOUT_S
 
 
+def _coerce_bool(value: object, default: bool) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "on", "enabled"}:
+        return True
+    if text in {"0", "false", "no", "off", "disabled"}:
+        return False
+    return default
+
+
+def _is_cdp_supervisor_enabled() -> bool:
+    """Return whether the out-of-band CDP supervisor should attach.
+
+    Defaults on for existing local / Browserbase behavior. AWS can disable this
+    for Browserless raw-CDP pools to avoid opening a second browser process per
+    chat until the fork has a single-CDP-client supervisor model.
+    """
+    env_value = os.environ.get("BROWSER_CDP_SUPERVISOR_ENABLED")
+    if env_value is not None and env_value.strip():
+        return _coerce_bool(env_value, True)
+
+    try:
+        from hermes_cli.config import read_raw_config
+
+        cfg = read_raw_config()
+        browser_cfg = cfg.get("browser", {}) if isinstance(cfg, dict) else {}
+        if isinstance(browser_cfg, dict) and "cdp_supervisor_enabled" in browser_cfg:
+            return _coerce_bool(browser_cfg.get("cdp_supervisor_enabled"), True)
+    except Exception as exc:
+        logger.debug("Could not read browser.cdp_supervisor_enabled from config: %s", exc)
+
+    return True
+
+
 def _ensure_cdp_supervisor(task_id: str) -> None:
     """Start a CDP supervisor for ``task_id`` if an endpoint is reachable.
 
@@ -374,6 +411,9 @@ def _ensure_cdp_supervisor(task_id: str) -> None:
         if maybe:
             cdp_url = _resolve_cdp_override(maybe)
     if not cdp_url:
+        return
+    if not _is_cdp_supervisor_enabled():
+        logger.debug("CDP supervisor disabled; skipping attach for task=%s", task_id)
         return
     try:
         from tools.browser_supervisor import SUPERVISOR_REGISTRY  # type: ignore[import-not-found]

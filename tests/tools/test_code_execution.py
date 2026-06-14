@@ -37,6 +37,7 @@ from unittest.mock import patch, MagicMock
 
 from tools.code_execution_tool import (
     SANDBOX_ALLOWED_TOOLS,
+    ExecuteCodeBudgetExceeded,
     execute_code,
     generate_hermes_tools_module,
     check_sandbox_requirements,
@@ -44,6 +45,10 @@ from tools.code_execution_tool import (
     EXECUTE_CODE_SCHEMA,
     _TOOL_DOC_LINES,
     _execute_remote,
+    _clear_execute_code_turn_budgets,
+    _finish_execute_code_turn_budget,
+    _remaining_execute_code_turn_budget,
+    _reserve_execute_code_turn_budget,
 )
 
 
@@ -443,6 +448,96 @@ except ValueError as e:
         result = self._run(code)
         self.assertEqual(result["status"], "success")
         self.assertIn("caught: nope", result["output"])
+
+
+class TestExecuteCodeTurnBudget(unittest.TestCase):
+    def setUp(self):
+        _clear_execute_code_turn_budgets()
+
+    def tearDown(self):
+        _clear_execute_code_turn_budgets()
+
+    def test_budget_ignored_without_turn_id(self):
+        reservation = _reserve_execute_code_turn_budget(
+            task_id="task-1",
+            turn_id=None,
+            config={"turn_budget_seconds": 3},
+            requested_timeout=10,
+        )
+        self.assertIsNone(reservation.key)
+        self.assertEqual(reservation.timeout_seconds, 10)
+
+    def test_reservation_caps_timeout_and_records_actual_usage(self):
+        reservation = _reserve_execute_code_turn_budget(
+            task_id="task-1",
+            turn_id="turn-1",
+            config={"turn_budget_seconds": 3},
+            requested_timeout=10,
+        )
+        self.assertEqual(reservation.timeout_seconds, 3)
+
+        _finish_execute_code_turn_budget(reservation, duration_seconds=1.25)
+
+        remaining = _remaining_execute_code_turn_budget(
+            task_id="task-1",
+            turn_id="turn-1",
+            config={"turn_budget_seconds": 3},
+        )
+        self.assertAlmostEqual(remaining, 1.75, places=2)
+
+    def test_active_reservations_reduce_remaining_budget(self):
+        first = _reserve_execute_code_turn_budget(
+            task_id="task-1",
+            turn_id="turn-1",
+            config={"turn_budget_seconds": 5},
+            requested_timeout=4,
+        )
+        second = _reserve_execute_code_turn_budget(
+            task_id="task-1",
+            turn_id="turn-1",
+            config={"turn_budget_seconds": 5},
+            requested_timeout=4,
+        )
+
+        self.assertEqual(first.timeout_seconds, 4)
+        self.assertEqual(second.timeout_seconds, 1)
+
+    def test_exhausted_budget_raises(self):
+        reservation = _reserve_execute_code_turn_budget(
+            task_id="task-1",
+            turn_id="turn-1",
+            config={"turn_budget_seconds": 2},
+            requested_timeout=10,
+        )
+        _finish_execute_code_turn_budget(reservation, duration_seconds=2.2)
+
+        with self.assertRaises(ExecuteCodeBudgetExceeded):
+            _reserve_execute_code_turn_budget(
+                task_id="task-1",
+                turn_id="turn-1",
+                config={"turn_budget_seconds": 2},
+                requested_timeout=10,
+            )
+
+    def test_registered_handler_passes_turn_id(self):
+        from tools.registry import registry
+
+        entry = registry.get_entry("execute_code")
+        self.assertIsNotNone(entry)
+        with patch("tools.code_execution_tool.execute_code", return_value="{}") as mock_execute:
+            entry.handler(
+                {"code": "print('ok')"},
+                task_id="task-1",
+                turn_id="turn-1",
+                enabled_tools=["terminal"],
+            )
+
+        mock_execute.assert_called_once_with(
+            code="print('ok')",
+            task_id="task-1",
+            turn_id="turn-1",
+            enabled_tools=["terminal"],
+        )
 
 
 class TestStubSchemaDrift(unittest.TestCase):

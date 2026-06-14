@@ -14,10 +14,12 @@ concurrently under distinct configurations).
 import hashlib
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
 from datetime import datetime, timezone
+from functools import lru_cache
 from pathlib import Path
 from hermes_constants import get_hermes_home
 from typing import Any, Optional
@@ -35,6 +37,8 @@ _IS_WINDOWS = sys.platform == "win32"
 _UNSET = object()
 _GATEWAY_LOCK_FILENAME = "gateway.lock"
 _gateway_lock_handle = None
+_SOURCE_COMMIT_ENV = "HERMES_SOURCE_COMMIT"
+_SOURCE_COMMIT_RE = re.compile(r"^(?:sha-)?([0-9a-fA-F]{7,64})$")
 # Windows byte-range locks are mandatory for other readers. Lock a byte well
 # past the JSON payload so runtime status / PID readers can still read the file
 # while another process holds the mutual-exclusion lock.
@@ -71,6 +75,47 @@ def _get_lock_dir() -> Path:
 
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _normalize_source_commit(value: object) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+    match = _SOURCE_COMMIT_RE.fullmatch(value.strip())
+    if not match:
+        return None
+    return match.group(1).lower()
+
+
+@lru_cache(maxsize=1)
+def _resolve_source_revision_cached() -> tuple[Optional[str], str]:
+    env_commit = _normalize_source_commit(os.getenv(_SOURCE_COMMIT_ENV))
+    if env_commit:
+        return env_commit, f"env:{_SOURCE_COMMIT_ENV}"
+
+    source_root = Path(__file__).resolve().parents[1]
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(source_root), "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=1,
+        )
+    except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
+        return None, "unknown"
+
+    if result.returncode != 0:
+        return None, "unknown"
+
+    git_commit = _normalize_source_commit(result.stdout)
+    if not git_commit:
+        return None, "unknown"
+    return git_commit, "git"
+
+
+def get_source_revision() -> dict[str, Optional[str]]:
+    """Return the Hermes runtime source revision exposed through health/status."""
+    commit, source = _resolve_source_revision_cached()
+    return {"commit": commit, "source": source}
 
 
 def terminate_pid(pid: int, *, force: bool = False) -> None:
@@ -206,6 +251,7 @@ def _build_pid_record() -> dict:
         "kind": _GATEWAY_KIND,
         "argv": list(sys.argv),
         "start_time": _get_process_start_time(os.getpid()),
+        "source_revision": get_source_revision(),
     }
 
 
@@ -525,6 +571,7 @@ def write_runtime_status(
     payload["pid"] = current_record["pid"]
     payload["argv"] = current_record["argv"]
     payload["start_time"] = current_record["start_time"]
+    payload["source_revision"] = current_record["source_revision"]
     payload["updated_at"] = _utc_now_iso()
 
     if gateway_state is not _UNSET:

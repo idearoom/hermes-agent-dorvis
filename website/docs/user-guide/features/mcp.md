@@ -299,6 +299,7 @@ Hermes reads MCP config from `~/.hermes/config.yaml` under `mcp_servers`.
 | `connect_timeout` | number | Initial connection timeout |
 | `enabled` | bool | If `false`, Hermes skips the server entirely |
 | `supports_parallel_tool_calls` | bool | If `true`, tools from this server may run concurrently |
+| `hermes_context` | bool or mapping | Opt in to Hermes-owned `_meta.hermes.task_id` on tool calls |
 | `tools` | mapping | Per-server tool filtering and utility policy |
 
 ### Minimal stdio example
@@ -319,6 +320,23 @@ mcp_servers:
     headers:
       Authorization: "Bearer ***"
 ```
+
+### Trusted Hermes context
+
+Internal orchestration servers can opt in to runtime context:
+
+```yaml
+mcp_servers:
+  sandbox:
+    url: "https://sandbox.internal/mcp"
+    hermes_context:
+      enabled: true
+```
+
+When enabled, Hermes includes the current `task_id` under
+`_meta.hermes.task_id` on `tools/call` requests. This metadata is produced by
+Hermes at dispatch time and is not part of the model-controlled tool arguments.
+Leave it off for ordinary third-party MCP servers.
 
 ## Built-in presets
 

@@ -160,6 +160,7 @@ Switching mode changes where scripts run and which interpreter runs them, not wh
 | Resource | Limit | Notes |
 |----------|-------|-------|
 | **Timeout** | 5 minutes (300s) | Script is killed with SIGTERM, then SIGKILL after 5s grace |
+| **Turn budget** | 5 minutes (300s) per assistant turn | Multiple `execute_code` calls in the same turn share this wall-clock budget; set to `0` to disable |
 | **Stdout** | 50 KB | Output truncated with `[output truncated at 50KB]` notice |
 | **Stderr** | 10 KB | Included in output on non-zero exit for debugging |
 | **Tool calls** | 50 per execution | Error returned when limit reached |
@@ -169,9 +170,10 @@ All limits are configurable via `config.yaml`:
 ```yaml
 # In ~/.hermes/config.yaml
 code_execution:
-  mode: project      # project (default) | strict
-  timeout: 300       # Max seconds per script (default: 300)
-  max_tool_calls: 50 # Max tool calls per execution (default: 50)
+  mode: project              # project (default) | strict
+  timeout: 300               # Max seconds per script (default: 300)
+  turn_budget_seconds: 300   # Shared execute_code wall-clock budget per assistant turn; 0 disables
+  max_tool_calls: 50         # Max tool calls per execution (default: 50)
 ```
 
 ## How Tool Calls Work Inside Scripts

@@ -47,6 +47,22 @@ def _make_mock_server(name, session=None, tools=None):
     return server
 
 
+def _run_mcp_handler_direct(coro_or_factory, timeout=30):
+    """Run an MCP handler coroutine directly for unit tests."""
+    del timeout
+    from tools.mcp_tool import _servers
+
+    coro = coro_or_factory() if callable(coro_or_factory) else coro_or_factory
+
+    async def _install_locks_and_run():
+        for server in list(_servers.values()):
+            if getattr(server, "_rpc_lock", None) is None:
+                server._rpc_lock = asyncio.Lock()
+        return await coro
+
+    return asyncio.run(_install_locks_and_run())
+
+
 # ---------------------------------------------------------------------------
 # Config loading
 # ---------------------------------------------------------------------------
@@ -1869,6 +1885,96 @@ class TestConfigurableTimeouts:
                        call_kwargs[1].get("timeout") == 180
         finally:
             _servers.pop("test_srv", None)
+
+
+# ---------------------------------------------------------------------------
+# Hermes context propagation
+# ---------------------------------------------------------------------------
+
+class TestHermesContextPropagation:
+    """Tests for opt-in Hermes runtime context on MCP tool calls."""
+
+    def test_default_call_does_not_send_mcp_meta(self):
+        from tools.mcp_tool import _make_tool_handler, _servers
+
+        mock_session = MagicMock()
+        mock_session.call_tool = AsyncMock(
+            return_value=_make_call_result("ok", is_error=False)
+        )
+        server = SimpleNamespace(
+            session=mock_session,
+            _rpc_lock=None,
+            _config={},
+        )
+        _servers["sandbox"] = server
+
+        try:
+            handler = _make_tool_handler("sandbox", "run", 120)
+            with patch("tools.mcp_tool._run_on_mcp_loop", side_effect=_run_mcp_handler_direct):
+                result = json.loads(handler({"cmd": "pwd"}, task_id="chat-123"))
+
+            assert result == {"result": "ok"}
+            mock_session.call_tool.assert_awaited_once_with(
+                "run",
+                arguments={"cmd": "pwd"},
+            )
+        finally:
+            _servers.pop("sandbox", None)
+
+    def test_opt_in_server_sends_task_id_in_mcp_meta(self):
+        from tools.mcp_tool import _make_tool_handler, _servers
+
+        mock_session = MagicMock()
+        mock_session.call_tool = AsyncMock(
+            return_value=_make_call_result("ok", is_error=False)
+        )
+        server = SimpleNamespace(
+            session=mock_session,
+            _rpc_lock=None,
+            _config={"hermes_context": {"enabled": True}},
+        )
+        _servers["sandbox"] = server
+
+        try:
+            handler = _make_tool_handler("sandbox", "run", 120)
+            with patch("tools.mcp_tool._run_on_mcp_loop", side_effect=_run_mcp_handler_direct):
+                result = json.loads(handler({"cmd": "pwd"}, task_id="chat-123"))
+
+            assert result == {"result": "ok"}
+            mock_session.call_tool.assert_awaited_once_with(
+                "run",
+                arguments={"cmd": "pwd"},
+                meta={"hermes": {"task_id": "chat-123"}},
+            )
+        finally:
+            _servers.pop("sandbox", None)
+
+    def test_empty_task_id_omits_mcp_meta_even_when_opted_in(self):
+        from tools.mcp_tool import _make_tool_handler, _servers
+
+        mock_session = MagicMock()
+        mock_session.call_tool = AsyncMock(
+            return_value=_make_call_result("ok", is_error=False)
+        )
+        server = SimpleNamespace(
+            session=mock_session,
+            _rpc_lock=None,
+            _config={"hermes_context": True},
+        )
+        _servers["sandbox"] = server
+
+        try:
+            handler = _make_tool_handler("sandbox", "run", 120)
+            with patch("tools.mcp_tool._run_on_mcp_loop", side_effect=_run_mcp_handler_direct):
+                result = json.loads(handler({"cmd": "pwd"}, task_id=""))
+
+            assert result == {"result": "ok"}
+            mock_session.call_tool.assert_awaited_once_with(
+                "run",
+                arguments={"cmd": "pwd"},
+            )
+        finally:
+            _servers.pop("sandbox", None)
 
 
 # ---------------------------------------------------------------------------

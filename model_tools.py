@@ -1123,6 +1123,7 @@ def handle_function_call(
                     return registry.dispatch(
                         function_name, next_args,
                         task_id=task_id,
+                        turn_id=turn_id,
                         enabled_tools=sandbox_enabled,
                     )
             else:

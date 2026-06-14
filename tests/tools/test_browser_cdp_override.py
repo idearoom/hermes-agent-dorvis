@@ -101,6 +101,101 @@ class TestGetCdpOverride:
         assert resolved == WS_URL
         mock_get.assert_called_once_with(VERSION_URL, timeout=10)
 
+
+class TestCdpSupervisorEnabled:
+    def test_enabled_by_default(self, monkeypatch):
+        import tools.browser_tool as browser_tool
+
+        monkeypatch.delenv("BROWSER_CDP_SUPERVISOR_ENABLED", raising=False)
+
+        with patch("hermes_cli.config.read_raw_config", return_value={}):
+            assert browser_tool._is_cdp_supervisor_enabled() is True
+
+    def test_env_false_disables_supervisor(self, monkeypatch):
+        import tools.browser_tool as browser_tool
+
+        monkeypatch.setenv("BROWSER_CDP_SUPERVISOR_ENABLED", "false")
+
+        assert browser_tool._is_cdp_supervisor_enabled() is False
+
+    def test_config_false_disables_supervisor_when_env_missing(self, monkeypatch):
+        import tools.browser_tool as browser_tool
+
+        monkeypatch.delenv("BROWSER_CDP_SUPERVISOR_ENABLED", raising=False)
+
+        with patch(
+            "hermes_cli.config.read_raw_config",
+            return_value={"browser": {"cdp_supervisor_enabled": False}},
+        ):
+            assert browser_tool._is_cdp_supervisor_enabled() is False
+
+    def test_disabled_supervisor_does_not_start_registry(self, monkeypatch):
+        import sys
+        import types
+
+        import tools.browser_tool as browser_tool
+
+        calls = []
+
+        class Registry:
+            def get_or_start(self, **kwargs):
+                calls.append(kwargs)
+
+        monkeypatch.setenv("BROWSER_CDP_URL", "ws://browserless.internal/?launch=%7B%7D")
+        monkeypatch.setenv("BROWSER_CDP_SUPERVISOR_ENABLED", "false")
+        monkeypatch.setattr(
+            browser_tool,
+            "_get_dialog_policy_config",
+            lambda: ("must_respond", 300.0),
+        )
+
+        monkeypatch.setitem(
+            sys.modules,
+            "tools.browser_supervisor",
+            types.SimpleNamespace(SUPERVISOR_REGISTRY=Registry()),
+        )
+
+        browser_tool._ensure_cdp_supervisor("task-raw-cdp")
+
+        assert calls == []
+
+    def test_enabled_supervisor_still_starts_registry(self, monkeypatch):
+        import sys
+        import types
+
+        import tools.browser_tool as browser_tool
+
+        calls = []
+
+        class Registry:
+            def get_or_start(self, **kwargs):
+                calls.append(kwargs)
+
+        monkeypatch.setenv("BROWSER_CDP_URL", "ws://browserless.internal/?launch=%7B%7D")
+        monkeypatch.setenv("BROWSER_CDP_SUPERVISOR_ENABLED", "true")
+        monkeypatch.setattr(
+            browser_tool,
+            "_get_dialog_policy_config",
+            lambda: ("must_respond", 300.0),
+        )
+
+        monkeypatch.setitem(
+            sys.modules,
+            "tools.browser_supervisor",
+            types.SimpleNamespace(SUPERVISOR_REGISTRY=Registry()),
+        )
+
+        browser_tool._ensure_cdp_supervisor("task-raw-cdp")
+
+        assert calls == [
+            {
+                "task_id": "task-raw-cdp",
+                "cdp_url": "ws://browserless.internal/?launch=%7B%7D",
+                "dialog_policy": "must_respond",
+                "dialog_timeout_s": 300.0,
+            }
+        ]
+
     def test_uses_config_browser_cdp_url_when_env_missing(self, monkeypatch):
         import tools.browser_tool as browser_tool
 

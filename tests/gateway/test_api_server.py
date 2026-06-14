@@ -514,6 +514,22 @@ class TestHealthEndpoint:
             assert data["version"] != ""
 
     @pytest.mark.asyncio
+    async def test_health_reports_source_revision(self, adapter):
+        """GET /health exposes the runtime source revision for deploy audits."""
+        source_revision = {
+            "commit": "a" * 40,
+            "source": "env:HERMES_SOURCE_COMMIT",
+        }
+
+        app = _create_app(adapter)
+        with patch("gateway.status.get_source_revision", return_value=source_revision):
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.get("/health")
+                assert resp.status == 200
+                data = await resp.json()
+                assert data["source_revision"] == source_revision
+
+    @pytest.mark.asyncio
     async def test_v1_health_alias_returns_ok(self, adapter):
         """GET /v1/health should return the same response as /health."""
         app = _create_app(adapter)
@@ -554,6 +570,22 @@ class TestHealthDetailedEndpoint:
                 assert data["active_agents"] == 2
                 assert isinstance(data["pid"], int)
                 assert "updated_at" in data
+
+    @pytest.mark.asyncio
+    async def test_health_detailed_reports_source_revision(self, adapter):
+        source_revision = {
+            "commit": "b" * 40,
+            "source": "git",
+        }
+
+        app = _create_app(adapter)
+        with patch("gateway.status.read_runtime_status", return_value=None), \
+             patch("gateway.status.get_source_revision", return_value=source_revision):
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.get("/health/detailed")
+                assert resp.status == 200
+                data = await resp.json()
+                assert data["source_revision"] == source_revision
 
     @pytest.mark.asyncio
     async def test_health_detailed_no_runtime_status(self, adapter):

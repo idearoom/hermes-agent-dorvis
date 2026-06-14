@@ -29,6 +29,7 @@ Remote execution additionally requires Python 3 in the terminal backend.
 """
 
 import base64
+from dataclasses import dataclass
 import functools
 import json
 import logging
@@ -71,8 +72,189 @@ SANDBOX_ALLOWED_TOOLS = frozenset([
 # Resource limit defaults (overridable via config.yaml → code_execution.*)
 DEFAULT_TIMEOUT = 300        # 5 minutes
 DEFAULT_MAX_TOOL_CALLS = 50
+DEFAULT_TURN_BUDGET_SECONDS = 300
 MAX_STDOUT_BYTES = 50_000    # 50 KB
 MAX_STDERR_BYTES = 10_000    # 10 KB
+
+_TURN_BUDGET_MAX_ENTRIES = 4096
+_TURN_BUDGET_STALE_SECONDS = 60 * 60
+_turn_budget_lock = threading.Lock()
+_turn_budget_usage: dict[tuple[str, str], dict[str, float]] = {}
+
+
+class ExecuteCodeBudgetExceeded(RuntimeError):
+    def __init__(self, *, task_id: str, turn_id: str, budget_seconds: float, used_seconds: float):
+        self.task_id = task_id
+        self.turn_id = turn_id
+        self.budget_seconds = budget_seconds
+        self.used_seconds = used_seconds
+        super().__init__(
+            "execute_code turn budget exhausted "
+            f"for task {task_id!r}, turn {turn_id!r} "
+            f"({used_seconds:.2f}s used of {budget_seconds:.2f}s)."
+        )
+
+
+@dataclass(frozen=True)
+class ExecuteCodeBudgetReservation:
+    key: tuple[str, str] | None
+    budget_seconds: float | None
+    timeout_seconds: float
+    reserved_seconds: float = 0.0
+
+
+def _configured_turn_budget_seconds(config: dict) -> float | None:
+    raw = config.get("turn_budget_seconds", DEFAULT_TURN_BUDGET_SECONDS)
+    if raw is None or raw == "":
+        return float(DEFAULT_TURN_BUDGET_SECONDS)
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        logger.warning(
+            "Ignoring code_execution.turn_budget_seconds=%r; using default %ss",
+            raw,
+            DEFAULT_TURN_BUDGET_SECONDS,
+        )
+        return float(DEFAULT_TURN_BUDGET_SECONDS)
+    if value <= 0:
+        return None
+    return value
+
+
+def _turn_budget_key(task_id: Optional[str], turn_id: Optional[str]) -> tuple[str, str] | None:
+    if not turn_id:
+        return None
+    return (str(task_id or "default"), str(turn_id))
+
+
+def _prune_turn_budget_usage(now: float) -> None:
+    stale = [
+        key for key, state in _turn_budget_usage.items()
+        if now - state.get("updated_at", now) > _TURN_BUDGET_STALE_SECONDS
+    ]
+    for key in stale:
+        _turn_budget_usage.pop(key, None)
+
+    if len(_turn_budget_usage) <= _TURN_BUDGET_MAX_ENTRIES:
+        return
+    oldest = sorted(
+        _turn_budget_usage.items(),
+        key=lambda item: item[1].get("updated_at", 0.0),
+    )
+    for key, _state in oldest[: len(_turn_budget_usage) - _TURN_BUDGET_MAX_ENTRIES]:
+        _turn_budget_usage.pop(key, None)
+
+
+def _clear_execute_code_turn_budgets() -> None:
+    with _turn_budget_lock:
+        _turn_budget_usage.clear()
+
+
+def _remaining_execute_code_turn_budget(
+    *,
+    task_id: Optional[str],
+    turn_id: Optional[str],
+    config: dict,
+) -> float | None:
+    budget = _configured_turn_budget_seconds(config)
+    key = _turn_budget_key(task_id, turn_id)
+    if budget is None or key is None:
+        return None
+    with _turn_budget_lock:
+        state = _turn_budget_usage.get(key, {})
+        used = state.get("used", 0.0)
+        reserved = state.get("reserved", 0.0)
+    return max(0.0, budget - used - reserved)
+
+
+def _reserve_execute_code_turn_budget(
+    *,
+    task_id: Optional[str],
+    turn_id: Optional[str],
+    config: dict,
+    requested_timeout: float,
+) -> ExecuteCodeBudgetReservation:
+    try:
+        timeout = float(requested_timeout)
+    except (TypeError, ValueError):
+        timeout = float(DEFAULT_TIMEOUT)
+    if timeout <= 0:
+        timeout = float(DEFAULT_TIMEOUT)
+
+    budget = _configured_turn_budget_seconds(config)
+    key = _turn_budget_key(task_id, turn_id)
+    if budget is None or key is None:
+        return ExecuteCodeBudgetReservation(
+            key=None,
+            budget_seconds=budget,
+            timeout_seconds=timeout,
+            reserved_seconds=0.0,
+        )
+
+    now = time.monotonic()
+    with _turn_budget_lock:
+        _prune_turn_budget_usage(now)
+        state = _turn_budget_usage.setdefault(
+            key,
+            {"used": 0.0, "reserved": 0.0, "updated_at": now},
+        )
+        used = state.get("used", 0.0)
+        reserved = state.get("reserved", 0.0)
+        remaining = budget - used - reserved
+        if remaining <= 0:
+            raise ExecuteCodeBudgetExceeded(
+                task_id=key[0],
+                turn_id=key[1],
+                budget_seconds=budget,
+                used_seconds=used + reserved,
+            )
+        reserved_seconds = min(timeout, remaining)
+        state["reserved"] = reserved + reserved_seconds
+        state["updated_at"] = now
+
+    return ExecuteCodeBudgetReservation(
+        key=key,
+        budget_seconds=budget,
+        timeout_seconds=reserved_seconds,
+        reserved_seconds=reserved_seconds,
+    )
+
+
+def _finish_execute_code_turn_budget(
+    reservation: ExecuteCodeBudgetReservation,
+    *,
+    duration_seconds: float,
+) -> None:
+    if reservation.key is None:
+        return
+    try:
+        duration = max(0.0, float(duration_seconds))
+    except (TypeError, ValueError):
+        duration = 0.0
+    now = time.monotonic()
+    with _turn_budget_lock:
+        state = _turn_budget_usage.setdefault(
+            reservation.key,
+            {"used": 0.0, "reserved": 0.0, "updated_at": now},
+        )
+        state["reserved"] = max(
+            0.0,
+            state.get("reserved", 0.0) - reservation.reserved_seconds,
+        )
+        state["used"] = state.get("used", 0.0) + duration
+        state["updated_at"] = now
+
+
+def _budget_exceeded_result(exc: ExecuteCodeBudgetExceeded) -> dict:
+    return {
+        "status": "error",
+        "error": str(exc),
+        "tool_calls_made": 0,
+        "duration_seconds": 0,
+        "budget_seconds": round(exc.budget_seconds, 2),
+        "budget_used_seconds": round(exc.used_seconds, 2),
+        "budget_remaining_seconds": 0,
+    }
 
 # Environment variable scrubbing rules (shared between the local + remote
 # backends).  Secret-substring block is applied first; anything left must
@@ -870,6 +1052,7 @@ def _execute_remote(
     code: str,
     task_id: Optional[str],
     enabled_tools: Optional[List[str]],
+    turn_id: Optional[str] = None,
 ) -> str:
     """Run a script on the remote terminal backend via file-based RPC.
 
@@ -881,6 +1064,8 @@ def _execute_remote(
     _cfg = _load_config()
     timeout = _cfg.get("timeout", DEFAULT_TIMEOUT)
     max_tool_calls = _cfg.get("max_tool_calls", DEFAULT_MAX_TOOL_CALLS)
+    exec_start = time.monotonic()
+    budget_reservation: ExecuteCodeBudgetReservation | None = None
 
     session_tools = set(enabled_tools) if enabled_tools else set()
     sandbox_tools = frozenset(SANDBOX_ALLOWED_TOOLS & session_tools)
@@ -898,11 +1083,18 @@ def _execute_remote(
 
     tool_call_log: list = []
     tool_call_counter = [0]
-    exec_start = time.monotonic()
     stop_event = threading.Event()
     rpc_thread = None
 
     try:
+        budget_reservation = _reserve_execute_code_turn_budget(
+            task_id=task_id,
+            turn_id=turn_id,
+            config=_cfg,
+            requested_timeout=timeout,
+        )
+        timeout = budget_reservation.timeout_seconds
+
         # Verify Python is available on the remote
         py_check = env.execute(
             "command -v python3 >/dev/null 2>&1 && echo OK",
@@ -973,6 +1165,9 @@ def _execute_remote(
         elif exit_code == 130:
             status = "interrupted"
 
+    except ExecuteCodeBudgetExceeded as exc:
+        return json.dumps(_budget_exceeded_result(exc), ensure_ascii=False)
+
     except Exception as exc:
         duration = round(time.monotonic() - exec_start, 2)
         logger.error(
@@ -992,6 +1187,12 @@ def _execute_remote(
         stop_event.set()
         if rpc_thread is not None:
             rpc_thread.join(timeout=5)
+
+        if budget_reservation is not None:
+            _finish_execute_code_turn_budget(
+                budget_reservation,
+                duration_seconds=time.monotonic() - exec_start,
+            )
 
         # Clean up remote sandbox dir
         try:
@@ -1066,6 +1267,7 @@ def _execute_remote(
 def execute_code(
     code: str,
     task_id: Optional[str] = None,
+    turn_id: Optional[str] = None,
     enabled_tools: Optional[List[str]] = None,
 ) -> str:
     """
@@ -1112,7 +1314,7 @@ def execute_code(
         }, ensure_ascii=False)
 
     if env_type != "local":
-        return _execute_remote(code, task_id, enabled_tools)
+        return _execute_remote(code, task_id, enabled_tools, turn_id=turn_id)
 
     # --- Local execution path (UDS) --- below this line is unchanged ---
 
@@ -1157,8 +1359,17 @@ def execute_code(
     tool_call_counter = [0]  # mutable so the RPC thread can increment
     exec_start = time.monotonic()
     server_sock = None
+    budget_reservation: ExecuteCodeBudgetReservation | None = None
 
     try:
+        budget_reservation = _reserve_execute_code_turn_budget(
+            task_id=task_id,
+            turn_id=turn_id,
+            config=_cfg,
+            requested_timeout=timeout,
+        )
+        timeout = budget_reservation.timeout_seconds
+
         # Write the auto-generated hermes_tools module.
         # encoding="utf-8" is required on Windows — the stub and user code
         # both contain non-ASCII characters (em-dashes in docstrings, plus
@@ -1463,6 +1674,9 @@ def execute_code(
 
         return json.dumps(result, ensure_ascii=False)
 
+    except ExecuteCodeBudgetExceeded as exc:
+        return json.dumps(_budget_exceeded_result(exc), ensure_ascii=False)
+
     except Exception as exc:
         duration = round(time.monotonic() - exec_start, 2)
         logger.error(
@@ -1489,6 +1703,11 @@ def execute_code(
                 logger.debug("Server socket close error: %s", e)
         import shutil
         shutil.rmtree(tmpdir, ignore_errors=True)
+        if budget_reservation is not None:
+            _finish_execute_code_turn_budget(
+                budget_reservation,
+                duration_seconds=time.monotonic() - exec_start,
+            )
         try:
             # Only UDS has a filesystem socket to unlink; TCP sockets are
             # freed by server_sock.close() above.
@@ -1825,6 +2044,7 @@ registry.register(
     handler=lambda args, **kw: execute_code(
         code=args.get("code", ""),
         task_id=kw.get("task_id"),
+        turn_id=kw.get("turn_id"),
         enabled_tools=kw.get("enabled_tools")),
     check_fn=check_sandbox_requirements,
     emoji="🐍",
