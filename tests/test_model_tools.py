@@ -65,6 +65,7 @@ class TestHandleFunctionCall:
                 turn_id="",
                 api_request_id="",
                 middleware_trace=[],
+                request_metadata={},
             ),
             call(
                 "post_tool_call",
@@ -81,6 +82,7 @@ class TestHandleFunctionCall:
                 error_type=None,
                 error_message=None,
                 middleware_trace=[],
+                request_metadata={},
             ),
             call(
                 "transform_tool_result",
@@ -96,6 +98,7 @@ class TestHandleFunctionCall:
                 status="ok",
                 error_type=None,
                 error_message=None,
+                request_metadata={},
             ),
         ]
 
@@ -200,6 +203,38 @@ class TestHandleFunctionCall:
         post_call = next(call for call in hook_calls if call[0] == "post_tool_call")
         assert pre_call[1]["middleware_trace"] == expected_trace
         assert post_call[1]["middleware_trace"] == expected_trace
+
+    def test_execute_code_dispatch_receives_turn_id(self):
+        seen = {}
+
+        def fake_dispatch(tool_name, args, **kwargs):
+            seen["dispatch"] = (tool_name, args, kwargs)
+            return json.dumps({"ok": True})
+
+        with (
+            patch("model_tools.registry.dispatch", side_effect=fake_dispatch),
+            patch("hermes_cli.plugins.has_hook", return_value=False),
+        ):
+            result = json.loads(
+                handle_function_call(
+                    "execute_code",
+                    {"code": "print('ok')"},
+                    task_id="task-1",
+                    turn_id="turn-1",
+                    enabled_tools=["execute_code", "terminal"],
+                )
+            )
+
+        assert result == {"ok": True}
+        assert seen["dispatch"] == (
+            "execute_code",
+            {"code": "print('ok')"},
+            {
+                "task_id": "task-1",
+                "turn_id": "turn-1",
+                "enabled_tools": ["execute_code", "terminal"],
+            },
+        )
 
 
 # =========================================================================
