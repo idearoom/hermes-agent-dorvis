@@ -3658,6 +3658,10 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                 }, ensure_ascii=False)
 
         async def _call():
+            call_meta = _build_hermes_call_meta(
+                getattr(server, "_config", {}) or {},
+                kwargs,
+            )
             async with server._rpc_lock:
                 # Snapshot the agent's context so an elicitation callback
                 # triggered during this call (fired on the MCP recv loop
@@ -3665,7 +3669,14 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                 # it and detect the gateway platform / session for routing.
                 server._pending_call_context = contextvars.copy_context()
                 try:
-                    result = await server.session.call_tool(tool_name, arguments=args)
+                    if call_meta:
+                        result = await server.session.call_tool(
+                            tool_name,
+                            arguments=args,
+                            meta=call_meta,
+                        )
+                    else:
+                        result = await server.session.call_tool(tool_name, arguments=args)
                 finally:
                     server._pending_call_context = None
             # MCP CallToolResult has .content (list of content blocks) and .isError
@@ -4323,6 +4334,24 @@ def _parse_boolish(value: Any, default: bool = True) -> bool:
             return False
     logger.warning("MCP config expected a boolean-ish value, got %r; using default=%s", value, default)
     return default
+
+
+def _mcp_hermes_context_enabled(config: dict) -> bool:
+    """Return whether this MCP server opted into Hermes runtime metadata."""
+    setting = config.get("hermes_context")
+    if isinstance(setting, dict):
+        return _parse_boolish(setting.get("enabled"), default=False)
+    return _parse_boolish(setting, default=False)
+
+
+def _build_hermes_call_meta(config: dict, dispatch_kwargs: dict) -> Optional[dict]:
+    """Build MCP request metadata that is trusted by Hermes, not the model."""
+    if not _mcp_hermes_context_enabled(config):
+        return None
+    task_id = str(dispatch_kwargs.get("task_id") or "").strip()
+    if not task_id:
+        return None
+    return {"hermes": {"task_id": task_id}}
 
 
 _UTILITY_CAPABILITY_METHODS = {

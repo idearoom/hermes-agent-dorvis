@@ -1527,8 +1527,15 @@ class APIServerAdapter(BasePlatformAdapter):
 
     async def _handle_health(self, request: "web.Request") -> "web.Response":
         """GET /health — simple health check."""
+        from gateway.status import get_source_revision
+
         return web.json_response(
-            {"status": "ok", "platform": "hermes-agent", "version": _hermes_version()}
+            {
+                "status": "ok",
+                "platform": "hermes-agent",
+                "version": _hermes_version(),
+                "source_revision": get_source_revision(),
+            }
         )
 
     async def _handle_health_detailed(self, request: "web.Request") -> "web.Response":
@@ -1545,6 +1552,7 @@ class APIServerAdapter(BasePlatformAdapter):
         from gateway.status import (
             derive_gateway_busy,
             derive_gateway_drainable,
+            get_source_revision,
             parse_active_agents,
             read_runtime_status,
         )
@@ -1559,6 +1567,7 @@ class APIServerAdapter(BasePlatformAdapter):
             "status": "ok",
             "platform": "hermes-agent",
             "version": _hermes_version(),
+            "source_revision": get_source_revision(),
             "gateway_state": gw_state,
             "platforms": runtime.get("platforms", {}),
             "active_agents": gw_active,
