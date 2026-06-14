@@ -415,6 +415,10 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_get("/v1/models", adapter._handle_models)
     app.router.add_get("/v1/capabilities", adapter._handle_capabilities)
     app.router.add_get("/v1/skills", adapter._handle_skills)
+    app.router.add_get("/v1/skills/pending", adapter._handle_skill_pending_list)
+    app.router.add_get("/v1/skills/pending/{pending_id}/diff", adapter._handle_skill_pending_diff)
+    app.router.add_post("/v1/skills/pending/{pending_id}/approve", adapter._handle_skill_pending_approve)
+    app.router.add_post("/v1/skills/pending/{pending_id}/reject", adapter._handle_skill_pending_reject)
     app.router.add_get("/v1/toolsets", adapter._handle_toolsets)
     app.router.add_post("/v1/chat/completions", adapter._handle_chat_completions)
     app.router.add_post("/v1/responses", adapter._handle_responses)
@@ -776,6 +780,129 @@ class TestSkillsEndpoint:
 
                 authed = await cli.get(
                     "/v1/skills",
+                    headers={"Authorization": "Bearer sk-secret"},
+                )
+                assert authed.status == 200
+
+    @pytest.mark.asyncio
+    async def test_skill_pending_list_returns_review_metadata(self, adapter):
+        records = [
+            {
+                "id": "abc123",
+                "subsystem": "skills",
+                "action": "create",
+                "summary": "create skill deploy-helper",
+                "origin": "background_review",
+                "created_at": 1781460000.0,
+                "payload": {
+                    "action": "create",
+                    "name": "deploy-helper",
+                    "category": "ops",
+                    "content": "large skill content is not listed",
+                },
+            }
+        ]
+        with patch("tools.write_approval.list_pending", return_value=records):
+            app = _create_app(adapter)
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.get("/v1/skills/pending")
+                assert resp.status == 200
+                data = await resp.json()
+                assert data["object"] == "list"
+                assert data["subsystem"] == "skills"
+                assert data["total"] == 1
+                row = data["data"][0]
+                assert row["id"] == "abc123"
+                assert row["name"] == "deploy-helper"
+                assert row["skill_action"] == "create"
+                assert row["category"] == "ops"
+                assert "content" not in row
+                assert "payload" not in row
+
+    @pytest.mark.asyncio
+    async def test_skill_pending_diff_returns_unified_diff(self, adapter):
+        rec = {"id": "abc123", "summary": "patch skill", "payload": {"name": "deploy-helper"}}
+        with patch("tools.write_approval.get_pending", return_value=rec), patch(
+            "tools.write_approval.skill_pending_diff",
+            return_value="--- old\n+++ new\n@@\n-before\n+after\n",
+        ):
+            app = _create_app(adapter)
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.get("/v1/skills/pending/abc123/diff")
+                assert resp.status == 200
+                data = await resp.json()
+                assert data["object"] == "hermes.skill_pending.diff"
+                assert data["id"] == "abc123"
+                assert data["summary"] == "patch skill"
+                assert "+after" in data["diff"]
+
+    @pytest.mark.asyncio
+    async def test_skill_pending_diff_404s_for_missing_id(self, adapter):
+        with patch("tools.write_approval.get_pending", return_value=None):
+            app = _create_app(adapter)
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.get("/v1/skills/pending/missing/diff")
+                assert resp.status == 404
+
+    @pytest.mark.asyncio
+    async def test_skill_pending_approve_applies_one_record(self, adapter):
+        rec = {"id": "abc123", "summary": "create skill", "payload": {"name": "deploy-helper"}}
+        with patch("tools.write_approval.get_pending", side_effect=[rec, None]), patch(
+            "hermes_cli.write_approval_commands.handle_pending_subcommand",
+            return_value="Approved 1 skills write(s).",
+        ) as handle:
+            app = _create_app(adapter)
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.post("/v1/skills/pending/abc123/approve")
+                assert resp.status == 200
+                data = await resp.json()
+                assert data["object"] == "hermes.skill_pending.action"
+                assert data["ok"] is True
+                assert data["action"] == "approve"
+                handle.assert_called_once_with("skills", ["approve", "abc123"])
+
+    @pytest.mark.asyncio
+    async def test_skill_pending_approve_reports_failed_apply(self, adapter):
+        rec = {"id": "abc123", "summary": "create skill", "payload": {"name": "deploy-helper"}}
+        with patch("tools.write_approval.get_pending", side_effect=[rec, rec]), patch(
+            "hermes_cli.write_approval_commands.handle_pending_subcommand",
+            return_value="Approved 0 skills write(s).\nFailed:\n  abc123: bad payload",
+        ):
+            app = _create_app(adapter)
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.post("/v1/skills/pending/abc123/approve")
+                assert resp.status == 500
+                data = await resp.json()
+                assert data["ok"] is False
+                assert data["action"] == "approve"
+                assert "bad payload" in data["message"]
+
+    @pytest.mark.asyncio
+    async def test_skill_pending_reject_discards_one_record(self, adapter):
+        rec = {"id": "abc123", "summary": "create skill", "payload": {"name": "deploy-helper"}}
+        with patch("tools.write_approval.get_pending", side_effect=[rec, None]), patch(
+            "hermes_cli.write_approval_commands.handle_pending_subcommand",
+            return_value="Rejected pending skills write 'abc123'.",
+        ) as handle:
+            app = _create_app(adapter)
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.post("/v1/skills/pending/abc123/reject")
+                assert resp.status == 200
+                data = await resp.json()
+                assert data["ok"] is True
+                assert data["action"] == "reject"
+                handle.assert_called_once_with("skills", ["reject", "abc123"])
+
+    @pytest.mark.asyncio
+    async def test_skill_pending_requires_auth_when_key_configured(self, auth_adapter):
+        with patch("tools.write_approval.list_pending", return_value=[]):
+            app = _create_app(auth_adapter)
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.get("/v1/skills/pending")
+                assert resp.status == 401
+
+                authed = await cli.get(
+                    "/v1/skills/pending",
                     headers={"Authorization": "Bearer sk-secret"},
                 )
                 assert authed.status == 200
