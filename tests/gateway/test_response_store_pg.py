@@ -1,8 +1,9 @@
 """Behavioral tests for the Postgres Responses API store (IdeaRoom D6 / AE-61).
 
 Parity with the SQLite ``ResponseStore`` in ``gateway/platforms/api_server.py``:
-get/put/delete/get_conversation/set_conversation/__len__ plus LRU eviction and
-accessed_at bump.
+get/put/delete/get_conversation/set_conversation/__len__. Unlike the SQLite
+fallback, the Postgres adapter is durable state and does not apply the old LRU
+cap.
 
 Requires a reachable Postgres; provide its DSN via ``HERMES_D6_TEST_DSN``
 (e.g. ``postgresql://user@localhost:5432/hermes_d6_test``). The test is skipped
@@ -84,23 +85,14 @@ def test_put_replaces_same_id(store):
     assert len(store) == 1
 
 
-def test_lru_eviction_by_accessed_at(store):
-    # max_size=3. Insert 3, touch the first so it is most-recent, then insert a
-    # 4th — the least-recently-accessed of the remaining should be evicted.
-    import time
-
+def test_max_size_argument_does_not_evict_durable_responses(store):
     store.put("a", {"v": "a"})
-    time.sleep(0.01)
     store.put("b", {"v": "b"})
-    time.sleep(0.01)
     store.put("c", {"v": "c"})
-    time.sleep(0.01)
-    store.get("a")  # bump a's accessed_at -> a is now newest
-    time.sleep(0.01)
-    store.put("d", {"v": "d"})  # over capacity -> evict oldest (b)
-    assert len(store) == 3
-    assert store.get("b") is None
+    store.put("d", {"v": "d"})
+    assert len(store) == 4
     assert store.get("a") == {"v": "a"}
+    assert store.get("b") == {"v": "b"}
     assert store.get("c") == {"v": "c"}
     assert store.get("d") == {"v": "d"}
 
@@ -122,13 +114,10 @@ def test_delete(store):
     assert store.delete("r1") is False  # already gone
 
 
-def test_eviction_clears_conversation_mappings(store):
-    import time
-
+def test_inserting_later_responses_preserves_conversation_mappings(store):
     for rid in ("a", "b", "c"):
         store.put(rid, {"v": rid})
         store.set_conversation(f"conv-{rid}", rid)
-        time.sleep(0.01)
-    store.put("d", {"v": "d"})  # evicts a
-    assert store.get_conversation("conv-a") is None
+    store.put("d", {"v": "d"})
+    assert store.get_conversation("conv-a") == "a"
     assert store.get_conversation("conv-b") == "b"
