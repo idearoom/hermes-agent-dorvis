@@ -661,7 +661,7 @@ def make_response_store():
         try:
             from gateway.platforms.response_store_pg import PgResponseStore
 
-            store = PgResponseStore(dsn, max_size=MAX_STORED_RESPONSES)
+            store = PgResponseStore(dsn)
             logger.info(
                 "ResponseStore: using Postgres backend (HERMES_RESPONSE_STORE_DSN set)"
             )

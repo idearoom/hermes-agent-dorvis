@@ -31,9 +31,11 @@ from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
 
-# Match api_server.MAX_STORED_RESPONSES; passed in explicitly by the factory so
-# this module never imports api_server (avoids a cycle).
-DEFAULT_MAX_STORED_RESPONSES = 100
+# ``max_size`` is still accepted by ``PgResponseStore.__init__`` for interface
+# parity with the SQLite store, but Postgres is the durable response store on
+# AWS. It must not evict model-visible conversation state just because more
+# turns arrived later.
+DEFAULT_MAX_STORED_RESPONSES = None
 
 _SCHEMA = "hermes_gw"
 
@@ -55,7 +57,7 @@ def _normalize_dsn(dsn: str) -> str:
 
 
 class PgResponseStore:
-    """Postgres-backed LRU store for Responses API state.
+    """Postgres-backed durable store for Responses API state.
 
     Interface parity with ``api_server.ResponseStore``:
     ``get / put / delete / get_conversation / set_conversation / close / __len__``.
@@ -67,11 +69,14 @@ class PgResponseStore:
     def __init__(
         self,
         dsn: str,
-        max_size: int = DEFAULT_MAX_STORED_RESPONSES,
+        max_size: Optional[int] = DEFAULT_MAX_STORED_RESPONSES,
         *,
         min_pool: int = 1,
         max_pool: int = 8,
     ) -> None:
+        # Kept for constructor compatibility only. Unlike the SQLite fallback,
+        # the Postgres adapter is durable state and intentionally does not apply
+        # the old 100-response LRU cap.
         self._max_size = max_size
         # Lazy imports: only the Postgres path pulls these in.
         from psycopg.types.json import Jsonb  # noqa: F401  (used in put)
@@ -101,8 +106,9 @@ class PgResponseStore:
                     accessed_at DOUBLE PRECISION NOT NULL
                 )"""
             )
-            # LRU eviction sorts on accessed_at — index it (the SQLite store
-            # full-scans; Postgres should not).
+            # accessed_at remains useful for diagnostics and future explicit
+            # retention policies, even though this durable store does not apply
+            # automatic LRU eviction.
             conn.execute(
                 f"CREATE INDEX IF NOT EXISTS idx_responses_accessed_at "
                 f"ON {_SCHEMA}.responses (accessed_at)"
@@ -115,7 +121,7 @@ class PgResponseStore:
             )
 
     def get(self, response_id: str) -> Optional[Dict[str, Any]]:
-        """Retrieve a stored response by ID (updates access time for LRU)."""
+        """Retrieve a stored response by ID and refresh diagnostic access time."""
         with self._pool.connection() as conn:
             row = conn.execute(
                 f"SELECT data FROM {_SCHEMA}.responses WHERE response_id = %s",
@@ -133,7 +139,7 @@ class PgResponseStore:
             return row[0]
 
     def put(self, response_id: str, data: Dict[str, Any]) -> None:
-        """Store a response, evicting the oldest if at capacity."""
+        """Store a response without automatic eviction."""
         with self._pool.connection() as conn:
             conn.execute(
                 f"""INSERT INTO {_SCHEMA}.responses (response_id, data, accessed_at)
@@ -142,29 +148,6 @@ class PgResponseStore:
                     DO UPDATE SET data = EXCLUDED.data, accessed_at = EXCLUDED.accessed_at""",
                 (response_id, self._Jsonb(data, dumps=_dumps), time.time()),
             )
-            count = conn.execute(
-                f"SELECT COUNT(*) FROM {_SCHEMA}.responses"
-            ).fetchone()[0]
-            if count > self._max_size:
-                evict_ids = [
-                    r[0]
-                    for r in conn.execute(
-                        f"SELECT response_id FROM {_SCHEMA}.responses "
-                        f"ORDER BY accessed_at ASC LIMIT %s",
-                        (count - self._max_size,),
-                    ).fetchall()
-                ]
-                if evict_ids:
-                    conn.execute(
-                        f"DELETE FROM {_SCHEMA}.conversations "
-                        f"WHERE response_id = ANY(%s)",
-                        (evict_ids,),
-                    )
-                    conn.execute(
-                        f"DELETE FROM {_SCHEMA}.responses "
-                        f"WHERE response_id = ANY(%s)",
-                        (evict_ids,),
-                    )
 
     def delete(self, response_id: str) -> bool:
         """Remove a response from the store. Returns True if found and deleted."""
