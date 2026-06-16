@@ -427,6 +427,18 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
     return app
 
 
+def _parse_sse_events(body: str) -> list[dict]:
+    events = []
+    for line in body.splitlines():
+        if not line.startswith("data: "):
+            continue
+        try:
+            events.append(json.loads(line[len("data: "):]))
+        except json.JSONDecodeError:
+            continue
+    return events
+
+
 @pytest.fixture
 def adapter():
     return _make_adapter()
@@ -470,6 +482,53 @@ class TestAgentExecution:
             conversation_history=[],
             task_id="session-123",
         )
+
+    @pytest.mark.asyncio
+    async def test_run_agent_usage_includes_context_compaction_and_cost(self, adapter):
+        class _FakeCompressor:
+            last_prompt_tokens = 4096
+            context_length = 8192
+            compression_count = 2
+
+        class _FakeCost:
+            status = "estimated"
+            amount_usd = 0.0123
+
+        mock_agent = MagicMock()
+        mock_agent.run_conversation.return_value = {"final_response": "ok"}
+        mock_agent.session_prompt_tokens = 10
+        mock_agent.session_completion_tokens = 5
+        mock_agent.session_total_tokens = 15
+        mock_agent.session_input_tokens = 11
+        mock_agent.session_output_tokens = 5
+        mock_agent.session_cache_read_tokens = 3
+        mock_agent.session_cache_write_tokens = 2
+        mock_agent.context_compressor = _FakeCompressor()
+        mock_agent.model = "gpt-5.5"
+        mock_agent.provider = "openai"
+        mock_agent.base_url = None
+
+        with (
+            patch.object(adapter, "_create_agent", return_value=mock_agent),
+            patch("agent.usage_pricing.estimate_usage_cost", return_value=_FakeCost()) as mock_cost,
+        ):
+            result, usage = await adapter._run_agent(
+                user_message="hello",
+                conversation_history=[],
+                session_id="session-123",
+            )
+
+        assert result["final_response"] == "ok"
+        assert usage["input_tokens"] == 10
+        assert usage["output_tokens"] == 5
+        assert usage["total_tokens"] == 15
+        assert usage["context_used"] == 4096
+        assert usage["context_max"] == 8192
+        assert usage["context_percent"] == 50
+        assert usage["compressions"] == 2
+        assert usage["cost_status"] == "estimated"
+        assert usage["cost_usd"] == 0.0123
+        assert mock_cost.call_count == 1
 
 
 # ---------------------------------------------------------------------------
@@ -2411,6 +2470,92 @@ class TestResponsesStreaming:
                 assert '"logprobs": []' in body
                 assert "Hello" in body
                 assert " world" in body
+
+    @pytest.mark.asyncio
+    async def test_stream_completed_preserves_responses_usage_context(self, adapter):
+        app = _create_app(adapter)
+        usage = {
+            "input_tokens": 10,
+            "output_tokens": 5,
+            "total_tokens": 15,
+            "context_used": 4096,
+            "context_max": 8192,
+            "context_percent": 50,
+            "compressions": 2,
+            "cost_usd": 0.0123,
+        }
+
+        async with TestClient(TestServer(app)) as cli:
+            async def _mock_run_agent(**kwargs):
+                cb = kwargs.get("stream_delta_callback")
+                if cb:
+                    cb("Usage visible")
+                return (
+                    {"final_response": "Usage visible", "messages": [], "api_calls": 1},
+                    dict(usage),
+                )
+
+            with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent):
+                resp = await cli.post(
+                    "/v1/responses",
+                    json={"model": "hermes-agent", "input": "hi", "stream": True},
+                )
+                assert resp.status == 200
+                body = await resp.text()
+
+            completed = next(
+                event for event in _parse_sse_events(body)
+                if event.get("type") == "response.completed"
+            )
+            assert completed["response"]["usage"] == usage
+
+            response_id = completed["response"]["id"]
+            get_resp = await cli.get(f"/v1/responses/{response_id}")
+            assert get_resp.status == 200
+            stored = await get_resp.json()
+            assert stored["usage"] == usage
+
+    @pytest.mark.asyncio
+    async def test_stream_failed_preserves_usage_and_structured_error(self, adapter):
+        app = _create_app(adapter)
+        usage = {
+            "input_tokens": 25,
+            "output_tokens": 0,
+            "total_tokens": 25,
+            "context_used": 7000,
+            "context_max": 8000,
+            "context_percent": 88,
+            "compressions": 1,
+            "cost_usd": 0.02,
+        }
+
+        async with TestClient(TestServer(app)) as cli:
+            async def _mock_run_agent(**kwargs):
+                return (
+                    {
+                        "final_response": "",
+                        "messages": [],
+                        "api_calls": 1,
+                        "error": "OpenAI quota exceeded for this account",
+                    },
+                    dict(usage),
+                )
+
+            with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent):
+                resp = await cli.post(
+                    "/v1/responses",
+                    json={"model": "hermes-agent", "input": "hi", "stream": True},
+                )
+                assert resp.status == 200
+                body = await resp.text()
+
+        failed = next(
+            event for event in _parse_sse_events(body)
+            if event.get("type") == "response.failed"
+        )
+        assert failed["error"]["type"] == "quota_exceeded"
+        assert failed["response"]["error"]["type"] == "quota_exceeded"
+        assert failed["response"]["usage"] == usage
 
     @pytest.mark.asyncio
     async def test_stream_string_false_returns_json_response(self, adapter):

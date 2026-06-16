@@ -143,6 +143,113 @@ def _coerce_request_bool(value: Any, default: bool = False) -> bool:
     return default
 
 
+def _coerce_token_count(value: Any, default: Optional[int] = 0) -> Optional[int]:
+    if isinstance(value, bool):
+        return default
+    if isinstance(value, (int, float)):
+        return max(0, int(value))
+    return default
+
+
+def _agent_token_count(agent: Any, name: str, default: Optional[int] = 0) -> Optional[int]:
+    try:
+        return _coerce_token_count(getattr(agent, name, default), default)
+    except Exception:
+        return default
+
+
+def _session_usage_snapshot(agent: Any) -> Dict[str, Any]:
+    input_tokens = _agent_token_count(agent, "session_prompt_tokens", 0) or 0
+    output_tokens = _agent_token_count(agent, "session_completion_tokens", 0) or 0
+    total_tokens = _agent_token_count(agent, "session_total_tokens", 0) or 0
+    usage: Dict[str, Any] = {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": total_tokens,
+    }
+
+    try:
+        comp = getattr(agent, "context_compressor", None)
+    except Exception:
+        comp = None
+    if comp is not None:
+        ctx_used = _coerce_token_count(getattr(comp, "last_prompt_tokens", None), None)
+        ctx_max = _coerce_token_count(getattr(comp, "context_length", None), None)
+        if ctx_max:
+            if ctx_used is None:
+                ctx_used = total_tokens
+            usage["context_used"] = ctx_used
+            usage["context_max"] = ctx_max
+            usage["context_percent"] = max(0, min(100, round(ctx_used / ctx_max * 100)))
+        compressions = _coerce_token_count(getattr(comp, "compression_count", None), None)
+        if compressions is not None:
+            usage["compressions"] = compressions
+
+    try:
+        model = getattr(agent, "model", "") or ""
+    except Exception:
+        model = ""
+    if isinstance(model, str) and model:
+        try:
+            from agent.usage_pricing import CanonicalUsage, estimate_usage_cost
+
+            cost = estimate_usage_cost(
+                model,
+                CanonicalUsage(
+                    input_tokens=_agent_token_count(agent, "session_input_tokens", input_tokens) or input_tokens,
+                    output_tokens=_agent_token_count(agent, "session_output_tokens", output_tokens) or output_tokens,
+                    cache_read_tokens=_agent_token_count(agent, "session_cache_read_tokens", 0) or 0,
+                    cache_write_tokens=_agent_token_count(agent, "session_cache_write_tokens", 0) or 0,
+                ),
+                provider=getattr(agent, "provider", None),
+                base_url=getattr(agent, "base_url", None),
+            )
+            usage["cost_status"] = cost.status
+            if cost.amount_usd is not None:
+                usage["cost_usd"] = float(cost.amount_usd)
+        except Exception:
+            pass
+
+    return usage
+
+
+_RESPONSES_USAGE_EXTRA_KEYS = (
+    "context_used",
+    "context_max",
+    "context_percent",
+    "compressions",
+    "cost_usd",
+    "cost_status",
+)
+
+
+def _responses_usage_payload(usage: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    usage = usage or {}
+    payload: Dict[str, Any] = {
+        "input_tokens": _coerce_token_count(usage.get("input_tokens"), 0) or 0,
+        "output_tokens": _coerce_token_count(usage.get("output_tokens"), 0) or 0,
+        "total_tokens": _coerce_token_count(usage.get("total_tokens"), 0) or 0,
+    }
+    for key in _RESPONSES_USAGE_EXTRA_KEYS:
+        value = usage.get(key)
+        if value is not None:
+            payload[key] = value
+    return payload
+
+
+def _responses_error_type(message: Any, explicit_type: Any = None) -> str:
+    text = f"{explicit_type or ''} {message or ''}".strip().lower()
+    if any(marker in text for marker in ("budget", "spend limit", "cost limit")):
+        return "budget_exceeded"
+    if any(marker in text for marker in ("quota", "insufficient_quota", "rate limit", "429", "too many requests")):
+        return "quota_exceeded"
+    if any(marker in text for marker in ("context", "maximum tokens", "token limit")):
+        return "context_window"
+    if any(marker in text for marker in ("provider", "upstream", "openai", "anthropic", "openrouter", "badrequesterror", "authenticationerror")):
+        return "provider_error"
+    return "server_error"
+
+
 def _clean_metadata_string(value: Any, *, limit: int = 1000) -> str:
     text = str(value)
     text = "".join(ch for ch in text if (ord(ch) >= 32 and ord(ch) != 127))
@@ -2588,7 +2695,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
         final_response_text = ""
         agent_error: Optional[str] = None
-        usage: Dict[str, int] = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+        usage: Dict[str, Any] = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
         terminal_snapshot_persisted = False
         response_session_id = session_id
 
@@ -2631,11 +2738,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 })
             incomplete_env = _envelope("incomplete")
             incomplete_env["output"] = incomplete_items
-            incomplete_env["usage"] = {
-                "input_tokens": usage.get("input_tokens", 0),
-                "output_tokens": usage.get("output_tokens", 0),
-                "total_tokens": usage.get("total_tokens", 0),
-            }
+            incomplete_env["usage"] = _responses_usage_payload(usage)
             incomplete_history = list(conversation_history)
             incomplete_history.append({"role": "user", "content": user_message})
             if incomplete_text:
@@ -2975,12 +3078,14 @@ class APIServerAdapter(BasePlatformAdapter):
             if agent_error:
                 failed_env = _envelope("failed")
                 failed_env["output"] = final_items
-                failed_env["error"] = {"message": agent_error, "type": "server_error"}
-                failed_env["usage"] = {
-                    "input_tokens": usage.get("input_tokens", 0),
-                    "output_tokens": usage.get("output_tokens", 0),
-                    "total_tokens": usage.get("total_tokens", 0),
+                failed_env["error"] = {
+                    "message": agent_error,
+                    "type": _responses_error_type(
+                        agent_error,
+                        result.get("error_type") if isinstance(result, dict) else None,
+                    ),
                 }
+                failed_env["usage"] = _responses_usage_payload(usage)
                 _failed_history = list(conversation_history)
                 _failed_history.append({"role": "user", "content": user_message})
                 if final_response_text or agent_error:
@@ -2996,15 +3101,12 @@ class APIServerAdapter(BasePlatformAdapter):
                 await _write_event("response.failed", {
                     "type": "response.failed",
                     "response": failed_env,
+                    "error": failed_env["error"],
                 })
             else:
                 completed_env = _envelope("completed")
                 completed_env["output"] = final_items
-                completed_env["usage"] = {
-                    "input_tokens": usage.get("input_tokens", 0),
-                    "output_tokens": usage.get("output_tokens", 0),
-                    "total_tokens": usage.get("total_tokens", 0),
-                }
+                completed_env["usage"] = _responses_usage_payload(usage)
                 full_history = self._build_response_conversation_history(
                     conversation_history,
                     user_message,
@@ -3065,15 +3167,15 @@ class APIServerAdapter(BasePlatformAdapter):
             try:
                 failed_env = _envelope("failed")
                 failed_env["output"] = list(emitted_items)
-                failed_env["error"] = {"message": str(_exc)[:500], "type": "server_error"}
-                failed_env["usage"] = {
-                    "input_tokens": usage.get("input_tokens", 0),
-                    "output_tokens": usage.get("output_tokens", 0),
-                    "total_tokens": usage.get("total_tokens", 0),
+                failed_env["error"] = {
+                    "message": str(_exc)[:500],
+                    "type": _responses_error_type(_exc),
                 }
+                failed_env["usage"] = _responses_usage_payload(usage)
                 await _write_event("response.failed", {
                     "type": "response.failed",
                     "response": failed_env,
+                    "error": failed_env["error"],
                 })
             except Exception:
                 pass
@@ -3342,11 +3444,7 @@ class APIServerAdapter(BasePlatformAdapter):
             "created_at": created_at,
             "model": body.get("model", self._model_name),
             "output": output_items,
-            "usage": {
-                "input_tokens": usage.get("input_tokens", 0),
-                "output_tokens": usage.get("output_tokens", 0),
-                "total_tokens": usage.get("total_tokens", 0),
-            },
+            "usage": _responses_usage_payload(usage),
         }
         response_session_id = (
             result.get("session_id") if isinstance(result, dict) else None
@@ -3819,8 +3917,9 @@ class APIServerAdapter(BasePlatformAdapter):
         """
         Create an agent and run a conversation in a thread executor.
 
-        Returns ``(result_dict, usage_dict)`` where *usage_dict* contains
-        ``input_tokens``, ``output_tokens`` and ``total_tokens``.
+        Returns ``(result_dict, usage_dict)`` where *usage_dict* contains the
+        OpenAI-compatible token counters plus optional Hermes context, cost,
+        and compaction metadata.
 
         If *agent_ref* is a one-element list, the AIAgent instance is stored
         at ``agent_ref[0]`` before ``run_conversation`` begins.  This allows
@@ -3857,11 +3956,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     conversation_history=conversation_history,
                     task_id=effective_task_id,
                 )
-                usage = {
-                    "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
-                    "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
-                    "total_tokens": getattr(agent, "session_total_tokens", 0) or 0,
-                }
+                usage = _session_usage_snapshot(agent)
                 # Include the effective session ID in the result so callers
                 # (e.g. X-Hermes-Session-Id header) can track compression-
                 # triggered session rotations. (#16938)
