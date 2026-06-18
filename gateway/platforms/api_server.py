@@ -20,6 +20,7 @@ Exposes an HTTP server with endpoints:
 - POST /v1/runs/{run_id}/approval — resolve a pending run approval
 - POST /v1/runs/{run_id}/stop       — interrupt a running agent
 - GET  /health                     — health check
+- GET  /ready                      — readiness check for deploy gates
 - GET  /health/detailed            — rich status for cross-container dashboard probing
 
 Any OpenAI-compatible frontend (Open WebUI, LobeChat, LibreChat,
@@ -1346,6 +1347,94 @@ class APIServerAdapter(BasePlatformAdapter):
             }
         )
 
+    def _readiness_payload(self) -> tuple[Dict[str, Any], int]:
+        from gateway.status import (
+            get_source_revision,
+            is_gateway_runtime_lock_active,
+            read_runtime_status,
+        )
+
+        runtime = read_runtime_status() or {}
+        platforms = runtime.get("platforms", {})
+        if not isinstance(platforms, dict):
+            platforms = {}
+        api_server_state = {}
+        raw_api_server_state = platforms.get(self.platform.value)
+        if isinstance(raw_api_server_state, dict):
+            api_server_state = raw_api_server_state
+
+        checks: Dict[str, bool] = {}
+        reasons: List[str] = []
+
+        def add_check(name: str, ok: bool, reason: str) -> None:
+            checks[name] = bool(ok)
+            if not ok:
+                reasons.append(reason)
+
+        runtime_pid = runtime.get("pid")
+        add_check(
+            "runtime_status_current_pid",
+            runtime_pid == os.getpid(),
+            f"runtime status belongs to pid {runtime_pid!r}, current pid is {os.getpid()}",
+        )
+        add_check(
+            "gateway_state_running",
+            runtime.get("gateway_state") == "running",
+            f"gateway_state is {runtime.get('gateway_state')!r}, not 'running'",
+        )
+        add_check(
+            "api_server_platform_connected",
+            self.is_connected and api_server_state.get("state") == "connected",
+            f"api_server platform state is {api_server_state.get('state')!r}, not 'connected'",
+        )
+        add_check(
+            "http_server_bound",
+            self._runner is not None and self._site is not None,
+            "api server HTTP runner/site is not bound",
+        )
+        add_check(
+            "api_key_configured",
+            bool(self._api_key),
+            "API_SERVER_KEY is not configured",
+        )
+        add_check(
+            "runtime_lock_active",
+            is_gateway_runtime_lock_active(),
+            "gateway runtime lock is not held",
+        )
+
+        run_gateway = os.getenv("HERMES_RUN_GATEWAY", "").strip().lower()
+        if run_gateway in _TRUE_REQUEST_BOOL_STRINGS:
+            owner = os.getenv("HERMES_GATEWAY_OWNER", "").strip()
+            add_check(
+                "intended_gateway_owner",
+                owner == "main-hermes",
+                f"HERMES_GATEWAY_OWNER is {owner!r}, not 'main-hermes'",
+            )
+
+        ready = all(checks.values())
+        payload = {
+            "status": "ready" if ready else "not_ready",
+            "platform": "hermes-agent",
+            "version": _hermes_version(),
+            "source_revision": get_source_revision(),
+            "checks": checks,
+            "reasons": reasons,
+            "gateway_state": runtime.get("gateway_state"),
+            "api_server_state": api_server_state.get("state"),
+            "active_agents": runtime.get("active_agents", 0),
+            "updated_at": runtime.get("updated_at"),
+            "pid": os.getpid(),
+            "runtime_pid": runtime_pid,
+            "gateway_owner": os.getenv("HERMES_GATEWAY_OWNER", "").strip() or None,
+        }
+        return payload, 200 if ready else 503
+
+    async def _handle_ready(self, request: "web.Request") -> "web.Response":
+        """GET /ready — deploy/readiness check distinct from liveness."""
+        payload, status = self._readiness_payload()
+        return web.json_response(payload, status=status)
+
     async def _handle_health_detailed(self, request: "web.Request") -> "web.Response":
         """GET /health/detailed — rich status for cross-container dashboard probing.
 
@@ -1447,6 +1536,7 @@ class APIServerAdapter(BasePlatformAdapter):
             },
             "endpoints": {
                 "health": {"method": "GET", "path": "/health"},
+                "ready": {"method": "GET", "path": "/ready"},
                 "health_detailed": {"method": "GET", "path": "/health/detailed"},
                 "models": {"method": "GET", "path": "/v1/models"},
                 "chat_completions": {"method": "POST", "path": "/v1/chat/completions"},
@@ -4577,8 +4667,10 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app = web.Application(middlewares=mws, client_max_size=MAX_REQUEST_BYTES)
             assert self._app is not None
             self._app.router.add_get("/health", self._handle_health)
+            self._app.router.add_get("/ready", self._handle_ready)
             self._app.router.add_get("/health/detailed", self._handle_health_detailed)
             self._app.router.add_get("/v1/health", self._handle_health)
+            self._app.router.add_get("/v1/ready", self._handle_ready)
             self._app.router.add_get("/v1/models", self._handle_models)
             self._app.router.add_get("/v1/capabilities", self._handle_capabilities)
             self._app.router.add_get("/v1/skills", self._handle_skills)
