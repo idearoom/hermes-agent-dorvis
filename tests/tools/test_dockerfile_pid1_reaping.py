@@ -87,6 +87,11 @@ def _instruction_text(dockerfile_text: str) -> str:
     return "\n".join(_dockerfile_instructions(dockerfile_text))
 
 
+def test_dockerfile_sources_node_24_lts(dockerfile_text):
+    assert "FROM node:24-bookworm-slim@sha256:" in dockerfile_text
+    assert "FROM node:22-" not in dockerfile_text
+
+
 def test_dockerfile_installs_an_init_for_zombie_reaping(dockerfile_text):
     """Some init (tini, dumb-init, catatonit, s6-overlay) must be installed.
 
