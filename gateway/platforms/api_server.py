@@ -1547,10 +1547,6 @@ class APIServerAdapter(BasePlatformAdapter):
                 "run_approval": {"method": "POST", "path": "/v1/runs/{run_id}/approval"},
                 "run_stop": {"method": "POST", "path": "/v1/runs/{run_id}/stop"},
                 "skills": {"method": "GET", "path": "/v1/skills"},
-                "skill_pending_list": {"method": "GET", "path": "/v1/skills/pending"},
-                "skill_pending_diff": {"method": "GET", "path": "/v1/skills/pending/{pending_id}/diff"},
-                "skill_pending_approve": {"method": "POST", "path": "/v1/skills/pending/{pending_id}/approve"},
-                "skill_pending_reject": {"method": "POST", "path": "/v1/skills/pending/{pending_id}/reject"},
                 "toolsets": {"method": "GET", "path": "/v1/toolsets"},
                 "sessions": {"method": "GET", "path": "/api/sessions"},
                 "session_create": {"method": "POST", "path": "/api/sessions"},
@@ -1594,125 +1590,6 @@ class APIServerAdapter(BasePlatformAdapter):
             "object": "list",
             "data": skills,
         })
-
-    @staticmethod
-    def _skill_pending_summary(record: Dict[str, Any]) -> Dict[str, Any]:
-        payload = record.get("payload") if isinstance(record.get("payload"), dict) else {}
-        return {
-            "id": str(record.get("id", "")),
-            "subsystem": "skills",
-            "action": str(record.get("action") or payload.get("action") or ""),
-            "skill_action": str(payload.get("action") or record.get("action") or ""),
-            "name": str(payload.get("name") or ""),
-            "category": str(payload.get("category") or ""),
-            "file_path": str(payload.get("file_path") or ""),
-            "summary": str(record.get("summary") or ""),
-            "origin": str(record.get("origin") or "foreground"),
-            "created_at": record.get("created_at"),
-        }
-
-    def _skill_pending_missing(self, pending_id: str) -> "web.Response":
-        return web.json_response(
-            _openai_error(
-                f"No pending skill write with id '{pending_id}'.",
-                code="skill_pending_not_found",
-            ),
-            status=404,
-        )
-
-    async def _handle_skill_pending_list(self, request: "web.Request") -> "web.Response":
-        """GET /v1/skills/pending — list staged skill writes awaiting review.
-
-        The list response intentionally exposes review metadata only, not the
-        full staged payload, because payloads can contain complete SKILL.md
-        contents. Fetch the unified diff endpoint when an admin needs to inspect
-        the concrete change.
-        """
-        auth_err = self._check_auth(request)
-        if auth_err:
-            return auth_err
-
-        try:
-            from tools import write_approval as wa
-            rows = [self._skill_pending_summary(record) for record in wa.list_pending(wa.SKILLS)]
-        except Exception:
-            logger.exception("GET /v1/skills/pending failed")
-            return web.json_response(
-                _openai_error("Failed to enumerate pending skill writes", err_type="server_error"),
-                status=500,
-            )
-
-        return web.json_response({
-            "object": "list",
-            "subsystem": "skills",
-            "total": len(rows),
-            "data": rows,
-        })
-
-    async def _handle_skill_pending_diff(self, request: "web.Request") -> "web.Response":
-        """GET /v1/skills/pending/{id}/diff — return the staged skill diff."""
-        auth_err = self._check_auth(request)
-        if auth_err:
-            return auth_err
-
-        pending_id = request.match_info.get("pending_id", "")
-        try:
-            from tools import write_approval as wa
-            record = wa.get_pending(wa.SKILLS, pending_id)
-            if not record:
-                return self._skill_pending_missing(pending_id)
-            diff = wa.skill_pending_diff(record)
-        except Exception:
-            logger.exception("GET /v1/skills/pending/%s/diff failed", pending_id)
-            return web.json_response(
-                _openai_error("Failed to read pending skill diff", err_type="server_error"),
-                status=500,
-            )
-
-        return web.json_response({
-            "object": "hermes.skill_pending.diff",
-            "id": pending_id,
-            "summary": str(record.get("summary") or ""),
-            "diff": diff,
-        })
-
-    async def _handle_skill_pending_approve(self, request: "web.Request") -> "web.Response":
-        """POST /v1/skills/pending/{id}/approve — apply a staged skill write."""
-        return await self._handle_skill_pending_action(request, action="approve")
-
-    async def _handle_skill_pending_reject(self, request: "web.Request") -> "web.Response":
-        """POST /v1/skills/pending/{id}/reject — discard a staged skill write."""
-        return await self._handle_skill_pending_action(request, action="reject")
-
-    async def _handle_skill_pending_action(self, request: "web.Request", *, action: str) -> "web.Response":
-        auth_err = self._check_auth(request)
-        if auth_err:
-            return auth_err
-
-        pending_id = request.match_info.get("pending_id", "")
-        try:
-            from tools import write_approval as wa
-            record = wa.get_pending(wa.SKILLS, pending_id)
-            if not record:
-                return self._skill_pending_missing(pending_id)
-            from hermes_cli.write_approval_commands import handle_pending_subcommand
-            message = handle_pending_subcommand(wa.SKILLS, [action, pending_id])
-            resolved = wa.get_pending(wa.SKILLS, pending_id) is None
-        except Exception:
-            logger.exception("POST /v1/skills/pending/%s/%s failed", pending_id, action)
-            return web.json_response(
-                _openai_error(f"Failed to {action} pending skill write", err_type="server_error"),
-                status=500,
-            )
-
-        ok = bool(message) and resolved
-        return web.json_response({
-            "object": "hermes.skill_pending.action",
-            "id": pending_id,
-            "action": action,
-            "ok": ok,
-            "message": message or "",
-        }, status=200 if ok else 500)
 
     async def _handle_toolsets(self, request: "web.Request") -> "web.Response":
         """GET /v1/toolsets — list toolsets and their resolved tools.
@@ -4674,10 +4551,6 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_get("/v1/models", self._handle_models)
             self._app.router.add_get("/v1/capabilities", self._handle_capabilities)
             self._app.router.add_get("/v1/skills", self._handle_skills)
-            self._app.router.add_get("/v1/skills/pending", self._handle_skill_pending_list)
-            self._app.router.add_get("/v1/skills/pending/{pending_id}/diff", self._handle_skill_pending_diff)
-            self._app.router.add_post("/v1/skills/pending/{pending_id}/approve", self._handle_skill_pending_approve)
-            self._app.router.add_post("/v1/skills/pending/{pending_id}/reject", self._handle_skill_pending_reject)
             self._app.router.add_get("/v1/toolsets", self._handle_toolsets)
             # Session/client control surface (thin wrappers over SessionDB + _run_agent)
             self._app.router.add_get("/api/sessions", self._handle_list_sessions)
