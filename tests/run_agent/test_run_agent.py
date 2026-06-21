@@ -6622,4 +6622,17 @@ class TestMemoryProviderTurnStart:
         src = inspect.getsource(_btc)
         # The extracted body uses ``agent.X`` rather than ``self.X``;
         # assert the extracted-form spelling directly.
-        assert "on_turn_start(agent._user_turn_count" in src
+        idx_turn_start = src.index(".on_turn_start(")
+        idx_prefetch = src.index(".prefetch_all(")
+        block = src[idx_turn_start:idx_prefetch]
+        assert "agent._user_turn_count" in block
+
+    def test_on_turn_start_passes_request_metadata(self):
+        """Source-level check: memory providers can tag PR/web request context."""
+        import inspect
+        from agent.turn_context import build_turn_context as _btc
+        src = inspect.getsource(_btc)
+        idx_turn_start = src.index(".on_turn_start(")
+        idx_prefetch = src.index(".prefetch_all(")
+        block = src[idx_turn_start:idx_prefetch]
+        assert 'request_metadata=getattr(agent, "_request_metadata", None) or {}' in block

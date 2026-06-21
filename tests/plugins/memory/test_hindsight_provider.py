@@ -758,6 +758,47 @@ class TestSyncTurn:
         assert "session:web-session" in item["tags"]
         assert f"chat:{chat_id}" in item["tags"]
 
+    def test_sync_turn_adds_pr_environment_tags_from_request_metadata(self, provider_with_config):
+        chat_id = "4dffcb7c-4747-40db-a4fb-9f36e5cef420"
+        p = provider_with_config()
+        p.initialize(
+            session_id="web-session",
+            platform="api_server",
+            agent_identity="dorvis-pr-56",
+        )
+        p._client = _make_mock_client()
+
+        p.on_turn_start(
+            1,
+            "hello",
+            request_metadata={
+                "source": "dorvis-web",
+                "environment": "pr-56",
+                "caller": {
+                    "email": "reviewer@example.com",
+                    "name": "Reviewer",
+                    "uid": "user-1",
+                },
+                "chat": {"id": chat_id, "type": "web"},
+            },
+        )
+        p.sync_turn("hello", "hi")
+        p._retain_queue.join()
+
+        item = p._client.aretain_batch.call_args.kwargs["items"][0]
+        assert "environment:pr-56" in item["tags"]
+        assert "pr:56" in item["tags"]
+        assert "source:dorvis-web" in item["tags"]
+        assert f"chat:{chat_id}" in item["tags"]
+        assert item["metadata"]["environment"] == "pr-56"
+        assert item["metadata"]["pr_number"] == "56"
+        assert item["metadata"]["source"] == "dorvis-web"
+        assert item["metadata"]["user_id"] == "user-1"
+        assert item["metadata"]["user_name"] == "Reviewer"
+        assert item["metadata"]["chat_id"] == chat_id
+        assert item["metadata"]["chat_type"] == "web"
+        assert item["metadata"]["agent_identity"] == "dorvis-pr-56"
+
     def test_sync_turn_does_not_add_chat_tag_for_non_web_chat(self, provider_with_config):
         p = provider_with_config()
         p.initialize(

@@ -35,6 +35,7 @@ import json
 import logging
 import os
 import queue
+import re
 import threading
 
 from datetime import datetime, timezone
@@ -557,6 +558,8 @@ class HindsightMemoryProvider(MemoryProvider):
         self._thread_id = ""
         self._agent_identity = ""
         self._agent_workspace = ""
+        self._request_source = ""
+        self._environment = ""
         self._turn_index = 0
         self._client = None
         self._timeout = _DEFAULT_TIMEOUT
@@ -1143,6 +1146,9 @@ class HindsightMemoryProvider(MemoryProvider):
         self._thread_id = str(kwargs.get("thread_id") or "").strip()
         self._agent_identity = str(kwargs.get("agent_identity") or "").strip()
         self._agent_workspace = str(kwargs.get("agent_workspace") or "").strip()
+        self._request_source = ""
+        self._environment = ""
+        self._apply_request_metadata(kwargs.get("request_metadata"))
         self._turn_index = 0
         self._session_turns = []
         self._last_retained_turn_count = 0
@@ -1445,8 +1451,14 @@ class HindsightMemoryProvider(MemoryProvider):
             "message_count": str(message_count),
             "turn_index": str(turn_index),
         }
-        if self._retain_source:
-            metadata["source"] = self._retain_source
+        source = self._retain_source or self._request_source
+        if source:
+            metadata["source"] = source
+        if self._environment:
+            metadata["environment"] = self._environment
+            m = re.fullmatch(r"pr-(\d+)", self._environment)
+            if m:
+                metadata["pr_number"] = m.group(1)
         if self._session_id:
             metadata["session_id"] = self._session_id
         if self._platform:
@@ -1489,7 +1501,54 @@ class HindsightMemoryProvider(MemoryProvider):
             tags.append(f"parent:{resolved_parent_session_id}")
         if resolved_chat_id and resolved_chat_type == "web":
             tags.append(f"chat:{resolved_chat_id}")
+        if self._environment:
+            tags.append(f"environment:{self._environment}")
+            m = re.fullmatch(r"pr-(\d+)", self._environment)
+            if m:
+                tags.append(f"pr:{m.group(1)}")
+        if self._request_source:
+            tags.append(f"source:{self._request_source}")
         return tags
+
+    def _apply_request_metadata(self, request_metadata: Any) -> None:
+        """Capture web/API request metadata so Hindsight retains are filterable."""
+        if not isinstance(request_metadata, dict):
+            return
+
+        source = str(request_metadata.get("source") or "").strip()
+        if source:
+            self._request_source = source
+
+        environment = str(request_metadata.get("environment") or "").strip()
+        if environment:
+            self._environment = environment
+
+        caller = request_metadata.get("caller")
+        if isinstance(caller, dict):
+            uid = str(caller.get("uid") or "").strip()
+            name = str(caller.get("name") or "").strip()
+            email = str(caller.get("email") or "").strip()
+            if uid:
+                self._user_id = uid
+            if name:
+                self._user_name = name
+            elif email and not self._user_name:
+                self._user_name = email
+
+        chat = request_metadata.get("chat")
+        if isinstance(chat, dict):
+            chat_id = str(chat.get("id") or "").strip()
+            chat_type = str(chat.get("type") or "").strip()
+            chat_name = str(chat.get("name") or "").strip()
+            if chat_id:
+                self._chat_id = chat_id
+            if chat_type:
+                self._chat_type = chat_type
+            if chat_name:
+                self._chat_name = chat_name
+
+    def on_turn_start(self, turn_number: int, message: str, **kwargs) -> None:
+        self._apply_request_metadata(kwargs.get("request_metadata"))
 
     def _build_retain_kwargs(
         self,

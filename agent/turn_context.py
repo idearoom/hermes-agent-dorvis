@@ -365,7 +365,12 @@ def build_turn_context(
     if agent._memory_manager:
         try:
             _turn_msg = original_user_message if isinstance(original_user_message, str) else ""
-            agent._memory_manager.on_turn_start(agent._user_turn_count, _turn_msg)
+            agent._memory_manager.on_turn_start(
+                agent._user_turn_count,
+                _turn_msg,
+                platform=getattr(agent, "platform", None) or "",
+                request_metadata=getattr(agent, "_request_metadata", None) or {},
+            )
         except Exception:
             pass
 
