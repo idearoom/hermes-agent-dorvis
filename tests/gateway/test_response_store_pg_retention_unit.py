@@ -25,6 +25,18 @@ _spec.loader.exec_module(_mod)
 PgResponseStore = _mod.PgResponseStore
 
 
+class _FakeAdminShutdown(Exception):
+    pass
+
+
+class _FakeInvalidSchemaName(Exception):
+    pass
+
+
+class _FakeUndefinedTable(Exception):
+    pass
+
+
 class _FakeJsonb:
     def __init__(self, value, *, dumps):
         self.value = json.loads(dumps(value))
@@ -47,13 +59,21 @@ class _FakeConnection:
         self.responses = {}
         self.conversations = {}
         self._clock = 0.0
+        self.fail_next_response_insert = False
+        self.schema_init_count = 0
 
     def execute(self, sql, params=None):
         normalized = " ".join(sql.split()).lower()
         params = params or ()
+        if normalized.startswith("create schema"):
+            self.schema_init_count += 1
+            return _FakeCursor()
         if normalized.startswith("create "):
             return _FakeCursor()
         if normalized.startswith("insert into hermes_gw.responses"):
+            if self.fail_next_response_insert:
+                self.fail_next_response_insert = False
+                raise _FakeUndefinedTable("relation hermes_gw.responses does not exist")
             response_id, data, accessed_at = params
             self.responses[response_id] = {
                 "data": data.value if isinstance(data, _FakeJsonb) else data,
@@ -122,6 +142,11 @@ class _FakePool:
 
 def _install_fake_psycopg_modules(monkeypatch):
     psycopg = types.ModuleType("psycopg")
+    psycopg.errors = types.SimpleNamespace(
+        AdminShutdown=_FakeAdminShutdown,
+        InvalidSchemaName=_FakeInvalidSchemaName,
+        UndefinedTable=_FakeUndefinedTable,
+    )
     psycopg_types = types.ModuleType("psycopg.types")
     psycopg_json = types.ModuleType("psycopg.types.json")
     psycopg_json.Jsonb = _FakeJsonb
@@ -143,5 +168,20 @@ def test_pg_response_store_keeps_more_than_constructor_max_size(monkeypatch):
         assert len(store) == 4
         assert store.get("r0") == {"index": 0}
         assert store.get("r3") == {"index": 3}
+    finally:
+        store.close()
+
+
+def test_pg_response_store_reinitializes_missing_schema_once(monkeypatch):
+    _install_fake_psycopg_modules(monkeypatch)
+    store = PgResponseStore("postgresql://fake", max_size=3)
+    try:
+        conn = _FakePool.last_instance.conn
+        conn.fail_next_response_insert = True
+
+        store.put("r1", {"value": 1})
+
+        assert conn.schema_init_count == 2
+        assert store.get("r1") == {"value": 1}
     finally:
         store.close()

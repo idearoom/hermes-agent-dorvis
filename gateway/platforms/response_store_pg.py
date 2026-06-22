@@ -79,10 +79,16 @@ class PgResponseStore:
         # the old 100-response LRU cap.
         self._max_size = max_size
         # Lazy imports: only the Postgres path pulls these in.
+        from psycopg import errors as psycopg_errors
         from psycopg.types.json import Jsonb  # noqa: F401  (used in put)
         from psycopg_pool import ConnectionPool
 
         self._Jsonb = Jsonb
+        self._schema_recovery_errors = (
+            psycopg_errors.AdminShutdown,
+            psycopg_errors.InvalidSchemaName,
+            psycopg_errors.UndefinedTable,
+        )
         # open=True connects eagerly so a bad DSN fails fast at construction
         # (the factory catches and falls back to SQLite with a loud error).
         self._pool = ConnectionPool(
@@ -120,67 +126,95 @@ class PgResponseStore:
                 )"""
             )
 
+    def _with_schema_retry(self, operation: str, fn):
+        try:
+            return fn()
+        except self._schema_recovery_errors:
+            logger.warning(
+                "ResponseStore: Postgres schema unavailable during %s; "
+                "reinitializing schema and retrying once.",
+                operation,
+                exc_info=True,
+            )
+            self._init_schema()
+            return fn()
+
     def get(self, response_id: str) -> Optional[Dict[str, Any]]:
         """Retrieve a stored response by ID and refresh diagnostic access time."""
-        with self._pool.connection() as conn:
-            row = conn.execute(
-                f"SELECT data FROM {_SCHEMA}.responses WHERE response_id = %s",
-                (response_id,),
-            ).fetchone()
-            if row is None:
-                return None
-            conn.execute(
-                f"UPDATE {_SCHEMA}.responses SET accessed_at = %s WHERE response_id = %s",
-                (time.time(), response_id),
-            )
-            # psycopg adapts jsonb -> Python dict/list directly; no json.loads.
-            # (Postgres enforces valid JSON on write, so the SQLite store's
-            # corrupted-JSON self-heal path is structurally impossible here.)
-            return row[0]
+        def _get():
+            with self._pool.connection() as conn:
+                row = conn.execute(
+                    f"SELECT data FROM {_SCHEMA}.responses WHERE response_id = %s",
+                    (response_id,),
+                ).fetchone()
+                if row is None:
+                    return None
+                conn.execute(
+                    f"UPDATE {_SCHEMA}.responses SET accessed_at = %s WHERE response_id = %s",
+                    (time.time(), response_id),
+                )
+                # psycopg adapts jsonb -> Python dict/list directly; no json.loads.
+                # (Postgres enforces valid JSON on write, so the SQLite store's
+                # corrupted-JSON self-heal path is structurally impossible here.)
+                return row[0]
+
+        return self._with_schema_retry("get", _get)
 
     def put(self, response_id: str, data: Dict[str, Any]) -> None:
         """Store a response without automatic eviction."""
-        with self._pool.connection() as conn:
-            conn.execute(
-                f"""INSERT INTO {_SCHEMA}.responses (response_id, data, accessed_at)
-                    VALUES (%s, %s, %s)
-                    ON CONFLICT (response_id)
-                    DO UPDATE SET data = EXCLUDED.data, accessed_at = EXCLUDED.accessed_at""",
-                (response_id, self._Jsonb(data, dumps=_dumps), time.time()),
-            )
+        def _put():
+            with self._pool.connection() as conn:
+                conn.execute(
+                    f"""INSERT INTO {_SCHEMA}.responses (response_id, data, accessed_at)
+                        VALUES (%s, %s, %s)
+                        ON CONFLICT (response_id)
+                        DO UPDATE SET data = EXCLUDED.data, accessed_at = EXCLUDED.accessed_at""",
+                    (response_id, self._Jsonb(data, dumps=_dumps), time.time()),
+                )
+
+        self._with_schema_retry("put", _put)
 
     def delete(self, response_id: str) -> bool:
         """Remove a response from the store. Returns True if found and deleted."""
-        with self._pool.connection() as conn:
-            conn.execute(
-                f"DELETE FROM {_SCHEMA}.conversations WHERE response_id = %s",
-                (response_id,),
-            )
-            cur = conn.execute(
-                f"DELETE FROM {_SCHEMA}.responses WHERE response_id = %s",
-                (response_id,),
-            )
-            return cur.rowcount > 0
+        def _delete():
+            with self._pool.connection() as conn:
+                conn.execute(
+                    f"DELETE FROM {_SCHEMA}.conversations WHERE response_id = %s",
+                    (response_id,),
+                )
+                cur = conn.execute(
+                    f"DELETE FROM {_SCHEMA}.responses WHERE response_id = %s",
+                    (response_id,),
+                )
+                return cur.rowcount > 0
+
+        return self._with_schema_retry("delete", _delete)
 
     def get_conversation(self, name: str) -> Optional[str]:
         """Get the latest response_id for a conversation name."""
-        with self._pool.connection() as conn:
-            row = conn.execute(
-                f"SELECT response_id FROM {_SCHEMA}.conversations WHERE name = %s",
-                (name,),
-            ).fetchone()
-            return row[0] if row else None
+        def _get_conversation():
+            with self._pool.connection() as conn:
+                row = conn.execute(
+                    f"SELECT response_id FROM {_SCHEMA}.conversations WHERE name = %s",
+                    (name,),
+                ).fetchone()
+                return row[0] if row else None
+
+        return self._with_schema_retry("get_conversation", _get_conversation)
 
     def set_conversation(self, name: str, response_id: str) -> None:
         """Map a conversation name to its latest response_id."""
-        with self._pool.connection() as conn:
-            conn.execute(
-                f"""INSERT INTO {_SCHEMA}.conversations (name, response_id)
-                    VALUES (%s, %s)
-                    ON CONFLICT (name)
-                    DO UPDATE SET response_id = EXCLUDED.response_id""",
-                (name, response_id),
-            )
+        def _set_conversation():
+            with self._pool.connection() as conn:
+                conn.execute(
+                    f"""INSERT INTO {_SCHEMA}.conversations (name, response_id)
+                        VALUES (%s, %s)
+                        ON CONFLICT (name)
+                        DO UPDATE SET response_id = EXCLUDED.response_id""",
+                    (name, response_id),
+                )
+
+        self._with_schema_retry("set_conversation", _set_conversation)
 
     def close(self) -> None:
         """Close the connection pool."""
@@ -193,8 +227,11 @@ class PgResponseStore:
             pass
 
     def __len__(self) -> int:
-        with self._pool.connection() as conn:
-            row = conn.execute(
-                f"SELECT COUNT(*) FROM {_SCHEMA}.responses"
-            ).fetchone()
-            return row[0] if row else 0
+        def _len():
+            with self._pool.connection() as conn:
+                row = conn.execute(
+                    f"SELECT COUNT(*) FROM {_SCHEMA}.responses"
+                ).fetchone()
+                return row[0] if row else 0
+
+        return self._with_schema_retry("len", _len)
