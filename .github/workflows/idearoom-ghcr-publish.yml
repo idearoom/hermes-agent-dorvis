@@ -65,7 +65,9 @@ jobs:
     # Only the IdeaRoom fork publishes to its GHCR namespace; a no-op elsewhere
     # (including NousResearch, were this file ever to reach it via a merge).
     if: github.repository == 'idearoom/hermes-agent-dorvis'
-    runs-on: ubuntu-24.04-arm
+    # Use the same Blacksmith arm64 runner family as idearoom-agents Docker
+    # builds; GitHub-hosted arm64 queues can strand manual SHA backfills.
+    runs-on: blacksmith-4vcpu-ubuntu-2404-arm
     timeout-minutes: 45
     steps:
       - name: Checkout code
