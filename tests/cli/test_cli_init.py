@@ -180,9 +180,9 @@ class TestPromptToolkitTerminalCompatibility:
     def test_lf_enter_binds_to_submit_handler_posix(self):
         """Some thin PTYs deliver Enter as LF/c-j instead of CR/enter.
 
-        On a bare local POSIX TTY (no SSH/WSL/WT) we keep c-j → submit so
+        On a bare local POSIX TTY (no SSH/WSL/WT/Ghostty) we keep c-j → submit so
         Enter works on thin PTYs (docker exec, certain ssh configurations).
-        On Windows, WSL, SSH sessions, and Windows Terminal we leave c-j
+        On Windows, WSL, SSH sessions, Windows Terminal, and Ghostty we leave c-j
         unbound here so it can be used as the Ctrl+Enter newline keystroke
         without conflicting with submit. See issue #22379.
         """
@@ -210,6 +210,17 @@ class TestPromptToolkitTerminalCompatibility:
         # Windows Terminal / Kitty / mintty over SSH) inserts a newline.
         with _patch.object(_sys, "platform", "linux"), \
              _patch.dict(_os.environ, {"SSH_CONNECTION": "1.2.3.4 5 6.7.8.9 22"}, clear=True), \
+             _patch("builtins.open", side_effect=OSError("no /proc")):
+            kb = KeyBindings()
+            _bind_prompt_submit_keys(kb, submit_handler)
+            bindings = {tuple(key.value for key in binding.keys): binding.handler for binding in kb.bindings}
+            assert bindings[("c-m",)] is submit_handler
+            assert ("c-j",) not in bindings
+
+        # Ghostty through tmux: TERM_PROGRAM is tmux, but Ghostty exports a
+        # stable env marker. Keep c-j free so Ctrl+J inserts a newline.
+        with _patch.object(_sys, "platform", "linux"), \
+             _patch.dict(_os.environ, {"TERM": "tmux-256color", "TERM_PROGRAM": "tmux", "GHOSTTY_RESOURCES_DIR": "/usr/share/ghostty"}, clear=True), \
              _patch("builtins.open", side_effect=OSError("no /proc")):
             kb = KeyBindings()
             _bind_prompt_submit_keys(kb, submit_handler)
@@ -544,30 +555,6 @@ class TestRootLevelProviderOverride:
 
         assert cfg["model"]["base_url"] == "https://example.com/v1"
 
-    def test_terminal_vercel_runtime_bridged_to_env(self, tmp_path, monkeypatch):
-        """Classic CLI must expose terminal.vercel_runtime to terminal_tool.py."""
-        import yaml
-
-        hermes_home = tmp_path / ".hermes"
-        hermes_home.mkdir()
-        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
-        monkeypatch.delenv("TERMINAL_VERCEL_RUNTIME", raising=False)
-
-        config_path = hermes_home / "config.yaml"
-        config_path.write_text(yaml.safe_dump({
-            "terminal": {
-                "backend": "vercel_sandbox",
-                "vercel_runtime": "python3.13",
-            },
-        }))
-
-        import cli
-        monkeypatch.setattr(cli, "_hermes_home", hermes_home)
-        cfg = cli.load_cli_config()
-
-        assert cfg["terminal"]["vercel_runtime"] == "python3.13"
-        assert os.environ["TERMINAL_VERCEL_RUNTIME"] == "python3.13"
-
     def test_normalize_root_model_keys_moves_to_model(self):
         """_normalize_root_model_keys migrates root keys into model section."""
         from hermes_cli.config import _normalize_root_model_keys
@@ -601,6 +588,38 @@ class TestRootLevelProviderOverride:
         result = _normalize_root_model_keys(config)
         assert result["model"]["provider"] == "correct-provider"
         assert "provider" not in result  # root key still cleaned up
+
+    def test_normalize_model_api_base_aliases_to_base_url(self):
+        """model.api_base is migrated to model.base_url (issue #8919)."""
+        from hermes_cli.config import _normalize_root_model_keys
+
+        config = {
+            "model": {
+                "provider": "custom",
+                "api_base": "http://localhost:4000",
+                "api_key": "my-key",
+                "default": "default",
+            },
+        }
+        result = _normalize_root_model_keys(config)
+        assert result["model"]["base_url"] == "http://localhost:4000"
+        assert "api_base" not in result["model"]  # alias cleaned up
+
+    def test_normalize_api_base_does_not_override_base_url(self):
+        """An explicit model.base_url is never overridden by api_base."""
+        from hermes_cli.config import _normalize_root_model_keys
+
+        config = {
+            "model": {
+                "provider": "custom",
+                "api_base": "http://wrong:9999",
+                "base_url": "http://localhost:4000",
+                "default": "default",
+            },
+        }
+        result = _normalize_root_model_keys(config)
+        assert result["model"]["base_url"] == "http://localhost:4000"
+        assert "api_base" not in result["model"]
 
     def test_normalize_root_context_length_migrates_to_model(self):
         """Root-level context_length is migrated into the model section."""

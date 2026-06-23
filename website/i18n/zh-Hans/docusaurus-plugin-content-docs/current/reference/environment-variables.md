@@ -18,8 +18,6 @@ description: "Hermes Agent 使用的所有环境变量完整参考"
 | `HERMES_OPENROUTER_CACHE_TTL` | 缓存 TTL（秒，1-86400）。覆盖 config.yaml 中的 `openrouter.response_cache_ttl`。 |
 | `NOUS_BASE_URL` | 覆盖 Nous Portal base URL（极少使用；仅用于开发/测试） |
 | `NOUS_INFERENCE_BASE_URL` | 直接覆盖 Nous 推理端点 |
-| `AI_GATEWAY_API_KEY` | Vercel AI Gateway API 密钥（[ai-gateway.vercel.sh](https://ai-gateway.vercel.sh)） |
-| `AI_GATEWAY_BASE_URL` | 覆盖 AI Gateway base URL（默认：`https://ai-gateway.vercel.sh/v1`） |
 | `OPENAI_API_KEY` | 自定义 OpenAI 兼容端点的 API 密钥（与 `OPENAI_BASE_URL` 配合使用） |
 | `OPENAI_BASE_URL` | 自定义端点的 base URL（VLLM、SGLang 等） |
 | `COPILOT_GITHUB_TOKEN` | 用于 Copilot API 的 GitHub token——最高优先级（OAuth `gho_*` 或细粒度 PAT `github_pat_*`；经典 PAT `ghp_*` **不支持**） |
@@ -65,9 +63,6 @@ description: "Hermes Agent 使用的所有环境变量完整参考"
 | `GOOGLE_API_KEY` | Google AI Studio API 密钥（[aistudio.google.com/app/apikey](https://aistudio.google.com/app/apikey)） |
 | `GEMINI_API_KEY` | `GOOGLE_API_KEY` 的别名 |
 | `GEMINI_BASE_URL` | 覆盖 Google AI Studio base URL |
-| `HERMES_GEMINI_CLIENT_ID` | `google-gemini-cli` PKCE 登录的 OAuth 客户端 ID（可选；默认使用 Google 公共 gemini-cli 客户端） |
-| `HERMES_GEMINI_CLIENT_SECRET` | `google-gemini-cli` 的 OAuth 客户端密钥（可选） |
-| `HERMES_GEMINI_PROJECT_ID` | 付费 Gemini 层级的 GCP 项目 ID（免费层级自动配置） |
 | `ANTHROPIC_API_KEY` | Anthropic Console API 密钥（[console.anthropic.com](https://console.anthropic.com/)） |
 | `ANTHROPIC_TOKEN` | 手动或旧版 Anthropic OAuth/setup-token 覆盖 |
 | `DASHSCOPE_API_KEY` | Qwen Cloud（阿里巴巴 DashScope）Qwen 模型 API 密钥（[modelstudio.console.alibabacloud.com](https://modelstudio.console.alibabacloud.com/)） |
@@ -156,10 +151,6 @@ description: "Hermes Agent 使用的所有环境变量完整参考"
 | `HINDSIGHT_TIMEOUT` | Hindsight 内存提供商 API 调用超时（秒，默认：`60`）。如果 Hindsight 实例在 `/sync` 或 `on_session_switch` 期间响应缓慢并出现超时，请增大此值，并检查 `errors.log`。 |
 | `SUPERMEMORY_API_KEY` | 支持 profile 召回和会话摄取的语义长期记忆（[supermemory.ai](https://supermemory.ai)） |
 | `DAYTONA_API_KEY` | Daytona 云沙箱（[daytona.io](https://daytona.io/)） |
-| `VERCEL_TOKEN` | Vercel Sandbox 访问 token（[vercel.com](https://vercel.com/)） |
-| `VERCEL_PROJECT_ID` | Vercel 项目 ID（与 `VERCEL_TOKEN` 配合使用） |
-| `VERCEL_TEAM_ID` | Vercel 团队 ID（与 `VERCEL_TOKEN` 配合使用） |
-| `VERCEL_OIDC_TOKEN` | Vercel 短期 OIDC token（仅用于开发的替代方案） |
 
 ### Langfuse 可观测性
 
@@ -192,7 +183,7 @@ description: "Hermes Agent 使用的所有环境变量完整参考"
 
 | 变量 | 描述 |
 |----------|-------------|
-| `TERMINAL_ENV` | 后端：`local`、`docker`、`ssh`、`singularity`、`modal`、`daytona`、`vercel_sandbox` |
+| `TERMINAL_ENV` | 后端：`local`、`docker`、`ssh`、`singularity`、`modal`、`daytona` |
 | `HERMES_DOCKER_BINARY` | 覆盖 Hermes 调用的容器二进制（例如 `podman`、`/usr/local/bin/docker`）。未设置时，Hermes 自动在 `PATH` 上发现 `docker` 或 `podman`。当两者都已安装且需要非默认选项，或二进制不在 `PATH` 中时使用。 |
 | `TERMINAL_DOCKER_IMAGE` | Docker 镜像（默认：`nikolaik/python-nodejs:python3.11-nodejs20`） |
 | `TERMINAL_DOCKER_FORWARD_ENV` | 显式转发到 Docker 终端会话的环境变量名 JSON 数组。注意：技能声明的 `required_environment_variables` 会自动转发——仅对未被任何技能声明的变量使用此项。 |
@@ -201,7 +192,6 @@ description: "Hermes Agent 使用的所有环境变量完整参考"
 | `TERMINAL_SINGULARITY_IMAGE` | Singularity 镜像或 `.sif` 路径 |
 | `TERMINAL_MODAL_IMAGE` | Modal 容器镜像 |
 | `TERMINAL_DAYTONA_IMAGE` | Daytona 沙箱镜像 |
-| `TERMINAL_VERCEL_RUNTIME` | Vercel Sandbox 运行时（`node24`、`node22`、`python3.13`） |
 | `TERMINAL_TIMEOUT` | 命令超时（秒） |
 | `TERMINAL_LIFETIME_SECONDS` | 终端会话最大生命周期（秒） |
 | `TERMINAL_CWD` | 终端会话的工作目录（仅 gateway/cron；CLI 使用启动目录） |
@@ -525,6 +515,8 @@ Graph 事件（Teams 会议、日历、聊天等）的入站变更通知监听�
 | `HERMES_GATEWAY_PLATFORM_CONNECT_TIMEOUT` | gateway 启动期间每个平台的连接超时（秒）。 |
 | `HERMES_GATEWAY_BUSY_INPUT_MODE` | 默认 gateway 繁忙输入行为：`queue`、`steer` 或 `interrupt`。可通过 `/busy` 按聊天覆盖。 |
 | `HERMES_GATEWAY_BUSY_ACK_ENABLED` | gateway 是否在用户 agent 繁忙时发送确认消息（⚡/⏳/⏩）（默认：`true`）。设为 `false` 可完全抑制这些消息——输入仍会正常排队/引导/中断，只是聊天回复被静默。从 `config.yaml` 中的 `display.busy_ack_enabled` 桥接。 |
+| `HERMES_GATEWAY_NO_SUPERVISE` | 在 s6-overlay Docker 镜像内部运行 `hermes gateway run` 时跳过 s6 自动监管，退回到 pre-s6 前台语义（无自动重启，gateway 作为容器主进程）。真值：`1`、`true`、`yes`。等同于 `--no-supervise` CLI 标志。在 s6 镜像之外为空操作。 |
+| `HERMES_GATEWAY_BOOTSTRAP_STATE` | 在 s6-overlay Docker 镜像内部，为**全新卷**声明 gateway 的初始受监管状态。空白卷上不存在持久化的 `gateway_state.json`，因此启动协调器会注册 `gateway-default` 槽位但保持其**关闭**（只有上次记录状态为 `running` 时才会自动启动）。将此变量设为 `running` 后，首次启动 hook 会在协调器运行前预写入 `gateway_state.json`，从而让 gateway 在第一次启动时就自动拉起。仅字面值 `running` 生效。仅影响首次启动：若已有 `gateway_state.json`，绝不会被覆盖，因此被刻意停止的 gateway 在重启后仍保持停止。在 s6 镜像之外为空操作。 |
 | `HERMES_FILE_MUTATION_VERIFIER` | 启用每轮文件变更验证器页脚（默认：`true`）。启用后，Hermes 附加一个建议列表，列出本轮中失败且未被成功写入覆盖的 `write_file`/`patch` 调用。设为 `0`、`false`、`no` 或 `off` 可抑制。镜像 `config.yaml` 中的 `display.file_mutation_verifier`；设置时环境变量优先。 |
 | `HERMES_CRON_TIMEOUT` | cron 任务 agent 运行的不活动超时（秒，默认：`600`）。agent 在主动调用工具或接收流 token 时可无限运行——仅在空闲时触发。设为 `0` 表示无限制。 |
 | `HERMES_CRON_SCRIPT_TIMEOUT` | cron 任务附加的预运行脚本超时（秒，默认：`120`）。对需要更长执行时间的脚本（例如随机延迟的反机器人计时）可增大此值。也可通过 `config.yaml` 中的 `cron.script_timeout_seconds` 配置。 |
@@ -540,6 +532,7 @@ Graph 事件（Teams 会议、日历、聊天等）的入站变更通知监听�
 | `HERMES_ACCEPT_HOOKS` | 无需 TTY 提示自动批准 `config.yaml` 中声明的任何未见过的 shell hook。等同于 `--accept-hooks` 或 `hooks_auto_accept: true`。 |
 | `HERMES_IGNORE_USER_CONFIG` | 跳过 `~/.hermes/config.yaml` 并使用内置默认值（`.env` 中的凭证仍会加载）。等同于 `--ignore-user-config`。 |
 | `HERMES_IGNORE_RULES` | 跳过 `AGENTS.md`、`SOUL.md`、`.cursorrules`、记忆和预加载技能的自动注入。等同于 `--ignore-rules`。 |
+| `HERMES_SAFE_MODE` | 故障排查模式：禁用**所有**自定义项——跳过插件发现和 MCP 服务器加载。由 `--safe-mode` 自动设置（同时也会设置上面两个 flag）。 |
 | `HERMES_MD_NAMES` | 自动注入的规则文件名逗号分隔列表（默认：`AGENTS.md,CLAUDE.md,.cursorrules,SOUL.md`）。 |
 | `HERMES_TOOL_PROGRESS` | 工具进度显示的已弃用兼容变量。优先使用 `config.yaml` 中的 `display.tool_progress`。 |
 | `HERMES_TOOL_PROGRESS_MODE` | 工具进度模式的已弃用兼容变量。优先使用 `config.yaml` 中的 `display.tool_progress`。 |
@@ -567,6 +560,7 @@ Graph 事件（Teams 会议、日历、聊天等）的入站变更通知监听�
 | `HERMES_ALLOW_PRIVATE_URLS` | `true`/`false`——允许工具获取 localhost/私有网络 URL。gateway 模式下默认关闭。 |
 | `HERMES_REDACT_SECRETS` | `true`/`false`——控制工具输出、日志和聊天响应中的密钥脱敏（默认：`true`）。 |
 | `HERMES_WRITE_SAFE_ROOT` | 可选目录前缀，限制 `write_file`/`patch` 写入；超出范围的路径需要审批。 |
+| `HERMES_DISABLE_LAZY_INSTALLS` | 官方 Docker 镜像中自动设置的内部桥接变量，用于阻止运行时将依赖安装到不可变的 `/opt/hermes` 树。面向用户的等价配置是 `config.yaml` 中的 `security.allow_lazy_installs: false`；不要在 `.env` 中手动设置此变量。 |
 | `HERMES_DISABLE_FILE_STATE_GUARD` | 设为 `1` 可关闭 `patch`/`write_file` 上的"文件自上次读取后已更改"保护。 |
 | `HERMES_CORE_TOOLS` | 规范核心工具列表的逗号分隔覆盖（高级；极少需要）。 |
 | `HERMES_BUNDLED_SKILLS` | 启动时加载的内置技能列表的逗号分隔覆盖。 |
