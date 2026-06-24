@@ -1126,6 +1126,79 @@ class TestSyncTurn:
             with _append_capability_lock:
                 _append_capability_cache.clear()
 
+    def test_sync_turn_replaces_full_document_for_metadata_bearing_web_retain(
+        self, provider_with_config, monkeypatch
+    ):
+        """Web/AWS provenance metadata must survive later document reads.
+
+        Hosted Hindsight append updates preserve document tags but can clear the
+        document-level metadata projection. Metadata-bearing web sessions
+        therefore use the stable session document_id with replace semantics and
+        resend the full accumulated session.
+        """
+        monkeypatch.setattr(
+            "plugins.memory.hindsight._fetch_hindsight_api_version",
+            lambda *a, **kw: "0.5.6",
+        )
+        from plugins.memory.hindsight import _append_capability_cache, _append_capability_lock
+        with _append_capability_lock:
+            _append_capability_cache.clear()
+        try:
+            chat_id = "4dffcb7c-4747-40db-a4fb-9f36e5cef420"
+            p = provider_with_config(retain_every_n_turns=2)
+            p.initialize(
+                session_id="web-session",
+                platform="api_server",
+                agent_identity="dorvis-test",
+                request_metadata={
+                    "source": "dorvis-web",
+                    "environment": "staging",
+                    "caller": {
+                        "email": "reviewer@example.com",
+                        "name": "Reviewer",
+                        "uid": "user-1",
+                    },
+                    "chat": {"id": chat_id, "type": "web"},
+                },
+            )
+            p._client = _make_mock_client()
+
+            p.sync_turn("turn1-user", "turn1-asst")
+            p.sync_turn("turn2-user", "turn2-asst")
+            p._retain_queue.join()
+
+            first = p._client.aretain_batch.call_args.kwargs
+            first_item = first["items"][0]
+            assert first["document_id"] == "web-session"
+            assert first_item["document_id"] == "web-session"
+            assert "update_mode" not in first_item
+            assert first_item["metadata"]["chat_id"] == chat_id
+            assert first_item["metadata"]["environment"] == "staging"
+            assert first_item["metadata"]["agent_identity"] == "dorvis-test"
+
+            p._client.aretain_batch.reset_mock()
+
+            p.sync_turn("turn3-user", "turn3-asst")
+            p.sync_turn("turn4-user", "turn4-asst")
+            p._retain_queue.join()
+
+            second = p._client.aretain_batch.call_args.kwargs
+            second_item = second["items"][0]
+            assert second["document_id"] == "web-session"
+            assert second_item["document_id"] == "web-session"
+            assert "update_mode" not in second_item
+            assert "turn1-user" in second_item["content"]
+            assert "turn2-user" in second_item["content"]
+            assert "turn3-user" in second_item["content"]
+            assert "turn4-user" in second_item["content"]
+            assert second_item["metadata"]["message_count"] == "8"
+            assert second_item["metadata"]["chat_id"] == chat_id
+            assert f"chat:{chat_id}" in second["document_tags"]
+            assert "environment:staging" in second["document_tags"]
+        finally:
+            with _append_capability_lock:
+                _append_capability_cache.clear()
+
     def test_sync_turn_passes_document_id(self, provider):
         """sync_turn should pass document_id (session_id + per-startup ts)."""
         provider.sync_turn("hello", "hi")

@@ -1222,6 +1222,27 @@ class HindsightMemoryProvider(MemoryProvider):
             return self._session_id, "append"
         return fallback_document_id, None
 
+    def _requires_document_metadata_preservation(self, metadata: Dict[str, str]) -> bool:
+        """Return True when Hindsight document reads must retain item metadata.
+
+        Hindsight append updates preserve document tags but the hosted document
+        read can drop the document-level metadata projection after later appends.
+        For web/AWS auditability metadata, prefer stable document-id replacement
+        over append efficiency so operators can inspect a retained conversation
+        by document/chat tag and still see the provenance fields.
+        """
+        return any(
+            metadata.get(key)
+            for key in (
+                "source",
+                "chat_id",
+                "environment",
+                "agent_identity",
+                "user_id",
+                "user_email",
+            )
+        )
+
     def initialize(self, session_id: str, **kwargs) -> None:
         self._session_id = str(session_id or "").strip()
         self._parent_session_id = str(kwargs.get("parent_session_id", "") or "").strip()
@@ -1771,12 +1792,27 @@ class HindsightMemoryProvider(MemoryProvider):
                          self._turn_counter, self._turn_counter + (self._retain_every_n_turns - self._turn_counter % self._retain_every_n_turns))
             return
 
+        lineage_tags = self._build_lineage_tags()
+
+        # Snapshot the state needed for the retain. The writer may run after
+        # _session_turns / _turn_index are mutated by a later sync_turn().
+        metadata_snapshot = self._build_metadata(
+            message_count=0,
+            turn_index=self._turn_index,
+        )
         document_id, update_mode = self._resolve_retain_target(self._document_id)
+        preserve_document_metadata = self._requires_document_metadata_preservation(
+            metadata_snapshot
+        )
+        if preserve_document_metadata and update_mode == "append" and self._session_id:
+            document_id = self._session_id
+            update_mode = None
 
         # On append-capable APIs each retain only needs to ship the turns
         # accumulated since the last retain — the server appends them to the
-        # existing document. On legacy/overwrite APIs we must resend the whole
-        # session because each retain replaces the document.
+        # existing document. On legacy/overwrite APIs or metadata-preserving
+        # stable replacement, resend the full session because each retain
+        # replaces the document.
         if update_mode == "append":
             turns_to_retain = self._session_turns[self._last_retained_turn_count:]
             if not turns_to_retain:
@@ -1785,19 +1821,13 @@ class HindsightMemoryProvider(MemoryProvider):
         else:
             turns_to_retain = list(self._session_turns)
 
+        metadata_snapshot["message_count"] = str(len(turns_to_retain) * 2)
+
         logger.debug("sync_turn: retaining %d/%d turns, payload %d chars",
                      len(turns_to_retain), len(self._session_turns),
                      sum(len(t) for t in turns_to_retain))
         content = "[" + ",".join(turns_to_retain) + "]"
 
-        lineage_tags = self._build_lineage_tags()
-
-        # Snapshot the state needed for the retain. The writer may run after
-        # _session_turns / _turn_index are mutated by a later sync_turn().
-        metadata_snapshot = self._build_metadata(
-            message_count=len(turns_to_retain) * 2,
-            turn_index=self._turn_index,
-        )
         num_turns = len(turns_to_retain)
         bank_id = self._bank_id
         retain_async_flag = self._retain_async
