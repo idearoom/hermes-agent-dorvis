@@ -1199,6 +1199,57 @@ class TestSyncTurn:
             with _append_capability_lock:
                 _append_capability_cache.clear()
 
+    def test_metadata_bearing_replace_hydrates_prior_session_db_turns(
+        self, provider_with_config, monkeypatch
+    ):
+        monkeypatch.setattr(
+            "plugins.memory.hindsight._fetch_hindsight_api_version",
+            lambda *a, **kw: "0.5.6",
+        )
+        from plugins.memory.hindsight import _append_capability_cache, _append_capability_lock
+        with _append_capability_lock:
+            _append_capability_cache.clear()
+        try:
+            chat_id = "4dffcb7c-4747-40db-a4fb-9f36e5cef420"
+            p = provider_with_config()
+            p.initialize(
+                session_id="web-session",
+                platform="api_server",
+                agent_identity="dorvis-test",
+                session_db=_FakeSessionDB([
+                    {"role": "user", "content": "prior user"},
+                    {"role": "assistant", "content": "prior assistant"},
+                ]),
+                request_metadata={
+                    "source": "dorvis-web",
+                    "environment": "staging",
+                    "caller": {
+                        "email": "reviewer@example.com",
+                        "name": "Reviewer",
+                        "uid": "user-1",
+                    },
+                    "chat": {"id": chat_id, "type": "web"},
+                },
+            )
+            p._client = _make_mock_client()
+
+            p.sync_turn("current user", "current assistant")
+            p._retain_queue.join()
+
+            call_kwargs = p._client.aretain_batch.call_args.kwargs
+            item = call_kwargs["items"][0]
+            assert call_kwargs["document_id"] == "web-session"
+            assert "update_mode" not in item
+            assert "prior user" in item["content"]
+            assert "prior assistant" in item["content"]
+            assert "current user" in item["content"]
+            assert "current assistant" in item["content"]
+            assert item["metadata"]["turn_index"] == "2"
+            assert item["metadata"]["message_count"] == "4"
+        finally:
+            with _append_capability_lock:
+                _append_capability_cache.clear()
+
     def test_sync_turn_passes_document_id(self, provider):
         """sync_turn should pass document_id (session_id + per-startup ts)."""
         provider.sync_turn("hello", "hi")

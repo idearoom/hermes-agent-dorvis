@@ -1189,6 +1189,7 @@ def init_agent(
                     # Thread session title for memory provider scoping
                     # (e.g. honcho uses this to derive chat-scoped session keys)
                     if agent._session_db:
+                        _init_kwargs["session_db"] = agent._session_db
                         try:
                             _st = agent._session_db.get_session_title(agent.session_id)
                             if _st:
