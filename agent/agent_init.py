@@ -1210,6 +1210,8 @@ def init_agent(
                         _init_kwargs["chat_type"] = agent._chat_type
                     if agent._thread_id:
                         _init_kwargs["thread_id"] = agent._thread_id
+                    if agent._request_metadata:
+                        _init_kwargs["request_metadata"] = dict(agent._request_metadata)
                     # Thread gateway session key for stable per-chat Honcho session isolation
                     if agent._gateway_session_key:
                         _init_kwargs["gateway_session_key"] = agent._gateway_session_key

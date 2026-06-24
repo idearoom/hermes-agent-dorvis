@@ -1637,6 +1637,13 @@ class HindsightMemoryProvider(MemoryProvider):
             metadata["agent_identity"] = self._agent_identity
         return metadata
 
+    def _merge_retain_tags(self, tags: List[str] | None = None) -> list[str]:
+        merged_tags = _normalize_retain_tags(self._retain_tags)
+        for tag in _normalize_retain_tags(tags):
+            if tag not in merged_tags:
+                merged_tags.append(tag)
+        return merged_tags
+
     def _build_lineage_tags(
         self,
         *,
@@ -1729,10 +1736,7 @@ class HindsightMemoryProvider(MemoryProvider):
             kwargs["document_id"] = document_id
         if retain_async is not None:
             kwargs["retain_async"] = retain_async
-        merged_tags = _normalize_retain_tags(self._retain_tags)
-        for tag in _normalize_retain_tags(tags):
-            if tag not in merged_tags:
-                merged_tags.append(tag)
+        merged_tags = self._merge_retain_tags(tags)
         if merged_tags:
             kwargs["tags"] = merged_tags
         if self._observation_scopes:
@@ -1798,11 +1802,13 @@ class HindsightMemoryProvider(MemoryProvider):
         bank_id = self._bank_id
         retain_async_flag = self._retain_async
         retain_context = self._retain_context
+        document_tags = self._merge_retain_tags(lineage_tags)
 
         def _do_retain() -> None:
             item = self._build_retain_kwargs(
                 content,
                 context=retain_context,
+                document_id=document_id,
                 metadata=metadata_snapshot,
                 tags=lineage_tags or None,
             )
@@ -1817,6 +1823,7 @@ class HindsightMemoryProvider(MemoryProvider):
                     bank_id=bank_id,
                     items=[item],
                     document_id=document_id,
+                    document_tags=document_tags or None,
                     retain_async=retain_async_flag,
                 )
             )
@@ -1971,6 +1978,7 @@ class HindsightMemoryProvider(MemoryProvider):
                 chat_id=old_chat_id,
                 chat_type=old_chat_type,
             )
+            old_document_tags = self._merge_retain_tags(old_lineage_tags)
             old_content = "[" + ",".join(old_turns) + "]"
             # Resolve doc_id + update_mode against the OLD session BEFORE
             # we rotate _session_id, so the flush lands in the old
@@ -1985,6 +1993,7 @@ class HindsightMemoryProvider(MemoryProvider):
                     item = self._build_retain_kwargs(
                         old_content,
                         context=self._retain_context,
+                        document_id=old_document_id,
                         metadata=old_metadata,
                         tags=old_lineage_tags or None,
                     )
@@ -2001,6 +2010,7 @@ class HindsightMemoryProvider(MemoryProvider):
                             bank_id=self._bank_id,
                             items=[item],
                             document_id=old_document_id,
+                            document_tags=old_document_tags or None,
                             retain_async=self._retain_async,
                         )
                     )

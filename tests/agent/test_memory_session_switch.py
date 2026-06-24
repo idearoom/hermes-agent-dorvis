@@ -228,7 +228,10 @@ def _make_hindsight_provider():
     provider._thread_id = ""
     provider._agent_identity = ""
     provider._agent_workspace = ""
+    provider._request_source = ""
+    provider._environment = ""
     provider._retain_tags = []
+    provider._observation_scopes = None
     provider._retain_context = "test-context"
     provider._retain_async = False
     provider._bank_id = "test-bank"

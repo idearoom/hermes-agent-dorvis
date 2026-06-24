@@ -94,6 +94,50 @@ def test_aiagent_forwards_user_id_alt_to_memory_provider():
     assert "status_callback" not in provider.init_kwargs
 
 
+def test_aiagent_forwards_request_metadata_to_memory_provider():
+    provider = RecordingMemoryProvider()
+    cfg = {"memory": {"provider": "recording"}, "agent": {}}
+    request_metadata = {
+        "source": "dorvis-web",
+        "environment": "staging",
+        "caller": {
+            "uid": "user-1",
+            "name": "Reviewer",
+            "email": "reviewer@example.com",
+        },
+        "chat": {"id": "chat-1", "type": "web"},
+    }
+
+    with (
+        patch("hermes_cli.config.load_config", return_value=cfg),
+        patch("plugins.memory.load_memory_provider", return_value=provider),
+        patch("agent.model_metadata.get_model_context_length", return_value=204_800),
+        patch("run_agent.get_tool_definitions", return_value=[]),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI"),
+    ):
+        from run_agent import AIAgent
+
+        agent = AIAgent(
+            api_key="test-key-1234567890",
+            base_url="https://openrouter.ai/api/v1",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=False,
+            session_id="sess-web",
+            platform="api_server",
+            user_id="user-1",
+            chat_id="chat-1",
+            chat_type="web",
+            request_metadata=request_metadata,
+        )
+
+    assert agent._memory_manager is not None
+    assert provider.init_session_id == "sess-web"
+    assert provider.init_kwargs["request_metadata"] == request_metadata
+    assert provider.init_kwargs["request_metadata"] is not request_metadata
+
+
 class CoreShadowProvider:
     """Provider that tries to register tools shadowing built-in core tools."""
 
