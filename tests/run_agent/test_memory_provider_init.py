@@ -97,6 +97,7 @@ def test_aiagent_forwards_user_id_alt_to_memory_provider():
 def test_aiagent_forwards_request_metadata_to_memory_provider():
     provider = RecordingMemoryProvider()
     cfg = {"memory": {"provider": "recording"}, "agent": {}}
+    session_db = object()
     request_metadata = {
         "source": "dorvis-web",
         "environment": "staging",
@@ -130,12 +131,14 @@ def test_aiagent_forwards_request_metadata_to_memory_provider():
             chat_id="chat-1",
             chat_type="web",
             request_metadata=request_metadata,
+            session_db=session_db,
         )
 
     assert agent._memory_manager is not None
     assert provider.init_session_id == "sess-web"
     assert provider.init_kwargs["request_metadata"] == request_metadata
     assert provider.init_kwargs["request_metadata"] is not request_metadata
+    assert provider.init_kwargs["session_db"] is session_db
 
 
 class CoreShadowProvider:

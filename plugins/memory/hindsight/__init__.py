@@ -1294,9 +1294,11 @@ class HindsightMemoryProvider(MemoryProvider):
         self._thread_id = str(kwargs.get("thread_id") or "").strip()
         self._agent_identity = str(kwargs.get("agent_identity") or "").strip()
         self._agent_workspace = str(kwargs.get("agent_workspace") or "").strip()
+        self._session_db = kwargs.get("session_db")
         self._request_source = ""
         self._environment = ""
         self._apply_request_metadata(kwargs.get("request_metadata"))
+        self._turn_counter = 0
         self._turn_index = 0
         self._session_turns = []
         self._last_retained_turn_count = 0
@@ -1376,6 +1378,7 @@ class HindsightMemoryProvider(MemoryProvider):
         self._retain_assistant_prefix = str(
             self._config.get("retain_assistant_prefix") or os.environ.get("HINDSIGHT_RETAIN_ASSISTANT_PREFIX", "Assistant")
         ).strip() or "Assistant"
+        self._hydrate_session_turns_from_session_db(self._session_db)
 
         # Retain controls
         self._auto_retain = self._config.get("auto_retain", True)
@@ -1623,6 +1626,73 @@ class HindsightMemoryProvider(MemoryProvider):
                 "timestamp": now,
             },
         ]
+
+    def _session_message_text(self, message: Dict[str, Any]) -> str:
+        content = message.get("content")
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts: List[str] = []
+            for part in content:
+                if isinstance(part, str):
+                    parts.append(part)
+                elif isinstance(part, dict):
+                    text = part.get("text")
+                    if text:
+                        parts.append(str(text))
+            return "\n".join(parts)
+        if content is None:
+            return ""
+        try:
+            return json.dumps(content, ensure_ascii=False)
+        except Exception:
+            return str(content)
+
+    def _hydrate_session_turns_from_session_db(self, session_db: Any) -> None:
+        if not session_db or not self._session_id:
+            return
+        if not self._requires_document_metadata_preservation(
+            self._build_metadata(message_count=0, turn_index=0)
+        ):
+            return
+        try:
+            messages = session_db.get_messages_as_conversation(self._session_id)
+        except Exception as exc:
+            logger.debug("Hindsight session hydration skipped: %s", exc)
+            return
+        if not isinstance(messages, list):
+            return
+
+        hydrated: List[str] = []
+        pending_user = ""
+        for message in messages:
+            if not isinstance(message, dict):
+                continue
+            role = str(message.get("role") or "").strip().lower()
+            if role == "user":
+                pending_user = self._session_message_text(message)
+                continue
+            if role == "assistant" and pending_user:
+                assistant_text = self._session_message_text(message)
+                if assistant_text:
+                    hydrated.append(
+                        json.dumps(
+                            self._build_turn_messages(pending_user, assistant_text),
+                            ensure_ascii=False,
+                        )
+                    )
+                pending_user = ""
+
+        if hydrated:
+            self._session_turns = hydrated
+            self._turn_counter = len(hydrated)
+            self._turn_index = self._turn_counter
+            self._last_retained_turn_count = len(hydrated)
+            logger.debug(
+                "Hindsight hydrated %d prior turns for metadata-preserving document %s",
+                len(hydrated),
+                self._session_id,
+            )
 
     def _build_metadata(self, *, message_count: int, turn_index: int) -> Dict[str, str]:
         metadata: Dict[str, str] = {
