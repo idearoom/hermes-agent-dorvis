@@ -889,9 +889,11 @@ class TestSyncTurn:
         call_kwargs = p._client.aretain_batch.call_args.kwargs
         assert call_kwargs["bank_id"] == "test-bank"
         assert call_kwargs["document_id"].startswith("session-1-")
+        assert call_kwargs["document_tags"] == ["conv", "session1", "session:session-1"]
         assert call_kwargs["retain_async"] is True
         assert len(call_kwargs["items"]) == 1
         item = call_kwargs["items"][0]
+        assert item["document_id"] == call_kwargs["document_id"]
         assert item["context"] == "conversation between Hermes Agent and the User"
         assert item["tags"] == ["conv", "session1", "session:session-1"]
         content = json.loads(item["content"])
@@ -944,9 +946,12 @@ class TestSyncTurn:
         p.sync_turn("hello", "hi")
         p._retain_queue.join()
 
-        item = p._client.aretain_batch.call_args.kwargs["items"][0]
+        call_kwargs = p._client.aretain_batch.call_args.kwargs
+        item = call_kwargs["items"][0]
         assert "session:web-session" in item["tags"]
         assert f"chat:{chat_id}" in item["tags"]
+        assert "session:web-session" in call_kwargs["document_tags"]
+        assert f"chat:{chat_id}" in call_kwargs["document_tags"]
 
     def test_sync_turn_adds_pr_environment_tags_from_request_metadata(self, provider_with_config):
         chat_id = "4dffcb7c-4747-40db-a4fb-9f36e5cef420"
@@ -975,11 +980,16 @@ class TestSyncTurn:
         p.sync_turn("hello", "hi")
         p._retain_queue.join()
 
-        item = p._client.aretain_batch.call_args.kwargs["items"][0]
+        call_kwargs = p._client.aretain_batch.call_args.kwargs
+        item = call_kwargs["items"][0]
         assert "environment:pr-56" in item["tags"]
         assert "pr:56" in item["tags"]
         assert "source:dorvis-web" in item["tags"]
         assert f"chat:{chat_id}" in item["tags"]
+        assert "environment:pr-56" in call_kwargs["document_tags"]
+        assert "pr:56" in call_kwargs["document_tags"]
+        assert "source:dorvis-web" in call_kwargs["document_tags"]
+        assert f"chat:{chat_id}" in call_kwargs["document_tags"]
         assert item["metadata"]["environment"] == "pr-56"
         assert item["metadata"]["pr_number"] == "56"
         assert item["metadata"]["source"] == "dorvis-web"
@@ -1013,8 +1023,10 @@ class TestSyncTurn:
         provider._client.aretain_batch.assert_called_once()
         call_kwargs = provider._client.aretain_batch.call_args.kwargs
         assert call_kwargs["document_id"].startswith("test-session-")
+        assert call_kwargs["document_tags"] == ["session:test-session"]
         assert call_kwargs["retain_async"] is True
         assert len(call_kwargs["items"]) == 1
+        assert call_kwargs["items"][0]["document_id"] == call_kwargs["document_id"]
         assert call_kwargs["items"][0]["context"] == "conversation between Hermes Agent and the User"
 
     def test_sync_turn_custom_context(self, provider_with_config):
@@ -1285,9 +1297,12 @@ class TestSessionSwitchBufferFlush:
         p.on_session_switch("new-sid", parent_session_id="web-session", reset=True)
         p._retain_queue.join()
 
-        item = p._client.aretain_batch.call_args.kwargs["items"][0]
+        call_kwargs = p._client.aretain_batch.call_args.kwargs
+        item = call_kwargs["items"][0]
         assert "session:web-session" in item["tags"]
         assert f"chat:{chat_id}" in item["tags"]
+        assert "session:web-session" in call_kwargs["document_tags"]
+        assert f"chat:{chat_id}" in call_kwargs["document_tags"]
 
     def test_buffered_turns_flushed_before_clear(self, provider_with_config):
         """retain_every_n_turns > 1 must not silently drop partial buffers
@@ -1312,6 +1327,7 @@ class TestSessionSwitchBufferFlush:
         kw = p._client.aretain_batch.call_args.kwargs
         assert kw["document_id"] == old_doc
         item = kw["items"][0]
+        assert item["document_id"] == kw["document_id"]
         # Both buffered turns must be present in the flushed payload.
         content = json.loads(item["content"])
         flat = json.dumps(content)
