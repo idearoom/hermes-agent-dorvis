@@ -1315,18 +1315,21 @@ def _execute_remote(
     duration = round(time.monotonic() - exec_start, 2)
 
     # --- Post-process output (same as local path) ---
+    from tools.large_output_handoff import (
+        sanitize_output_text,
+        write_large_output_handoff,
+    )
 
-    stdout_text, stdout_metadata = _truncate_stdout_text(stdout_text)
-
-    # Strip ANSI escape sequences
-    from tools.ansi_strip import strip_ansi
-    stdout_text = strip_ansi(stdout_text)
-
-    # Redact secrets. code_file=True: execute_code output is code-execution
-    # output that often echoes source/config — skip false-positive ENV/JSON/
-    # f-string-template redaction while still masking real credentials.
-    from agent.redact import redact_sensitive_text
-    stdout_text = redact_sensitive_text(stdout_text, code_file=True)
+    stdout_text = sanitize_output_text(stdout_text)
+    _stdout_preview, stdout_metadata = _truncate_stdout_text(stdout_text)
+    if stdout_metadata["stdout_truncated"]:
+        stdout_text = write_large_output_handoff(
+            stdout_text,
+            max_inline_chars=MAX_STDOUT_BYTES,
+            task_id=effective_task_id,
+            producer="execute_code",
+            source="stdout",
+        )
 
     # Build response
     result: Dict[str, Any] = {
@@ -1644,18 +1647,25 @@ def execute_code(
                 logger.debug("Error reading process output: %s", e, exc_info=True)
 
         stdout_total_bytes = [0]  # mutable ref for total bytes seen
+        stdout_full_path = os.path.join(tmpdir, "stdout.bin")
 
-        def _drain_head_tail(pipe, head_chunks, tail_chunks, head_bytes, tail_bytes, total_ref):
+        def _drain_head_tail(
+            pipe, head_chunks, tail_chunks, head_bytes, tail_bytes,
+            total_ref, full_output_path,
+        ):
             """Drain stdout keeping both head and tail data."""
             head_collected = 0
             from collections import deque
             tail_buf = deque()
             tail_collected = 0
+            full_output = None
             try:
+                full_output = open(full_output_path, "ab")
                 while True:
                     data = pipe.read(4096)
                     if not data:
                         break
+                    full_output.write(data)
                     total_ref[0] += len(data)
                     # Fill head buffer first
                     if head_collected < head_bytes:
@@ -1674,6 +1684,12 @@ def execute_code(
                         tail_collected -= len(oldest)
             except (ValueError, OSError):
                 pass
+            finally:
+                if full_output is not None:
+                    try:
+                        full_output.close()
+                    except OSError:
+                        pass
             # Transfer final tail to output list
             tail_chunks.extend(tail_buf)
 
@@ -1683,7 +1699,8 @@ def execute_code(
         stdout_reader = threading.Thread(
             target=_drain_head_tail,
             args=(proc.stdout, stdout_head_chunks, stdout_tail_chunks,
-                  _STDOUT_HEAD_BYTES, _STDOUT_TAIL_BYTES, stdout_total_bytes),
+                  _STDOUT_HEAD_BYTES, _STDOUT_TAIL_BYTES, stdout_total_bytes,
+                  stdout_full_path),
             daemon=True
         )
         stderr_reader = threading.Thread(
@@ -1731,11 +1748,38 @@ def execute_code(
 
         stderr_text = b"".join(stderr_chunks).decode("utf-8", errors="replace")
 
-        stdout_text, stdout_metadata = _assemble_stdout_result(
+        stdout_preview, stdout_metadata = _assemble_stdout_result(
             b"".join(stdout_head_chunks),
             b"".join(stdout_tail_chunks),
             total_bytes=stdout_total_bytes[0],
         )
+        # Assemble stdout. Large stdout becomes a structured handoff reference
+        # instead of an in-band splice that can corrupt JSON/CSV output.
+        total_stdout = stdout_total_bytes[0]
+        if total_stdout > MAX_STDOUT_BYTES:
+            try:
+                with open(stdout_full_path, "rb") as _stdout_file:
+                    stdout_text = _stdout_file.read().decode("utf-8", errors="replace")
+            except OSError:
+                stdout_text = (
+                    b"".join(stdout_head_chunks) + b"".join(stdout_tail_chunks)
+                ).decode("utf-8", errors="replace")
+        else:
+            stdout_text = stdout_preview
+
+        from tools.large_output_handoff import (
+            sanitize_output_text,
+            write_large_output_handoff,
+        )
+        stdout_text = sanitize_output_text(stdout_text)
+        if len(stdout_text) > MAX_STDOUT_BYTES:
+            stdout_text = write_large_output_handoff(
+                stdout_text,
+                max_inline_chars=MAX_STDOUT_BYTES,
+                task_id=task_id or "default",
+                producer="execute_code",
+                source="stdout",
+            )
 
         exit_code = proc.returncode if proc.returncode is not None else -1
         duration = round(time.monotonic() - exec_start, 2)
