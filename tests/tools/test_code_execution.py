@@ -17,6 +17,8 @@ import pytest
 
 import json
 import os
+from pathlib import Path
+import tempfile
 import time
 
 os.environ["TERMINAL_ENV"] = "local"
@@ -1050,11 +1052,15 @@ class TestInterruptHandling(unittest.TestCase):
             t.join(timeout=3)
 
 
-class TestHeadTailTruncation(unittest.TestCase):
-    """Tests for head+tail truncation of large stdout in execute_code."""
+class TestLargeOutputHandoff(unittest.TestCase):
+    """Tests for parseable file handoff of large stdout in execute_code."""
 
-    def _run(self, code):
-        with patch("model_tools.handle_function_call", side_effect=_mock_handle_function_call):
+    def _run(self, code, handoff_dir=None):
+        env_patch = {}
+        if handoff_dir is not None:
+            env_patch["HERMES_LARGE_OUTPUT_DIR"] = str(handoff_dir)
+        with patch.dict(os.environ, env_patch, clear=False), \
+             patch("model_tools.handle_function_call", side_effect=_mock_handle_function_call):
             result = execute_code(
                 code=code,
                 task_id="test-task",
@@ -1069,8 +1075,8 @@ class TestHeadTailTruncation(unittest.TestCase):
         self.assertIn("small output", result["output"])
         self.assertNotIn("TRUNCATED", result["output"])
 
-    def test_large_output_preserves_head_and_tail(self):
-        """Output exceeding MAX_STDOUT_BYTES keeps both head and tail."""
+    def test_large_output_returns_handoff_reference(self):
+        """Output exceeding MAX_STDOUT_BYTES returns a structured reference."""
         code = '''
 # Print HEAD marker, then filler, then TAIL marker
 print("HEAD_MARKER_START")
@@ -1078,27 +1084,38 @@ for i in range(15000):
     print(f"filler_line_{i:06d}_padding_to_fill_buffer")
 print("TAIL_MARKER_END")
 '''
-        result = self._run(code)
-        self.assertEqual(result["status"], "success")
-        output = result["output"]
-        # Head should be preserved
-        self.assertIn("HEAD_MARKER_START", output)
-        # Tail should be preserved (this is the key improvement)
-        self.assertIn("TAIL_MARKER_END", output)
-        # Truncation notice should be present
-        self.assertIn("TRUNCATED", output)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result = self._run(code, handoff_dir=tmpdir)
+            self.assertEqual(result["status"], "success")
+            output = result["output"]
+            self.assertNotIn("[OUTPUT TRUNCATED", output)
 
-    def test_truncation_notice_format(self):
-        """Truncation notice includes character counts."""
-        code = '''
-for i in range(15000):
-    print(f"padding_line_{i:06d}_xxxxxxxxxxxxxxxxxxxxxxxxxx")
+            reference = json.loads(output)
+            self.assertEqual(reference["type"], "hermes_large_output_handoff")
+            self.assertEqual(reference["producer"], "execute_code")
+            self.assertTrue(reference["truncated"])
+
+            full_output = Path(reference["full_output_path"]).read_text(encoding="utf-8")
+            self.assertIn("HEAD_MARKER_START", full_output)
+            self.assertIn("TAIL_MARKER_END", full_output)
+
+    def test_large_json_output_reference_is_parseable_and_points_to_json(self):
+        payload_code = '''
+import json
+payload = [{"row": i, "value": "x" * 120} for i in range(650)]
+print(json.dumps(payload))
 '''
-        result = self._run(code)
-        output = result["output"]
-        if "TRUNCATED" in output:
-            self.assertIn("chars omitted", output)
-            self.assertIn("total", output)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result = self._run(payload_code, handoff_dir=tmpdir)
+
+            reference = json.loads(result["output"])
+            self.assertEqual(reference["type"], "hermes_large_output_handoff")
+            self.assertNotIn("[OUTPUT TRUNCATED", result["output"])
+
+            full_output = Path(reference["full_output_path"]).read_text(encoding="utf-8")
+            parsed = json.loads(full_output)
+            self.assertEqual(parsed[0]["row"], 0)
+            self.assertEqual(parsed[-1]["row"], 649)
 
 
 if __name__ == "__main__":

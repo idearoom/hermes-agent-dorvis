@@ -207,3 +207,59 @@ def test_terminal_output_transform_integration_with_real_plugin(monkeypatch, tmp
     assert "PLUGIN-HEAD" in result["output"]
     assert "PLUGIN-TAIL" in result["output"]
     assert "[OUTPUT TRUNCATED" in result["output"]
+
+
+def test_large_output_handoff_plugin_returns_parseable_reference(monkeypatch, tmp_path):
+    import yaml
+
+    handoff_dir = tmp_path / "handoffs"
+    monkeypatch.setenv("HERMES_LARGE_OUTPUT_DIR", str(handoff_dir))
+
+    hermes_home = Path(os.environ["HERMES_HOME"])
+    plugins_dir = hermes_home / "plugins"
+    plugin_dir = plugins_dir / "large-output-handoff"
+    plugin_dir.mkdir(parents=True)
+    (plugin_dir / "plugin.yaml").write_text(
+        "name: large-output-handoff\n"
+        "provides_hooks:\n"
+        "  - transform_terminal_output\n",
+        encoding="utf-8",
+    )
+    (plugin_dir / "__init__.py").write_text(
+        "def register(ctx):\n"
+        "    from tools.large_output_handoff import maybe_transform_large_output\n"
+        "    from tools.tool_output_limits import get_max_bytes\n"
+        "    def transform(output, task_id='', **kwargs):\n"
+        "        return maybe_transform_large_output(\n"
+        "            output,\n"
+        "            max_inline_chars=get_max_bytes(),\n"
+        "            task_id=task_id or 'default',\n"
+        "            producer='terminal',\n"
+        "            source='stdout',\n"
+        "        )\n"
+        "    ctx.register_hook('transform_terminal_output', transform)\n",
+        encoding="utf-8",
+    )
+    cfg_path = hermes_home / "config.yaml"
+    cfg_path.write_text(
+        yaml.safe_dump({"plugins": {"enabled": ["large-output-handoff"]}}),
+        encoding="utf-8",
+    )
+
+    plugins_mod._plugin_manager = plugins_mod.PluginManager()
+    plugins_mod.discover_plugins()
+
+    payload = [{"row": i, "value": "x" * 120} for i in range(650)]
+    result, _mock_env = _run_terminal(
+        monkeypatch,
+        tmp_path,
+        output=json.dumps(payload),
+        command="produce-json",
+    )
+
+    assert "[OUTPUT TRUNCATED" not in result["output"]
+    reference = json.loads(result["output"])
+    assert reference["type"] == "hermes_large_output_handoff"
+    assert reference["producer"] == "terminal"
+    with open(reference["full_output_path"], encoding="utf-8") as handle:
+        assert json.loads(handle.read()) == payload

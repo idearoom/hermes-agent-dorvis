@@ -1213,28 +1213,20 @@ def _execute_remote(
     duration = round(time.monotonic() - exec_start, 2)
 
     # --- Post-process output (same as local path) ---
+    from tools.large_output_handoff import (
+        sanitize_output_text,
+        write_large_output_handoff,
+    )
 
-    # Truncate stdout to cap
+    stdout_text = sanitize_output_text(stdout_text)
     if len(stdout_text) > MAX_STDOUT_BYTES:
-        head_bytes = int(MAX_STDOUT_BYTES * 0.4)
-        tail_bytes = MAX_STDOUT_BYTES - head_bytes
-        head = stdout_text[:head_bytes]
-        tail = stdout_text[-tail_bytes:]
-        omitted = len(stdout_text) - len(head) - len(tail)
-        stdout_text = (
-            head
-            + f"\n\n... [OUTPUT TRUNCATED - {omitted:,} chars omitted "
-            f"out of {len(stdout_text):,} total] ...\n\n"
-            + tail
+        stdout_text = write_large_output_handoff(
+            stdout_text,
+            max_inline_chars=MAX_STDOUT_BYTES,
+            task_id=effective_task_id,
+            producer="execute_code",
+            source="stdout",
         )
-
-    # Strip ANSI escape sequences
-    from tools.ansi_strip import strip_ansi
-    stdout_text = strip_ansi(stdout_text)
-
-    # Redact secrets
-    from agent.redact import redact_sensitive_text
-    stdout_text = redact_sensitive_text(stdout_text)
 
     # Build response
     result: Dict[str, Any] = {
@@ -1532,18 +1524,25 @@ def execute_code(
                 logger.debug("Error reading process output: %s", e, exc_info=True)
 
         stdout_total_bytes = [0]  # mutable ref for total bytes seen
+        stdout_full_path = os.path.join(tmpdir, "stdout.bin")
 
-        def _drain_head_tail(pipe, head_chunks, tail_chunks, head_bytes, tail_bytes, total_ref):
+        def _drain_head_tail(
+            pipe, head_chunks, tail_chunks, head_bytes, tail_bytes,
+            total_ref, full_output_path,
+        ):
             """Drain stdout keeping both head and tail data."""
             head_collected = 0
             from collections import deque
             tail_buf = deque()
             tail_collected = 0
+            full_output = None
             try:
+                full_output = open(full_output_path, "ab")
                 while True:
                     data = pipe.read(4096)
                     if not data:
                         break
+                    full_output.write(data)
                     total_ref[0] += len(data)
                     # Fill head buffer first
                     if head_collected < head_bytes:
@@ -1562,6 +1561,12 @@ def execute_code(
                         tail_collected -= len(oldest)
             except (ValueError, OSError):
                 pass
+            finally:
+                if full_output is not None:
+                    try:
+                        full_output.close()
+                    except OSError:
+                        pass
             # Transfer final tail to output list
             tail_chunks.extend(tail_buf)
 
@@ -1571,7 +1576,8 @@ def execute_code(
         stdout_reader = threading.Thread(
             target=_drain_head_tail,
             args=(proc.stdout, stdout_head_chunks, stdout_tail_chunks,
-                  _STDOUT_HEAD_BYTES, _STDOUT_TAIL_BYTES, stdout_total_bytes),
+                  _STDOUT_HEAD_BYTES, _STDOUT_TAIL_BYTES, stdout_total_bytes,
+                  stdout_full_path),
             daemon=True
         )
         stderr_reader = threading.Thread(
@@ -1621,17 +1627,31 @@ def execute_code(
         stdout_tail = b"".join(stdout_tail_chunks).decode("utf-8", errors="replace")
         stderr_text = b"".join(stderr_chunks).decode("utf-8", errors="replace")
 
-        # Assemble stdout with head+tail truncation
+        # Assemble stdout. Large stdout becomes a structured handoff reference
+        # instead of an in-band splice that can corrupt JSON/CSV output.
         total_stdout = stdout_total_bytes[0]
-        if total_stdout > MAX_STDOUT_BYTES and stdout_tail:
-            omitted = total_stdout - len(stdout_head) - len(stdout_tail)
-            truncated_notice = (
-                f"\n\n... [OUTPUT TRUNCATED - {omitted:,} chars omitted "
-                f"out of {total_stdout:,} total] ...\n\n"
-            )
-            stdout_text = stdout_head + truncated_notice + stdout_tail
+        if total_stdout > MAX_STDOUT_BYTES:
+            try:
+                with open(stdout_full_path, "rb") as _stdout_file:
+                    stdout_text = _stdout_file.read().decode("utf-8", errors="replace")
+            except OSError:
+                stdout_text = stdout_head + stdout_tail
         else:
             stdout_text = stdout_head + stdout_tail
+
+        from tools.large_output_handoff import (
+            sanitize_output_text,
+            write_large_output_handoff,
+        )
+        stdout_text = sanitize_output_text(stdout_text)
+        if len(stdout_text) > MAX_STDOUT_BYTES:
+            stdout_text = write_large_output_handoff(
+                stdout_text,
+                max_inline_chars=MAX_STDOUT_BYTES,
+                task_id=task_id or "default",
+                producer="execute_code",
+                source="stdout",
+            )
 
         exit_code = proc.returncode if proc.returncode is not None else -1
         duration = round(time.monotonic() - exec_start, 2)
