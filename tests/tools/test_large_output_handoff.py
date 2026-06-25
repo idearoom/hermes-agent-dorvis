@@ -1,5 +1,9 @@
 import json
+import os
+from pathlib import Path
+import tempfile
 
+import tools.large_output_handoff as large_output_handoff
 from tools.large_output_handoff import (
     HANDOFF_TYPE,
     maybe_transform_large_output,
@@ -62,6 +66,42 @@ def test_maybe_transform_large_output_redacts_before_handoff(monkeypatch, tmp_pa
     assert secret not in persisted
     assert "OPENAI_API_KEY=" in persisted
     assert "***" in persisted
+
+
+def test_write_large_output_handoff_falls_back_when_first_dir_is_unwritable(
+    monkeypatch,
+    tmp_path,
+):
+    primary = tmp_path / "primary"
+    fallback_root = tmp_path / "tmp"
+    fallback_dir = fallback_root / f"hermes-large-outputs-{os.getuid()}"
+    real_ensure = large_output_handoff._ensure_writable_dir
+
+    def fail_primary_once(directory):
+        if Path(directory) == primary:
+            raise PermissionError("primary handoff dir is not writable")
+        return real_ensure(directory)
+
+    monkeypatch.setenv("HERMES_LARGE_OUTPUT_DIR", str(primary))
+    monkeypatch.setattr(tempfile, "gettempdir", lambda: str(fallback_root))
+    monkeypatch.setattr(
+        large_output_handoff,
+        "_ensure_writable_dir",
+        fail_primary_once,
+    )
+
+    reference = json.loads(
+        write_large_output_handoff(
+            json.dumps([{"row": 1}]),
+            max_inline_chars=1,
+            task_id="fallback-test",
+            producer="execute_code",
+        )
+    )
+
+    full_output_path = Path(reference["full_output_path"])
+    assert full_output_path.parent == fallback_dir
+    assert json.loads(full_output_path.read_text(encoding="utf-8")) == [{"row": 1}]
 
 
 def test_sanitize_output_text_keeps_small_clean_text_unchanged():

@@ -13,6 +13,7 @@ import json
 import os
 from pathlib import Path
 import re
+import tempfile
 from typing import Any
 
 
@@ -70,7 +71,6 @@ def write_large_output_handoff(
     encoded = text.encode("utf-8", errors="replace")
     digest = hashlib.sha256(encoded).hexdigest()
     directory = _handoff_dir()
-    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
 
     safe_task = _safe_component(task_id or "default")
     safe_producer = _safe_component(producer)
@@ -101,7 +101,27 @@ def write_large_output_handoff(
 
 
 def _handoff_dir() -> Path:
-    return Path(os.getenv("HERMES_LARGE_OUTPUT_DIR") or DEFAULT_HANDOFF_DIR)
+    explicit = os.getenv("HERMES_LARGE_OUTPUT_DIR")
+    candidates = [Path(explicit)] if explicit else [Path(DEFAULT_HANDOFF_DIR)]
+    candidates.append(Path(tempfile.gettempdir()) / f"hermes-large-outputs-{os.getuid()}")
+
+    errors: list[str] = []
+    seen: set[str] = set()
+    for directory in candidates:
+        key = str(directory)
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            _ensure_writable_dir(directory)
+            return directory
+        except OSError as exc:
+            errors.append(f"{directory}: {exc}")
+
+    raise OSError(
+        "No writable Hermes large-output handoff directory; tried "
+        + "; ".join(errors)
+    )
 
 
 def _safe_component(value: str) -> str:
@@ -127,9 +147,26 @@ def _append_manifest(directory: Path, record: dict[str, Any]) -> None:
         **record,
     }
     manifest = directory / "manifest.jsonl"
-    with open(manifest, "a", encoding="utf-8") as handle:
-        handle.write(json.dumps(entry, ensure_ascii=False, sort_keys=True) + "\n")
     try:
-        os.chmod(manifest, 0o600)
+        with open(manifest, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(entry, ensure_ascii=False, sort_keys=True) + "\n")
+        try:
+            os.chmod(manifest, 0o600)
+        except OSError:
+            pass
     except OSError:
         pass
+
+
+def _ensure_writable_dir(directory: Path) -> None:
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    probe = directory / f".write-test-{os.getpid()}"
+    with open(probe, "wb") as handle:
+        handle.write(b"")
+    try:
+        os.chmod(probe, 0o600)
+    finally:
+        try:
+            probe.unlink()
+        except OSError:
+            pass
