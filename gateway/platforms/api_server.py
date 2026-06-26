@@ -5008,6 +5008,29 @@ class APIServerAdapter(BasePlatformAdapter):
             async_delivery=False,
         )
 
+    @staticmethod
+    def _shutdown_agent_memory_provider(agent: Any) -> None:
+        """Close memory-provider resources owned by a short-lived API agent.
+
+        API server requests create fresh ``AIAgent`` instances per run, but the
+        agent may create a Hindsight cloud client with an aiohttp session.  The
+        broader ``agent.close()`` path also tears down per-session runtime state
+        such as process/browser/tool resources, so only close memory here.
+        """
+        if agent is None:
+            return
+        shutdown = getattr(agent, "shutdown_memory_provider", None)
+        if not callable(shutdown):
+            return
+        try:
+            session_messages = getattr(agent, "_session_messages", None)
+            if isinstance(session_messages, list):
+                shutdown(session_messages)
+            else:
+                shutdown()
+        except Exception as exc:
+            logger.debug("[api_server] agent memory-provider shutdown failed: %s", exc)
+
     async def _run_agent(
         self,
         user_message: str,
@@ -5049,6 +5072,7 @@ class APIServerAdapter(BasePlatformAdapter):
             from gateway.session_context import clear_session_vars
 
             with self._profile_scope(request_profile):
+                agent = None
                 tokens = self._bind_api_server_session(
                     chat_id=session_id or "",
                     session_key=gateway_session_key or session_id or "",
@@ -5083,7 +5107,12 @@ class APIServerAdapter(BasePlatformAdapter):
                         result["session_id"] = _eff_sid
                     return result, usage
                 finally:
-                    clear_session_vars(tokens)
+                    try:
+                        self._shutdown_agent_memory_provider(agent)
+                    finally:
+                        if agent_ref is not None and agent_ref and agent_ref[0] is agent:
+                            agent_ref[0] = None
+                        clear_session_vars(tokens)
 
         self._activate_admitted_request()
         self._inflight_agent_runs += 1
@@ -5356,39 +5385,42 @@ class APIServerAdapter(BasePlatformAdapter):
                     session_tokens = []
                     with self._profile_scope(request_profile):
                         try:
-                            # Bind approval/session identity for this API run via
-                            # contextvars so concurrent runs do not share process
-                            # environment state.
-                            approval_token = set_current_session_key(approval_session_key)
-                            session_tokens = self._bind_api_server_session(
-                                session_key=approval_session_key,
-                            )
-                            register_gateway_notify(approval_session_key, _approval_notify)
-                            r = agent.run_conversation(
-                                user_message=user_message,
-                                conversation_history=conversation_history,
-                                task_id=effective_task_id,
-                            )
-                        finally:
                             try:
-                                unregister_gateway_notify(approval_session_key)
+                                # Bind approval/session identity for this API run via
+                                # contextvars so concurrent runs do not share process
+                                # environment state.
+                                approval_token = set_current_session_key(approval_session_key)
+                                session_tokens = self._bind_api_server_session(
+                                    session_key=approval_session_key,
+                                )
+                                register_gateway_notify(approval_session_key, _approval_notify)
+                                r = agent.run_conversation(
+                                    user_message=user_message,
+                                    conversation_history=conversation_history,
+                                    task_id=effective_task_id,
+                                )
                             finally:
-                                if approval_token is not None:
-                                    try:
-                                        reset_current_session_key(approval_token)
-                                    except Exception:
-                                        pass
-                                if session_tokens:
-                                    try:
-                                        clear_session_vars(session_tokens)
-                                    except Exception:
-                                        pass
-                        u = {
-                            "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
-                            "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
-                            "total_tokens": getattr(agent, "session_total_tokens", 0) or 0,
-                        }
-                        return r, u
+                                try:
+                                    unregister_gateway_notify(approval_session_key)
+                                finally:
+                                    if approval_token is not None:
+                                        try:
+                                            reset_current_session_key(approval_token)
+                                        except Exception:
+                                            pass
+                                    if session_tokens:
+                                        try:
+                                            clear_session_vars(session_tokens)
+                                        except Exception:
+                                            pass
+                            u = {
+                                "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
+                                "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
+                                "total_tokens": getattr(agent, "session_total_tokens", 0) or 0,
+                            }
+                            return r, u
+                        finally:
+                            self._shutdown_agent_memory_provider(agent)
 
                 result, usage = await asyncio.get_running_loop().run_in_executor(None, _run_sync)
                 if run_id in self._stopping_run_ids:
