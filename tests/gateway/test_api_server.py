@@ -17,6 +17,7 @@ import base64
 import json
 import os
 import stat
+import threading
 import time
 import uuid
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -536,6 +537,25 @@ def auth_adapter():
     return _make_adapter(api_key="sk-secret")
 
 
+def _make_api_agent(final_response: str = "ok") -> MagicMock:
+    mock_agent = MagicMock()
+    mock_agent.run_conversation.return_value = {
+        "final_response": final_response,
+        "messages": [],
+        "api_calls": 1,
+    }
+    mock_agent.session_prompt_tokens = 1
+    mock_agent.session_completion_tokens = 2
+    mock_agent.session_total_tokens = 3
+    mock_agent._session_messages = [
+        {"role": "user", "content": "hello"},
+        {"role": "assistant", "content": final_response},
+    ]
+    mock_agent.shutdown_memory_provider = MagicMock()
+    mock_agent.close = MagicMock()
+    return mock_agent
+
+
 # ---------------------------------------------------------------------------
 # Adapter internals
 # ---------------------------------------------------------------------------
@@ -616,6 +636,87 @@ class TestAgentExecution:
         assert usage["cost_status"] == "estimated"
         assert usage["cost_usd"] == 0.0123
         assert mock_cost.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_run_agent_shuts_down_memory_provider_after_success(self, adapter):
+        mock_agent = _make_api_agent()
+
+        with patch.object(adapter, "_create_agent", return_value=mock_agent):
+            result, usage = await adapter._run_agent(
+                user_message="hello",
+                conversation_history=[],
+                session_id="session-123",
+            )
+
+        assert result["final_response"] == "ok"
+        assert usage == {"input_tokens": 1, "output_tokens": 2, "total_tokens": 3}
+        mock_agent.shutdown_memory_provider.assert_called_once_with(mock_agent._session_messages)
+        mock_agent.close.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_run_agent_shuts_down_memory_provider_after_exception(self, adapter):
+        mock_agent = _make_api_agent()
+        mock_agent.run_conversation.side_effect = RuntimeError("boom")
+
+        with patch.object(adapter, "_create_agent", return_value=mock_agent):
+            with pytest.raises(RuntimeError, match="boom"):
+                await adapter._run_agent(
+                    user_message="hello",
+                    conversation_history=[],
+                    session_id="session-123",
+                )
+
+        mock_agent.shutdown_memory_provider.assert_called_once_with(mock_agent._session_messages)
+        mock_agent.close.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_run_agent_shuts_down_memory_provider_after_cancellation(self, adapter):
+        ready = threading.Event()
+        interrupted = threading.Event()
+        mock_agent = _make_api_agent("cancelled")
+
+        def _interrupt(message=None):
+            interrupted.set()
+
+        def _blocking_run(user_message=None, conversation_history=None, task_id=None):
+            ready.set()
+            interrupted.wait(timeout=3)
+            return {"final_response": "cancelled", "messages": [], "api_calls": 1}
+
+        mock_agent.interrupt = MagicMock(side_effect=_interrupt)
+        mock_agent.run_conversation.side_effect = _blocking_run
+        agent_ref = [None]
+
+        with patch.object(adapter, "_create_agent", return_value=mock_agent):
+            task = asyncio.create_task(
+                adapter._run_agent(
+                    user_message="hello",
+                    conversation_history=[],
+                    session_id="session-123",
+                    agent_ref=agent_ref,
+                )
+            )
+            started = await asyncio.to_thread(ready.wait, 3)
+            if not started:
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+            assert started
+            assert agent_ref[0] is mock_agent
+
+            mock_agent.interrupt("test cancellation")
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+            for _ in range(20):
+                if mock_agent.shutdown_memory_provider.called:
+                    break
+                await asyncio.sleep(0.05)
+
+        mock_agent.shutdown_memory_provider.assert_called_once_with(mock_agent._session_messages)
+        assert agent_ref[0] is None
+        mock_agent.close.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -1064,6 +1165,26 @@ class TestChatCompletionsEndpoint:
         async with TestClient(TestServer(app)) as cli:
             resp = await cli.post("/v1/chat/completions", json={"model": "test", "messages": []})
             assert resp.status == 400
+
+    @pytest.mark.asyncio
+    async def test_non_streaming_shuts_down_memory_provider(self, adapter):
+        mock_agent = _make_api_agent("Hello!")
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent", return_value=mock_agent):
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "test",
+                        "messages": [{"role": "user", "content": "hi"}],
+                    },
+                )
+                assert resp.status == 200
+                data = await resp.json()
+
+        assert data["choices"][0]["message"]["content"] == "Hello!"
+        mock_agent.shutdown_memory_provider.assert_called_once_with(mock_agent._session_messages)
+        mock_agent.close.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_stream_true_returns_sse(self, adapter):
@@ -2284,6 +2405,23 @@ class TestResponsesEndpoint:
 
             # Session must be the same across the chain
             assert first_session_id == second_session_id
+
+    @pytest.mark.asyncio
+    async def test_non_streaming_shuts_down_memory_provider(self, adapter):
+        mock_agent = _make_api_agent("Hello!")
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent", return_value=mock_agent):
+                resp = await cli.post(
+                    "/v1/responses",
+                    json={"model": "hermes-agent", "input": "Hello"},
+                )
+                assert resp.status == 200
+                data = await resp.json()
+
+        assert data["output"][-1]["content"][0]["text"] == "Hello!"
+        mock_agent.shutdown_memory_provider.assert_called_once_with(mock_agent._session_messages)
+        mock_agent.close.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_invalid_previous_response_id_returns_404(self, adapter):

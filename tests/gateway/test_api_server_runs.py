@@ -10,6 +10,7 @@ Covers:
 
 import asyncio
 import threading
+import time
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -79,8 +80,29 @@ def _make_slow_agent(**kwargs):
     mock_agent.session_prompt_tokens = 0
     mock_agent.session_completion_tokens = 0
     mock_agent.session_total_tokens = 0
+    mock_agent._session_messages = [
+        {"role": "user", "content": "hello"},
+        {"role": "assistant", "content": "interrupted"},
+    ]
+    mock_agent.shutdown_memory_provider = MagicMock()
+    mock_agent.close = MagicMock()
 
     return mock_agent, ready, interrupted
+
+
+def _make_completed_agent(final_response: str = "done") -> MagicMock:
+    mock_agent = MagicMock()
+    mock_agent.run_conversation.return_value = {"final_response": final_response}
+    mock_agent.session_prompt_tokens = 4
+    mock_agent.session_completion_tokens = 2
+    mock_agent.session_total_tokens = 6
+    mock_agent._session_messages = [
+        {"role": "user", "content": "hello"},
+        {"role": "assistant", "content": final_response},
+    ]
+    mock_agent.shutdown_memory_provider = MagicMock()
+    mock_agent.close = MagicMock()
+    return mock_agent
 
 
 @pytest.fixture
@@ -201,11 +223,7 @@ class TestRunStatus:
         app = _create_runs_app(adapter)
         async with TestClient(TestServer(app)) as cli:
             with patch.object(adapter, "_create_agent") as mock_create:
-                mock_agent = MagicMock()
-                mock_agent.run_conversation.return_value = {"final_response": "done"}
-                mock_agent.session_prompt_tokens = 4
-                mock_agent.session_completion_tokens = 2
-                mock_agent.session_total_tokens = 6
+                mock_agent = _make_completed_agent("done")
                 mock_create.return_value = mock_agent
 
                 resp = await cli.post("/v1/runs", json={"input": "hello"})
@@ -224,6 +242,35 @@ class TestRunStatus:
                 assert status["output"] == "done"
                 assert status["usage"]["total_tokens"] == 6
                 assert status["last_event"] == "run.completed"
+                mock_agent.shutdown_memory_provider.assert_called_once_with(mock_agent._session_messages)
+                mock_agent.close.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_failed_run_shuts_down_memory_provider(self, adapter):
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_agent = _make_completed_agent("unused")
+                mock_agent.run_conversation.side_effect = RuntimeError("boom")
+                mock_create.return_value = mock_agent
+
+                resp = await cli.post("/v1/runs", json={"input": "hello"})
+                assert resp.status == 202
+                data = await resp.json()
+                run_id = data["run_id"]
+
+                for _ in range(20):
+                    status_resp = await cli.get(f"/v1/runs/{run_id}")
+                    assert status_resp.status == 200
+                    status = await status_resp.json()
+                    if status["status"] == "failed":
+                        break
+                    await asyncio.sleep(0.05)
+
+                assert status["status"] == "failed"
+                assert "boom" in status["error"]
+                mock_agent.shutdown_memory_provider.assert_called_once_with(mock_agent._session_messages)
+                mock_agent.close.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_status_reflects_explicit_session_id(self, adapter):
@@ -369,6 +416,43 @@ class TestRunEvents:
             resp = await cli.get("/v1/runs/run_any/events")
         assert resp.status == 401
 
+    @pytest.mark.asyncio
+    async def test_orphaned_active_run_interrupts_and_shuts_down_memory_provider(self, adapter):
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_agent, agent_ready, _ = _make_slow_agent()
+                mock_create.return_value = mock_agent
+
+                resp = await cli.post("/v1/runs", json={"input": "hello"})
+                assert resp.status == 202
+                data = await resp.json()
+                run_id = data["run_id"]
+
+                assert agent_ready.wait(timeout=3.0)
+                adapter._run_streams_created[run_id] = time.time() - adapter._RUN_STREAM_TTL - 1
+
+                sleep_calls = {"count": 0}
+
+                async def _one_sweep_then_cancel(delay):
+                    sleep_calls["count"] += 1
+                    if sleep_calls["count"] > 1:
+                        raise asyncio.CancelledError()
+
+                with patch("gateway.platforms.api_server.asyncio.sleep", new=_one_sweep_then_cancel):
+                    with pytest.raises(asyncio.CancelledError):
+                        await adapter._sweep_orphaned_runs()
+
+                mock_agent.interrupt.assert_called_once_with("Run stream orphaned")
+
+                for _ in range(20):
+                    if mock_agent.shutdown_memory_provider.called:
+                        break
+                    await asyncio.sleep(0.05)
+
+                mock_agent.shutdown_memory_provider.assert_called_once_with(mock_agent._session_messages)
+                mock_agent.close.assert_not_called()
+
 
 # ---------------------------------------------------------------------------
 # POST /v1/runs/{run_id}/stop — interrupt a running agent
@@ -417,6 +501,8 @@ class TestStopRun:
                 await asyncio.sleep(0.5)
                 assert run_id not in adapter._active_run_agents
                 assert run_id not in adapter._active_run_tasks
+                mock_agent.shutdown_memory_provider.assert_called_once_with(mock_agent._session_messages)
+                mock_agent.close.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_stop_nonexistent_run_returns_404(self, adapter):
