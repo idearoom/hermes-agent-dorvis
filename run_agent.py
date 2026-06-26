@@ -3132,10 +3132,16 @@ class AIAgent:
                 response_text,
                 **sync_kwargs,
             )
-            self._memory_manager.queue_prefetch_all(
-                user_text,
-                session_id=self.session_id or "",
-            )
+            # API-server agents are intentionally one-shot: the next request
+            # gets a fresh AIAgent and uses same-turn recall instead of a
+            # warmed in-process prefetch. Queueing next-turn prefetch here
+            # creates background Hindsight aiohttp work with no consumer and
+            # can race request teardown.
+            if (self.platform or "").strip() != "api_server":
+                self._memory_manager.queue_prefetch_all(
+                    user_text,
+                    session_id=self.session_id or "",
+                )
         except Exception:
             pass
 

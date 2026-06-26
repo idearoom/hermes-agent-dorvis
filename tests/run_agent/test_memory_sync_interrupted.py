@@ -35,6 +35,7 @@ def _bare_agent():
     # providers that cache per-session state can update it mid-process
     # (see #6672).
     agent.session_id = "test_session_001"
+    agent.platform = "cli"
     return agent
 
 
@@ -90,6 +91,25 @@ class TestSyncExternalMemoryForTurn:
             "What's the weather in Paris?",
             session_id="test_session_001",
         )
+
+    def test_api_server_completed_turn_syncs_without_next_turn_prefetch(self):
+        """API-server agents are request-scoped, so retain the turn but do
+        not warm prefetch for an in-process next turn that can never happen."""
+        agent = _bare_agent()
+        agent.platform = "api_server"
+
+        agent._sync_external_memory_for_turn(
+            original_user_message="remember this",
+            final_response="stored",
+            interrupted=False,
+        )
+
+        agent._memory_manager.sync_all.assert_called_once_with(
+            "remember this",
+            "stored",
+            session_id="test_session_001",
+        )
+        agent._memory_manager.queue_prefetch_all.assert_not_called()
 
     def test_completed_turn_syncs_messages_when_present(self):
         agent = _bare_agent()
