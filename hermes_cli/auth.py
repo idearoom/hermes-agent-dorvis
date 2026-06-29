@@ -3744,12 +3744,20 @@ def resolve_codex_runtime_credentials(
         data = _read_codex_tokens()
     except AuthError as exc:
         read_error = exc
-        if getattr(exc, "relogin_required", False) and getattr(exc, "code", None) in {
-            "codex_auth_missing_access_token",
-            "codex_auth_missing_refresh_token",
-            "codex_auth_invalid_shape",
-        }:
-            imported = _recover_codex_tokens_from_cli(str(getattr(exc, "code", None) or "auth_error"))
+        exc_code = getattr(exc, "code", None)
+        should_import_from_explicit_codex_home = (
+            exc_code == "codex_auth_missing"
+            and bool(os.getenv("CODEX_HOME", "").strip())
+        )
+        if getattr(exc, "relogin_required", False) and (
+            exc_code in {
+                "codex_auth_missing_access_token",
+                "codex_auth_missing_refresh_token",
+                "codex_auth_invalid_shape",
+            }
+            or should_import_from_explicit_codex_home
+        ):
+            imported = _recover_codex_tokens_from_cli(str(exc_code or "auth_error"))
             if imported:
                 data = {"tokens": imported, "last_refresh": imported.get("last_refresh")}
             else:
