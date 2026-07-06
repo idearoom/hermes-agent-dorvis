@@ -38,7 +38,6 @@ being re-audited — see ``assert_schema_compat``.
 from __future__ import annotations
 
 import hashlib
-import json
 import logging
 import os
 import random
