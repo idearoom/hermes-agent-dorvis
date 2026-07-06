@@ -4,7 +4,38 @@ This fork carries IdeaRoom-specific runtime patches on top of NousResearch
 `hermes-agent` upstream. Keep this file current whenever a patch is added,
 removed, rebased, or promoted.
 
-Current upstream base for the carried branch: `388268ecde085a22c15474fea1723db161a930da`.
+Current upstream base for the carried branch: `2ebf9a90b762f21e33318b342e921b17e3d81946`
+(merged into fork `main` as `37bc3ce4a`; previous base `388268ecde085a22c15474fea1723db161a930da`).
+
+### 2026-07-06 rebase notes (388268ec → 2ebf9a90)
+
+All carried patches survived; none were absorbed or dropped. Conflicted and
+notable resolutions:
+
+- **Stateful compression quality gate** — conflicted in
+  `agent/context_compressor.py` and `agent/conversation_compression.py`.
+  Upstream stopped eagerly resetting `_last_summary_auth_failure` /
+  `_last_summary_network_failure` at the top of `compress()` (data-loss fix
+  #29559); the patch now follows that semantics and only resets its own
+  quality-gate/diagnostic fields. The `context_compression_aborted` /
+  `context_compression_completed` hook emissions were re-grafted into
+  upstream's new try/finally compression-lock structure (lock lease refresher,
+  in-place compaction #38763); the completed hook now also carries `in_place`.
+  `quality_gate_enabled` is read via `getattr(..., False)` because upstream
+  tests construct `ContextCompressor` via `__new__`, bypassing `__init__`.
+- **MCP Hermes context keying** — additive collisions with upstream's
+  `skip_preflight` doc row and new `TestFilterMCPChildren` tests; both sides
+  kept.
+- **Large output handoff** — trivial import-block collision in
+  `tests/tools/test_code_execution.py`; both sides kept.
+- Hook-surface audit: upstream added a `pre_verify` hook
+  (`hermes_cli/plugins.py`) and now fires `on_session_end` memory extraction
+  before soft-evicting finalizable sessions under LRU cache pressure
+  (`gateway/run.py`). Both are additive; no fork hook call sites changed.
+- Upstream consolidated gateway session metadata and the routing index into
+  `state.db` (schema v19, `gateway_routing` table, `AsyncSessionDB` facade);
+  `sessions.json` is now an optional legacy mirror. No carried patch touches
+  that surface, but D6b (Postgres session store) builds on it.
 
 ## Patch Inventory
 
