@@ -610,6 +610,13 @@ class PgSessionDB(SessionDB):
     ``__init__`` read the DSN from ``HERMES_STATE_STORE_DSN``.
     """
 
+    # SQLite's multimodal-content sentinel is "\x00json:" — but Postgres
+    # TEXT cannot store NUL bytes (the param adapter strips them). Use a
+    # \x01 sentinel instead; _encode_content/_decode_content are classmethods
+    # and pick this up automatically. scripts/migrate_state_to_postgres.py
+    # rewrites the legacy prefix during the one-time copy.
+    _CONTENT_JSON_PREFIX = "\x01json:"
+
     def __init__(
         self,
         db_path: Path = None,

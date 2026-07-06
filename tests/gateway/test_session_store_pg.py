@@ -1,0 +1,551 @@
+"""Postgres-backed SessionDB integration tests (IdeaRoom D6b / AE-115).
+
+Requires a reachable Postgres and is skipped otherwise, mirroring
+``test_response_store_pg.py``: set ``HERMES_STATE_TEST_DSN`` (or reuse the
+D6a ``HERMES_D6_TEST_DSN``) to something like::
+
+    postgresql://postgres:test@localhost:54330/postgres
+
+Each test drops and recreates the ``hermes_state`` schema, so point it at a
+throwaway database.
+"""
+
+import json
+import os
+import subprocess
+import sys
+import textwrap
+import threading
+import time
+from pathlib import Path
+
+import pytest
+
+_DSN = (
+    os.environ.get("HERMES_STATE_TEST_DSN", "").strip()
+    or os.environ.get("HERMES_D6_TEST_DSN", "").strip()
+)
+
+psycopg = pytest.importorskip("psycopg")
+pytest.importorskip("psycopg_pool")
+
+if not _DSN:
+    pytest.skip(
+        "HERMES_STATE_TEST_DSN / HERMES_D6_TEST_DSN not set",
+        allow_module_level=True,
+    )
+
+import hermes_state
+from hermes_state import AsyncSessionDB, SessionDB
+from hermes_state_pg import _SCHEMA, EXPECTED_SCHEMA_VERSION, PgSessionDB
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _drop_schema():
+    with psycopg.connect(_DSN, autocommit=True) as conn:
+        conn.execute(f"DROP SCHEMA IF EXISTS {_SCHEMA} CASCADE")
+
+
+@pytest.fixture()
+def pg_db():
+    _drop_schema()
+    db = PgSessionDB(dsn=_DSN)
+    yield db
+    db.close()
+
+
+@pytest.fixture()
+def sqlite_db(tmp_path):
+    db = SessionDB(tmp_path / "state.db")
+    yield db
+    db.close()
+
+
+# ── CRUD / append / load round-trip ────────────────────────────────────────
+
+
+def test_full_crud_round_trip(pg_db):
+    sid = pg_db.create_session(
+        "sess-1", "webui", user_id="u1", model="m1",
+        model_config={"temperature": 0.2}, system_prompt="sys",
+    )
+    assert sid == "sess-1"
+
+    mid1 = pg_db.append_message(sid, "user", "hello world")
+    mid2 = pg_db.append_message(
+        sid,
+        "assistant",
+        "hi there",
+        tool_calls=[{"id": "t1", "function": {"name": "f"}}],
+        token_count=7,
+        finish_reason="stop",
+        reasoning="thinking...",
+    )
+    assert isinstance(mid1, int) and mid2 > mid1
+
+    # Multimodal content round-trips through the JSON envelope.
+    pg_db.append_message(
+        sid, "user", [{"type": "text", "text": "part"}, {"type": "image_url"}]
+    )
+
+    msgs = pg_db.get_messages(sid)
+    assert [m["role"] for m in msgs] == ["user", "assistant", "user"]
+    assert msgs[0]["content"] == "hello world"
+    assert msgs[1]["tool_calls"][0]["id"] == "t1"
+    assert isinstance(msgs[2]["content"], list)
+
+    sess = pg_db.get_session(sid)
+    assert sess["message_count"] == 3
+    assert sess["tool_call_count"] == 1
+    assert json.loads(sess["model_config"])["temperature"] == 0.2
+
+    conv = pg_db.get_messages_as_conversation(sid)
+    assert any(m["role"] == "assistant" for m in conv)
+
+    pg_db.update_token_counts(sid, input_tokens=100, output_tokens=50)
+    assert pg_db.get_session(sid)["input_tokens"] == 100
+
+    assert pg_db.delete_session(sid) is True
+    assert pg_db.get_session(sid) is None
+    assert pg_db.get_messages(sid) == []
+
+
+def test_replace_messages_and_counters(pg_db):
+    sid = pg_db.create_session("sess-r", "webui")
+    for i in range(4):
+        pg_db.append_message(sid, "user", f"old {i}")
+    pg_db.replace_messages(sid, [{"role": "user", "content": "new only"}])
+    msgs = pg_db.get_messages(sid)
+    assert len(msgs) == 1 and msgs[0]["content"] == "new only"
+    assert pg_db.get_session(sid)["message_count"] == 1
+
+
+# ── Gateway peer metadata + routing index ──────────────────────────────────
+
+
+def test_gateway_peer_and_routing_round_trip(pg_db):
+    sid = pg_db.create_session("sess-gw", "webui", user_id="u1")
+    pg_db.record_gateway_session_peer(
+        sid,
+        source="webui",
+        user_id="u1",
+        session_key="webui:u1:c1",
+        chat_id="c1",
+        chat_type="dm",
+        thread_id=None,
+        display_name="Dalton",
+        origin_json='{"chat_id": "c1"}',
+    )
+    pg_db.set_expiry_finalized(sid, True)
+    sess = pg_db.get_session(sid)
+    assert sess["display_name"] == "Dalton"
+    assert sess["expiry_finalized"] == 1
+
+    rows = pg_db.list_gateway_sessions(platform="webui")
+    assert [r["id"] for r in rows] == [sid]
+    assert (
+        pg_db.find_session_by_origin(platform="webui", chat_id="c1", user_id="u1")
+        == sid
+    )
+
+    pg_db.save_gateway_routing_entry("k1", '{"v": 1}', scope="dirA")
+    pg_db.save_gateway_routing_entry("k2", '{"v": 2}', scope="dirA")
+    pg_db.save_gateway_routing_entry("k1", '{"v": 9}', scope="dirB")
+    assert pg_db.load_gateway_routing_entries(scope="dirA") == {
+        "k1": '{"v": 1}',
+        "k2": '{"v": 2}',
+    }
+
+    pg_db.replace_gateway_routing_entries({"k3": '{"v": 3}'}, scope="dirA")
+    assert pg_db.load_gateway_routing_entries(scope="dirA") == {"k3": '{"v": 3}'}
+    # Other scope untouched by the replace.
+    assert pg_db.load_gateway_routing_entries(scope="dirB") == {"k1": '{"v": 9}'}
+
+    pg_db.delete_gateway_routing_entries(["k3"], scope="dirA")
+    assert pg_db.load_gateway_routing_entries(scope="dirA") == {}
+
+
+# ── archive_and_compact atomicity ──────────────────────────────────────────
+
+
+def test_archive_and_compact_soft_archives_and_inserts(pg_db):
+    sid = pg_db.create_session("sess-c", "webui")
+    for i in range(5):
+        pg_db.append_message(sid, "user", f"pre-compaction {i}")
+    n = pg_db.archive_and_compact(
+        sid, [{"role": "user", "content": "the summary"}]
+    )
+    assert n == 1
+    live = pg_db.get_messages(sid)
+    assert [m["content"] for m in live] == ["the summary"]
+    everything = pg_db.get_messages(sid, include_inactive=True)
+    assert len(everything) == 6
+    archived = [m for m in everything if m["active"] == 0]
+    assert len(archived) == 5
+    assert all(m["compacted"] == 1 for m in archived)
+    assert pg_db.has_archived_messages(sid) is True
+    assert pg_db.get_session(sid)["message_count"] == 1
+    # Archived (compacted=1) rows stay searchable by default.
+    hits = pg_db.search_messages("pre-compaction")
+    assert len(hits) == 5
+
+
+def test_archive_and_compact_rolls_back_atomically(pg_db):
+    sid = pg_db.create_session("sess-atom", "webui")
+    for i in range(3):
+        pg_db.append_message(sid, "user", f"keep me {i}")
+    # Second message is unstorable (token_count must be numeric) — the whole
+    # transaction (soft-archive + inserts) must roll back.
+    bad = [
+        {"role": "user", "content": "summary"},
+        {"role": "user", "content": "boom", "token_count": {"not": "an int"}},
+    ]
+    with pytest.raises(Exception):
+        pg_db.archive_and_compact(sid, bad)
+    live = pg_db.get_messages(sid)
+    assert [m["content"] for m in live] == ["keep me 0", "keep me 1", "keep me 2"]
+    assert all(m["active"] == 1 and m["compacted"] == 0 for m in live)
+    assert pg_db.get_session(sid)["message_count"] == 3
+
+
+# ── FTS parity (tsvector vs FTS5) ──────────────────────────────────────────
+
+_CORPUS = [
+    ("user", "we should deploy the new gateway build today"),
+    ("assistant", "deployment finished without errors"),
+    ("user", "docker compose keeps restarting the browserless container"),
+    ("user", "let's talk about kubernetes ingress and docker networking"),
+    ("assistant", "the chat-send helper drops messages on reconnect"),
+    ("user", "大别山项目的进展如何"),
+    ("assistant", "大别山项目 进展顺利, 明天继续"),
+    ("user", "totally unrelated message about gardening"),
+]
+
+_PARITY_QUERIES = [
+    "docker",                # exact word
+    "deploy*",               # prefix
+    "docker kubernetes",     # multi-term implicit AND
+    "docker OR gardening",   # boolean OR
+    '"docker compose"',      # phrase
+    "chat-send",             # hyphenated term (sanitizer quotes it)
+    "大别山项目",              # non-ASCII (CJK trigram/ILIKE path)
+]
+
+
+def _index_by_content(db, sid):
+    return {m["content"]: m["id"] for m in db.get_messages(sid)}
+
+
+@pytest.mark.parametrize("query", _PARITY_QUERIES)
+def test_fts_parity_with_sqlite(pg_db, sqlite_db, query):
+    if not sqlite_db._fts_enabled:
+        pytest.skip("SQLite build lacks FTS5")
+    for db in (pg_db, sqlite_db):
+        sid = db.create_session("sess-fts", "webui")
+        for role, content in _CORPUS:
+            db.append_message(sid, role, content)
+
+    def matched_contents(db):
+        by_content = _index_by_content(db, "sess-fts")
+        by_id = {v: k for k, v in by_content.items()}
+        return {by_id[m["id"]] for m in db.search_messages(query, limit=50)}
+
+    pg_hits = matched_contents(pg_db)
+    sq_hits = matched_contents(sqlite_db)
+    assert pg_hits == sq_hits, (
+        f"FTS parity broken for {query!r}: pg={pg_hits} sqlite={sq_hits}"
+    )
+    assert pg_hits, f"parity query {query!r} matched nothing on either backend"
+
+
+def test_search_filters_and_sort(pg_db):
+    sid = pg_db.create_session("sess-f", "webui")
+    other = pg_db.create_session("sess-o", "cli")
+    pg_db.append_message(sid, "user", "alpha needle one")
+    pg_db.append_message(sid, "assistant", "alpha needle two")
+    pg_db.append_message(other, "user", "alpha needle three")
+
+    assert len(pg_db.search_messages("needle")) == 3
+    assert len(pg_db.search_messages("needle", source_filter=["webui"])) == 2
+    assert len(pg_db.search_messages("needle", exclude_sources=["webui"])) == 1
+    assert len(pg_db.search_messages("needle", role_filter=["assistant"])) == 1
+
+    newest = pg_db.search_messages("needle", sort="newest")
+    assert [m["snippet"] for m in newest][0].count("needle") >= 1
+    ts = [m["timestamp"] for m in newest]
+    assert ts == sorted(ts, reverse=True)
+
+    hit = pg_db.search_messages("needle", role_filter=["assistant"])[0]
+    # prev + match (+ next when one exists; the assistant hit is last in its
+    # session, matching the SQLite implementation's context shape).
+    assert "context" in hit and len(hit["context"]) == 2
+    assert "content" not in hit
+
+
+# ── Compression locks: cross-connection correctness ────────────────────────
+
+
+def test_compression_lock_contention_two_connections(pg_db):
+    """Two pools (= two processes' worth of connections) against one DB."""
+    db2 = PgSessionDB(dsn=_DSN)
+    try:
+        sid = pg_db.create_session("sess-lock", "webui")
+
+        assert pg_db.try_acquire_compression_lock(sid, "holder-A", 5.0) is True
+        # Graceful conflict, not a PK-violation exception:
+        assert db2.try_acquire_compression_lock(sid, "holder-B", 5.0) is False
+        assert db2.get_compression_lock_holder(sid) == "holder-A"
+
+        # Refresh only works for the owner.
+        assert pg_db.refresh_compression_lock(sid, "holder-A", 5.0) is True
+        assert db2.refresh_compression_lock(sid, "holder-B", 5.0) is False
+
+        # Release is owner-scoped and idempotent.
+        db2.release_compression_lock(sid, "holder-B")  # no-op, not ours
+        assert pg_db.get_compression_lock_holder(sid) == "holder-A"
+        pg_db.release_compression_lock(sid, "holder-A")
+        assert pg_db.get_compression_lock_holder(sid) is None
+
+        # TTL expiry is honored: an expired lock is reclaimed transparently.
+        assert pg_db.try_acquire_compression_lock(sid, "holder-A", 0.05) is True
+        time.sleep(0.15)
+        assert db2.try_acquire_compression_lock(sid, "holder-B", 5.0) is True
+        assert pg_db.get_compression_lock_holder(sid) == "holder-B"
+        db2.release_compression_lock(sid, "holder-B")
+    finally:
+        db2.close()
+
+
+def test_compression_lock_thread_race_single_winner(pg_db):
+    db2 = PgSessionDB(dsn=_DSN)
+    try:
+        sid = pg_db.create_session("sess-race", "webui")
+        wins = []
+        barrier = threading.Barrier(8)
+
+        def worker(db, holder):
+            barrier.wait()
+            if db.try_acquire_compression_lock(sid, holder, 10.0):
+                wins.append(holder)
+
+        threads = [
+            threading.Thread(
+                target=worker,
+                args=(pg_db if i % 2 == 0 else db2, f"h{i}"),
+            )
+            for i in range(8)
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert len(wins) == 1
+        assert pg_db.get_compression_lock_holder(sid) == wins[0]
+    finally:
+        db2.close()
+
+
+# ── Schema-version assertion ───────────────────────────────────────────────
+
+
+def test_boot_fails_on_upstream_schema_version_drift(monkeypatch):
+    _drop_schema()
+    monkeypatch.setattr(
+        hermes_state, "SCHEMA_VERSION", EXPECTED_SCHEMA_VERSION + 1
+    )
+    with pytest.raises(RuntimeError, match="rebase-drift"):
+        PgSessionDB(dsn=_DSN)
+
+
+def test_boot_fails_on_persisted_version_mismatch(pg_db):
+    """A database initialized by a different build refuses this build."""
+    with psycopg.connect(_DSN, autocommit=True) as conn:
+        conn.execute(f"UPDATE {_SCHEMA}.schema_version SET version = 18")
+    with pytest.raises(RuntimeError, match="expects "):
+        PgSessionDB(dsn=_DSN)
+
+
+def test_boot_fails_on_persisted_surface_mismatch(pg_db):
+    with psycopg.connect(_DSN, autocommit=True) as conn:
+        conn.execute(
+            f"UPDATE {_SCHEMA}.state_meta SET value = 'deadbeef' "
+            "WHERE key = 'pg_backend_schema_surface_sha256'"
+        )
+    with pytest.raises(RuntimeError, match="Rebase drift"):
+        PgSessionDB(dsn=_DSN)
+
+
+# ── Env-var dispatch, end to end ───────────────────────────────────────────
+
+
+def test_sessiondb_env_dispatch_end_to_end(monkeypatch):
+    _drop_schema()
+    monkeypatch.setenv("HERMES_STATE_STORE_DSN", _DSN)
+    db = SessionDB()
+    try:
+        assert type(db) is PgSessionDB
+        sid = db.create_session("sess-env", "webui")
+        db.append_message(sid, "user", "dispatched")
+        assert db.get_messages(sid)[0]["content"] == "dispatched"
+    finally:
+        db.close()
+
+
+def test_async_facade_over_pg(pg_db):
+    import asyncio
+
+    facade = AsyncSessionDB(pg_db)
+
+    async def flow():
+        await facade.create_session("sess-async", "webui")
+        await facade.append_message("sess-async", "user", "via facade")
+        return await facade.get_messages("sess-async")
+
+    msgs = asyncio.run(flow())
+    assert msgs[0]["content"] == "via facade"
+
+
+# ── Migration script ───────────────────────────────────────────────────────
+
+
+def test_migration_script_round_trip(tmp_path):
+    _drop_schema()
+    src = tmp_path / "state.db"
+    sdb = SessionDB(src)
+    parent = sdb.create_session("mig-parent", "webui", user_id="u1")
+    child = sdb.create_session(
+        "mig-child", "webui", parent_session_id=parent
+    )
+    for i in range(6):
+        sdb.append_message(parent, "user", f"parent msg {i}")
+    sdb.append_message(child, "assistant", "child msg")
+    # Multimodal content: SQLite stores it with the "\x00json:" sentinel;
+    # the migration must rewrite it to the Pg backend's "\x01json:" form.
+    sdb.append_message(
+        child, "user", [{"type": "text", "text": "multimodal part"}]
+    )
+    # Soft-archive so active/compacted flags must survive the copy.
+    sdb.archive_and_compact(parent, [{"role": "user", "content": "summary"}])
+    sdb.save_gateway_routing_entry("k1", '{"v": 1}', scope="s")
+    sdb.set_meta("some_key", "some_value")
+    sdb.try_acquire_compression_lock(parent, "mig-holder", 3600.0)
+    src_active = len(sdb.get_messages(parent))
+    src_all = len(sdb.get_messages(parent, include_inactive=True))
+    sdb.close()
+
+    script = _REPO_ROOT / "scripts" / "migrate_state_to_postgres.py"
+
+    # Dry run writes nothing.
+    out = subprocess.run(
+        [sys.executable, str(script), "--sqlite", str(src), "--dsn", _DSN],
+        capture_output=True, text=True, cwd=_REPO_ROOT,
+    )
+    assert out.returncode == 0, out.stderr
+    assert "Dry run" in out.stdout
+
+    out = subprocess.run(
+        [sys.executable, str(script), "--sqlite", str(src), "--dsn", _DSN,
+         "--apply"],
+        capture_output=True, text=True, cwd=_REPO_ROOT,
+    )
+    assert out.returncode == 0, out.stderr + out.stdout
+    assert "Migration complete." in out.stdout
+    assert "MISMATCH" not in out.stdout
+
+    pdb = PgSessionDB(dsn=_DSN)
+    try:
+        assert len(pdb.get_messages(parent)) == src_active
+        assert len(pdb.get_messages(parent, include_inactive=True)) == src_all
+        assert pdb.get_session(child)["parent_session_id"] == parent
+        child_msgs = pdb.get_messages(child)
+        assert child_msgs[1]["content"] == [
+            {"type": "text", "text": "multimodal part"}
+        ]
+        assert pdb.load_gateway_routing_entries(scope="s") == {"k1": '{"v": 1}'}
+        assert pdb.get_meta("some_key") == "some_value"
+        assert pdb.get_compression_lock_holder(parent) == "mig-holder"
+        # Identity sequence resumes past migrated ids.
+        new_id = pdb.append_message(child, "user", "post-migration")
+        max_migrated = max(
+            m["id"] for m in pdb.get_messages(parent, include_inactive=True)
+        )
+        assert new_id > max_migrated
+    finally:
+        pdb.close()
+
+    # Second --apply without --allow-nonempty refuses; with it, idempotent.
+    out = subprocess.run(
+        [sys.executable, str(script), "--sqlite", str(src), "--dsn", _DSN,
+         "--apply"],
+        capture_output=True, text=True, cwd=_REPO_ROOT,
+    )
+    assert out.returncode == 3
+    out = subprocess.run(
+        [sys.executable, str(script), "--sqlite", str(src), "--dsn", _DSN,
+         "--apply", "--allow-nonempty"],
+        capture_output=True, text=True, cwd=_REPO_ROOT,
+    )
+    assert out.returncode == 0, out.stderr + out.stdout
+    pdb = PgSessionDB(dsn=_DSN)
+    try:
+        assert len(pdb.get_messages(parent, include_inactive=True)) == src_all
+    finally:
+        pdb.close()
+
+
+# ── Two-process concurrent smoke ───────────────────────────────────────────
+
+_WORKER_SRC = textwrap.dedent(
+    """
+    import json, sys, time
+    sys.path.insert(0, sys.argv[4])
+    from hermes_state_pg import PgSessionDB
+
+    dsn, name, shared_sid = sys.argv[1], sys.argv[2], sys.argv[3]
+    db = PgSessionDB(dsn=dsn)
+    own_sid = db.create_session(f"proc-{name}", "webui", user_id=name)
+    acquired = 0
+    for i in range(40):
+        db.append_message(own_sid, "user", f"{name} write {i}")
+        if db.try_acquire_compression_lock(shared_sid, f"holder-{name}", 0.5):
+            acquired += 1
+            time.sleep(0.005)
+            db.release_compression_lock(shared_sid, f"holder-{name}")
+    msgs = db.get_messages(own_sid)
+    ok = len(msgs) == 40 and all(
+        m["content"] == f"{name} write {i}" for i, m in enumerate(msgs)
+    )
+    print(json.dumps({"name": name, "ok": ok, "acquired": acquired}))
+    db.close()
+    """
+)
+
+
+def test_two_process_concurrent_smoke(pg_db, tmp_path):
+    """Two real OS processes, one database: interleaved session writes on
+    distinct sessions plus lock contention on a shared session."""
+    shared = pg_db.create_session("proc-shared", "webui")
+    worker = tmp_path / "worker.py"
+    worker.write_text(_WORKER_SRC)
+    procs = [
+        subprocess.Popen(
+            [sys.executable, str(worker), _DSN, name, shared, str(_REPO_ROOT)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            cwd=tmp_path,
+        )
+        for name in ("alpha", "beta")
+    ]
+    results = []
+    for p in procs:
+        out, err = p.communicate(timeout=120)
+        assert p.returncode == 0, err
+        results.append(json.loads(out.strip().splitlines()[-1]))
+
+    assert all(r["ok"] for r in results), results
+    # Both processes made progress through the shared lock over 40 rounds.
+    assert all(r["acquired"] > 0 for r in results), results
+    # No cross-contamination between the two writers' sessions.
+    assert len(pg_db.get_messages("proc-alpha")) == 40
+    assert len(pg_db.get_messages("proc-beta")) == 40
+    assert pg_db.get_compression_lock_holder(shared) is None
