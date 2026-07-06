@@ -684,21 +684,54 @@ class PgSessionDB(SessionDB):
 
     # ── Schema ──────────────────────────────────────────────────────────
 
+    # Serializes concurrent cold-boot bootstrap (see _init_pg_schema).
+    # Stable 63-bit advisory-lock key derived from the schema name.
+    _BOOTSTRAP_LOCK_KEY = int.from_bytes(
+        hashlib.sha256(f"hermes_state_pg:{_SCHEMA}".encode()).digest()[:8],
+        "big",
+        signed=True,
+    )
+
     def _init_pg_schema(self) -> None:
+        # Two gateway tasks can construct PgSessionDB concurrently against
+        # the same database (the blue/green overlap window of ADR 0177, or a
+        # service scaling from zero). Postgres CREATE TABLE IF NOT EXISTS is
+        # not concurrency-safe when the table genuinely doesn't exist yet
+        # (both creators race in pg_type: "duplicate key value violates
+        # unique constraint pg_type_typname_nsp_index"), and the
+        # schema_version seed below is check-then-insert. Serialize the whole
+        # bootstrap behind a session advisory lock; after first boot the lock
+        # is held only for the duration of no-op IF NOT EXISTS statements.
         with self._pool.connection() as conn:
-            for stmt in PG_SCHEMA_SQL:
-                conn.execute(stmt)
-            for stmt in PG_TRGM_SQL:
-                try:
+            conn.execute(
+                "SELECT pg_advisory_lock(%s)", (self._BOOTSTRAP_LOCK_KEY,)
+            )
+            try:
+                for stmt in PG_SCHEMA_SQL:
                     conn.execute(stmt)
-                except Exception as exc:
-                    logger.info(
-                        "pg_trgm acceleration unavailable for the session "
-                        "store (CJK search falls back to unindexed ILIKE): %s",
-                        exc,
+                for stmt in PG_TRGM_SQL:
+                    try:
+                        conn.execute(stmt)
+                    except Exception as exc:
+                        logger.info(
+                            "pg_trgm acceleration unavailable for the session "
+                            "store (CJK search falls back to unindexed ILIKE): %s",
+                            exc,
+                        )
+                        break
+                self._assert_persisted_schema_markers(conn)
+            finally:
+                try:
+                    conn.execute(
+                        "SELECT pg_advisory_unlock(%s)", (self._BOOTSTRAP_LOCK_KEY,)
                     )
-                    break
-            self._assert_persisted_schema_markers(conn)
+                except Exception:
+                    # Don't mask the bootstrap error; a dead connection
+                    # releases its session advisory locks server-side anyway.
+                    logger.warning(
+                        "failed to release session-store bootstrap advisory lock",
+                        exc_info=True,
+                    )
 
     def _assert_persisted_schema_markers(self, conn) -> None:
         """Record/verify the schema version + surface hash inside Postgres.

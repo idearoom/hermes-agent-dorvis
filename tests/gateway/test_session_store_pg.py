@@ -522,6 +522,60 @@ _WORKER_SRC = textwrap.dedent(
 )
 
 
+_COLD_BOOT_WORKER_SRC = textwrap.dedent(
+    """
+    import json, sys, time
+    sys.path.insert(0, sys.argv[3])
+    from hermes_state_pg import PgSessionDB
+
+    dsn, start_at = sys.argv[1], float(sys.argv[2])
+    # Line up all workers on the same instant so their first-boot DDL
+    # genuinely overlaps.
+    while time.time() < start_at:
+        time.sleep(0.001)
+    db = PgSessionDB(dsn=dsn)
+    db.ensure_session("cold-boot-probe", "webui")
+    print(json.dumps({"ok": True}))
+    db.close()
+    """
+)
+
+
+def test_concurrent_cold_boot_bootstrap(tmp_path):
+    """N processes constructing PgSessionDB against an EMPTY database at the
+    same instant must all boot (ADR 0177 blue/green overlap, service scaling
+    from zero). Guards the advisory-lock serialization in _init_pg_schema:
+    Postgres CREATE TABLE IF NOT EXISTS races in pg_type when the tables
+    genuinely don't exist yet, and the schema_version seed is
+    check-then-insert."""
+    _drop_schema()
+    worker = tmp_path / "cold_boot_worker.py"
+    worker.write_text(_COLD_BOOT_WORKER_SRC)
+    start_at = time.time() + 1.5
+    procs = [
+        subprocess.Popen(
+            [sys.executable, str(worker), _DSN, str(start_at), str(_REPO_ROOT)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            cwd=tmp_path,
+        )
+        for _ in range(4)
+    ]
+    for p in procs:
+        out, err = p.communicate(timeout=120)
+        assert p.returncode == 0, err
+        assert json.loads(out.strip().splitlines()[-1])["ok"], out
+
+    with psycopg.connect(_DSN) as conn:
+        versions = conn.execute(
+            f"SELECT version FROM {_SCHEMA}.schema_version"
+        ).fetchall()
+        assert versions == [(EXPECTED_SCHEMA_VERSION,)], versions
+        locks = conn.execute(
+            f"SELECT * FROM {_SCHEMA}.compression_locks"
+        ).fetchall()
+        assert locks == [], locks
+
+
 def test_two_process_concurrent_smoke(pg_db, tmp_path):
     """Two real OS processes, one database: interleaved session writes on
     distinct sessions plus lock contention on a shared session."""
