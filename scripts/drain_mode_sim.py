@@ -12,8 +12,9 @@ API-server gateway processes (separate HERMES_HOME → separate SQLite state):
   * Process B ("incoming"): keeps accepting and completing new launches
     concurrently throughout A's drain window.
 
-The shared-Postgres session-store variant of this simulation lands with the
-D6b sibling branch; this script deliberately uses per-process SQLite state.
+The shared-Postgres session-store variant of this simulation is
+``scripts/drain_mode_sim_pg.py`` (AE-115 + AE-117 combined evidence); this
+script deliberately uses per-process SQLite state.
 
 Usage:
     .venv/bin/python scripts/drain_mode_sim.py            # orchestrator
