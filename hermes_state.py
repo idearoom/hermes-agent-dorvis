@@ -1023,6 +1023,27 @@ class SessionDB:
     _IMPORT_MAX_SESSION_BYTES = 5 * 1024 * 1024
     _IMPORT_MAX_TOTAL_BYTES = 25 * 1024 * 1024
 
+    def __new__(cls, db_path: Path = None, read_only: bool = False, **kwargs):
+        # (**kwargs lets subclasses such as PgSessionDB add keyword-only
+        # constructor arguments without re-implementing __new__.)
+        # IdeaRoom D6b (AE-115): when HERMES_STATE_STORE_DSN is set, the
+        # shared state store lives in Postgres so two gateway tasks can
+        # coexist during a blue/green drain window (ADR 0177). Dispatch here
+        # — the single construction seam — so every ``SessionDB()`` in the
+        # gateway process (run.py, SessionStore, api_server, mirror, cron,
+        # mcp_serve, ...) resolves to the same backend and split-brain is
+        # impossible. An explicit ``db_path`` always means a specific SQLite
+        # file and is never redirected. With the env var unset this is a
+        # single dict lookup and the SQLite path is unchanged.
+        if cls is SessionDB and db_path is None:
+            import os
+
+            if os.environ.get("HERMES_STATE_STORE_DSN", "").strip():
+                from hermes_state_pg import PgSessionDB
+
+                return object.__new__(PgSessionDB)
+        return object.__new__(cls)
+
     def __init__(self, db_path: Path = None, read_only: bool = False):
         self.db_path = db_path or DEFAULT_DB_PATH
         self.read_only = read_only
