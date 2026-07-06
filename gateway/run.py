@@ -8072,6 +8072,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # engages drain on the first tick.
         self._spawn_supervised(self._drain_control_watcher, "drain_control_watcher")
 
+        # AE-117 drain mode (parent-repo ADR 0177): start the drain
+        # coordinator (refuse-new/finish-in-flight/self-exit-at-zero) and the
+        # ECS task scale-in protection manager. Both are no-ops until a drain
+        # begins / when ECS_AGENT_URI is absent.
+        try:
+            from gateway.drain_mode import start_drain_mode_tasks
+            start_drain_mode_tasks(self)
+        except Exception:  # noqa: BLE001 - drain mode must never block startup
+            logger.warning("drain-mode: startup failed", exc_info=True)
+
         logger.info("Press Ctrl+C to stop")
         
         return True
@@ -22680,6 +22690,24 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
                 planned_stop = consume_planned_stop_marker_for_self()
             except Exception as e:
                 logger.debug("Planned stop marker check failed: %s", e)
+
+        # AE-117 drain-based blue/green (parent-repo ADR 0177): when
+        # HERMES_DRAIN_ON_SIGTERM is enabled (ECS task definitions), an
+        # UNPLANNED SIGTERM begins a drain — refuse new runs, finish
+        # in-flight work, self-exit at zero — instead of the immediate stop
+        # path. Planned stops/takeovers keep their existing semantics, and a
+        # second SIGTERM while draining falls through to immediate shutdown.
+        if (
+            received_signal == signal.SIGTERM
+            and not planned_takeover
+            and not planned_stop
+        ):
+            try:
+                from gateway.drain_mode import sigterm_begins_drain
+                if sigterm_begins_drain():
+                    return
+            except Exception as _e:
+                logger.debug("drain-mode SIGTERM hook failed: %s", _e)
 
         # Fast (<10ms) snapshot of who's asking us to shut down — runs
         # synchronously inside the asyncio signal handler, so we keep it

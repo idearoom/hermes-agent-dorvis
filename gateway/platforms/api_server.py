@@ -1263,6 +1263,18 @@ class APIServerAdapter(BasePlatformAdapter):
         # Shutdown counts this reservation so the request cannot slip through
         # the drain between its first await and _run_agent()/task registration.
         self._pending_agent_requests: int = 0
+        # AE-117 drain mode (parent-repo ADR 0177): register this adapter as
+        # the authoritative API-run source for the process-wide drain
+        # coordinator. Re-registration replaces stale reconnect adapters.
+        from gateway.drain_mode import get_drain_mode
+
+        self._drain_mode = get_drain_mode()
+        self._inflight_run_agents: Dict[int, Any] = {}
+        self._drain_mode.register_source(
+            "api_server",
+            self._drain_active_run_count,
+            self._drain_force_terminate,
+        )
 
     def active_agent_work_count(self) -> int:
         """Return all live agent work owned by this API adapter.
@@ -1285,14 +1297,18 @@ class APIServerAdapter(BasePlatformAdapter):
     def _gateway_is_draining() -> bool:
         """Whether the owning gateway currently refuses new agent turns."""
         try:
+            from gateway.drain_mode import get_drain_mode
             from gateway.run import _gateway_runner_ref
 
             runner = _gateway_runner_ref()
             return bool(
-                runner
-                and (
-                    getattr(runner, "_draining", False)
-                    or getattr(runner, "_external_drain_active", False)
+                get_drain_mode().draining
+                or (
+                    runner
+                    and (
+                        getattr(runner, "_draining", False)
+                        or getattr(runner, "_external_drain_active", False)
+                    )
                 )
             )
         except Exception:
@@ -1736,6 +1752,9 @@ class APIServerAdapter(BasePlatformAdapter):
             ("GET", "/health", self._handle_health),
             ("GET", "/ready", self._handle_ready),
             ("GET", "/health/detailed", self._handle_health_detailed),
+            # AE-117 one-way deploy drain surface (Bearer-authenticated).
+            ("POST", "/admin/drain", self._handle_admin_drain),
+            ("GET", "/admin/drain", self._handle_admin_drain_status),
             ("GET", "/v1/health", self._handle_health),
             ("GET", "/v1/ready", self._handle_ready),
             ("GET", "/v1/models", self._handle_models),
@@ -2228,6 +2247,16 @@ class APIServerAdapter(BasePlatformAdapter):
                 f"HERMES_GATEWAY_OWNER is {owner!r}, not 'main-hermes'",
             )
 
+        # AE-117: a draining gateway is intentionally not ready — deploy
+        # tooling and load balancers must route new work to the incoming
+        # task while this one finishes its in-flight runs.
+        draining = self._gateway_is_draining()
+        add_check(
+            "gateway_not_draining",
+            not draining,
+            "gateway drain mode is engaged (finishing in-flight runs)",
+        )
+
         ready = all(checks.values())
         payload = {
             "status": "ready" if ready else "not_ready",
@@ -2239,6 +2268,10 @@ class APIServerAdapter(BasePlatformAdapter):
             "gateway_state": runtime.get("gateway_state"),
             "api_server_state": api_server_state.get("state"),
             "active_agents": runtime.get("active_agents", 0),
+            # AE-117 drain observability: drain latch + this adapter's
+            # in-flight run count (chat/responses inflight + live /v1/runs).
+            "draining": draining,
+            "active_runs": self._drain_active_run_count(),
             "updated_at": runtime.get("updated_at"),
             "pid": os.getpid(),
             "runtime_pid": runtime_pid,
@@ -4976,6 +5009,116 @@ class APIServerAdapter(BasePlatformAdapter):
             )
         return None
 
+    # ------------------------------------------------------------------
+    # AE-117 drain mode (ADR 0177) — refuse new runs, finish in-flight
+    # ------------------------------------------------------------------
+
+    def _drain_active_run_count(self) -> int:
+        """In-flight agent work owned by this adapter.
+
+        Counts the non-streaming/SSE chat+responses paths
+        (``_inflight_agent_runs``) plus /v1/runs tasks that have not reached
+        a terminal state. Completed-but-unconsumed run streams are NOT
+        active work — established consumers only need the drain settle
+        window to read already-queued terminal events.
+        """
+        return self.active_agent_work_count()
+
+    def _drain_force_terminate(self, reason: str) -> int:
+        """Interrupt every in-flight run so its stream ends cleanly.
+
+        Called by the drain coordinator at the drain cap. Reuses the same
+        interrupt path as POST /v1/runs/{run_id}/stop: ``agent.interrupt``
+        breaks the executor-thread conversation loop, and the existing
+        completion/cancellation handling emits the normal terminal events
+        (``run.cancelled``/``run.failed``/terminal envelope) plus the SSE
+        close sentinel — clients see a definite end, not a hang.
+        """
+        interrupted = 0
+        for run_id, agent in list(self._active_run_agents.items()):
+            try:
+                agent.interrupt(reason)
+                interrupted += 1
+            except Exception:
+                logger.debug(
+                    "[api_server] drain force-terminate: interrupt failed for run %s",
+                    run_id, exc_info=True,
+                )
+        for run_id, task in list(self._active_run_tasks.items()):
+            if not task.done():
+                task.cancel()
+        for key, agent in list(self._inflight_run_agents.items()):
+            try:
+                agent.interrupt(reason)
+                interrupted += 1
+            except Exception:
+                logger.debug(
+                    "[api_server] drain force-terminate: interrupt failed for "
+                    "inflight agent %s", key, exc_info=True,
+                )
+        return interrupted
+
+    def _drain_refusal_response(self) -> Optional["web.Response"]:
+        """503 gateway_draining refusal for new-run launches, else None.
+
+        The contract is programmatically detectable: HTTP 503 with
+        ``{"error": {"code": "gateway_draining", ...}}`` so Hermes web and
+        the agent-platform worker can distinguish drain-refusal from other
+        unavailability and retry against the incoming task. Established
+        streams, run polling/SSE, health/readiness, and read-only endpoints
+        are never gated by this check.
+        """
+        if not self._drain_mode.draining:
+            return None
+        return web.json_response(
+            _openai_error(
+                "Gateway is draining ahead of shutdown and is not accepting "
+                "new runs; retry against a healthy gateway task",
+                err_type="unavailable_error",
+                code="gateway_draining",
+            ),
+            status=503,
+            headers={"Retry-After": "2"},
+        )
+
+    async def _handle_admin_drain(self, request: "web.Request") -> "web.Response":
+        """POST /admin/drain — engage drain mode (one-way; idempotent)."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        raw_reason = (body or {}).get("reason")
+        reason = (
+            _clean_metadata_string(raw_reason, limit=200).strip()
+            if isinstance(raw_reason, str)
+            else ""
+        ) or "admin"
+        already_draining = self._drain_mode.draining
+        if not already_draining:
+            self._drain_mode.begin(f"admin:{reason}")
+        payload = self._drain_mode.snapshot()
+        payload.update({
+            "object": "hermes.gateway.drain",
+            "already_draining": already_draining,
+            "active_runs": self._drain_active_run_count(),
+        })
+        return web.json_response(payload, status=202 if not already_draining else 200)
+
+    async def _handle_admin_drain_status(self, request: "web.Request") -> "web.Response":
+        """GET /admin/drain — report drain state without changing it."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        payload = self._drain_mode.snapshot()
+        payload.update({
+            "object": "hermes.gateway.drain",
+            "active_runs": self._drain_active_run_count(),
+        })
+        return web.json_response(payload)
+
     @staticmethod
     def _bind_api_server_session(
         *,
@@ -5073,6 +5216,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
             with self._profile_scope(request_profile):
                 agent = None
+                agent_key = None
                 tokens = self._bind_api_server_session(
                     chat_id=session_id or "",
                     session_key=gateway_session_key or session_id or "",
@@ -5092,6 +5236,9 @@ class APIServerAdapter(BasePlatformAdapter):
                     )
                     if agent_ref is not None:
                         agent_ref[0] = agent
+                    # Track executor-backed agents for drain-cap interruption.
+                    agent_key = id(agent)
+                    self._inflight_run_agents[agent_key] = agent
                     effective_task_id = session_id or str(uuid.uuid4())
                     result = agent.run_conversation(
                         user_message=user_message,
@@ -5110,6 +5257,8 @@ class APIServerAdapter(BasePlatformAdapter):
                     try:
                         self._shutdown_agent_memory_provider(agent)
                     finally:
+                        if agent_key is not None:
+                            self._inflight_run_agents.pop(agent_key, None)
                         if agent_ref is not None and agent_ref and agent_ref[0] is agent:
                             agent_ref[0] = None
                         clear_session_vars(tokens)
@@ -5196,6 +5345,11 @@ class APIServerAdapter(BasePlatformAdapter):
         gateway_session_key, key_err = self._parse_session_key_header(request)
         if key_err is not None:
             return key_err
+
+        # AE-117: a draining gateway refuses new run launches.
+        draining = self._drain_refusal_response()
+        if draining is not None:
+            return draining
 
         # Enforce concurrency limit (shared across all agent-serving
         # endpoints; configurable via gateway.api_server.max_concurrent_runs).
