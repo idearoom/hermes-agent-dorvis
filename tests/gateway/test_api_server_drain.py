@@ -12,6 +12,11 @@ Covers:
 """
 
 import asyncio
+from contextlib import contextmanager
+import os
+from pathlib import Path
+import subprocess
+import sys
 import threading
 import time
 from unittest.mock import MagicMock, patch
@@ -70,6 +75,94 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_get("/v1/runs/{run_id}/events", adapter._handle_run_events)
     app.router.add_post("/v1/runs/{run_id}/stop", adapter._handle_stop_run)
     return app
+
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _set_local_api_health(adapter: APIServerAdapter, *, connected: bool) -> None:
+    adapter._running = connected
+    adapter._runner = object()
+    adapter._site = object()
+
+
+async def _get_readiness(adapter: APIServerAdapter) -> tuple[int, dict]:
+    app = _create_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.get("/ready")
+        return resp.status, await resp.json()
+
+
+def _write_peer_runtime_status(
+    *, gateway_state: str = "stopped", platform_state: str = "disconnected"
+) -> None:
+    script = (
+        "from gateway.status import write_runtime_status; "
+        f"write_runtime_status(gateway_state={gateway_state!r}, "
+        f"platform='api_server', platform_state={platform_state!r})"
+    )
+    subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=_REPO_ROOT,
+        env=os.environ.copy(),
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
+@contextmanager
+def _owned_runtime_lock():
+    from gateway.status import (
+        acquire_gateway_runtime_lock,
+        release_gateway_runtime_lock,
+    )
+
+    assert acquire_gateway_runtime_lock() is True
+    try:
+        yield
+    finally:
+        release_gateway_runtime_lock()
+
+
+@contextmanager
+def _peer_owned_runtime_lock():
+    from gateway.status import release_gateway_runtime_lock
+
+    release_gateway_runtime_lock()
+    script = """
+from gateway.status import (
+    acquire_gateway_runtime_lock,
+    release_gateway_runtime_lock,
+    write_runtime_status,
+)
+write_runtime_status(
+    gateway_state="running",
+    platform="api_server",
+    platform_state="connected",
+)
+if not acquire_gateway_runtime_lock():
+    raise SystemExit("peer could not acquire runtime lock")
+print("locked", flush=True)
+input()
+release_gateway_runtime_lock()
+"""
+    process = subprocess.Popen(
+        [sys.executable, "-c", script],
+        cwd=_REPO_ROOT,
+        env=os.environ.copy(),
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert process.stdout is not None
+        assert process.stdout.readline().strip() == "locked"
+        yield
+    finally:
+        stdout, stderr = process.communicate("release\n", timeout=5)
+        assert process.returncode == 0, (stdout, stderr)
 
 
 def _make_slow_agent():
@@ -339,6 +432,74 @@ class TestDrainForceTerminate:
 
 
 class TestDrainReadiness:
+    @pytest.mark.asyncio
+    async def test_static_owner_stays_ready_when_shared_status_belongs_to_other_task(
+        self, auth_adapter, monkeypatch
+    ):
+        """A blue/green peer's EFS status must not evict this healthy task."""
+        monkeypatch.setenv("HERMES_RUN_GATEWAY", "1")
+        monkeypatch.setenv("HERMES_GATEWAY_OWNER", "main-hermes")
+        _set_local_api_health(auth_adapter, connected=True)
+        _write_peer_runtime_status()
+
+        with _owned_runtime_lock():
+            status, data = await _get_readiness(auth_adapter)
+
+        assert status == 200
+        assert data["status"] == "ready"
+        assert data["checks"]["runtime_status_current_pid"] is False
+        assert data["checks"]["gateway_state_running"] is False
+        assert data["checks"]["api_server_platform_connected"] is False
+        assert data["checks"]["api_server_local_connected"] is True
+        assert data["advisories"]
+
+    @pytest.mark.asyncio
+    async def test_generic_gateway_keeps_strict_runtime_status_check(
+        self, auth_adapter, monkeypatch
+    ):
+        monkeypatch.delenv("HERMES_RUN_GATEWAY", raising=False)
+        monkeypatch.delenv("HERMES_GATEWAY_OWNER", raising=False)
+        _set_local_api_health(auth_adapter, connected=True)
+        _write_peer_runtime_status()
+
+        with _owned_runtime_lock():
+            status, data = await _get_readiness(auth_adapter)
+
+        assert status == 503
+        assert data["status"] == "not_ready"
+        assert any("runtime status belongs to pid" in reason for reason in data["reasons"])
+
+    @pytest.mark.asyncio
+    async def test_static_owner_still_requires_local_api_connection(
+        self, auth_adapter, monkeypatch
+    ):
+        monkeypatch.setenv("HERMES_RUN_GATEWAY", "1")
+        monkeypatch.setenv("HERMES_GATEWAY_OWNER", "main-hermes")
+        _set_local_api_health(auth_adapter, connected=False)
+        _write_peer_runtime_status()
+
+        with _owned_runtime_lock():
+            status, data = await _get_readiness(auth_adapter)
+
+        assert status == 503
+        assert data["checks"]["api_server_local_connected"] is False
+        assert "local api server adapter is not connected" in data["reasons"]
+
+    @pytest.mark.asyncio
+    async def test_static_owner_requires_its_own_runtime_lock(
+        self, auth_adapter, monkeypatch
+    ):
+        monkeypatch.setenv("HERMES_RUN_GATEWAY", "1")
+        monkeypatch.setenv("HERMES_GATEWAY_OWNER", "main-hermes")
+        _set_local_api_health(auth_adapter, connected=True)
+
+        with _peer_owned_runtime_lock():
+            status, data = await _get_readiness(auth_adapter)
+
+        assert status == 503
+        assert data["checks"]["runtime_lock_owned_by_current_process"] is False
+        assert "gateway runtime lock is owned by another process" in data["reasons"]
+
     def test_payload_reports_not_draining_by_default(self, adapter):
         payload, _status = adapter._readiness_payload()
         assert payload["draining"] is False

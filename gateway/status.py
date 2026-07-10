@@ -893,6 +893,11 @@ def is_gateway_runtime_lock_active(lock_path: Optional[Path] = None) -> bool:
             pass
 
 
+def is_gateway_runtime_lock_owned_by_current_process() -> bool:
+    """Return True only when this process owns the gateway runtime lock."""
+    return _gateway_lock_handle is not None
+
+
 def write_pid_file() -> None:
     """Write the current process PID and metadata to the gateway PID file.
 

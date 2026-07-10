@@ -2186,6 +2186,7 @@ class APIServerAdapter(BasePlatformAdapter):
         from gateway.status import (
             get_source_revision,
             is_gateway_runtime_lock_active,
+            is_gateway_runtime_lock_owned_by_current_process,
             read_runtime_status,
         )
 
@@ -2200,27 +2201,52 @@ class APIServerAdapter(BasePlatformAdapter):
 
         checks: Dict[str, bool] = {}
         reasons: List[str] = []
+        advisories: List[str] = []
 
-        def add_check(name: str, ok: bool, reason: str) -> None:
+        run_gateway = os.getenv("HERMES_RUN_GATEWAY", "").strip().lower()
+        gateway_owner = os.getenv("HERMES_GATEWAY_OWNER", "").strip()
+        static_gateway_owner = (
+            run_gateway in _TRUE_REQUEST_BOOL_STRINGS
+            and gateway_owner == "main-hermes"
+        )
+
+        def add_check(
+            name: str, ok: bool, reason: str, *, required: bool = True
+        ) -> None:
             checks[name] = bool(ok)
             if not ok:
-                reasons.append(reason)
+                (reasons if required else advisories).append(reason)
 
         runtime_pid = runtime.get("pid")
+        # gateway_state.json lives under HERMES_HOME. IdeaRoom's static
+        # main-hermes service deliberately shares that EFS-backed home across
+        # overlapping blue/green tasks, so the peer task can legitimately be
+        # the most recent writer. Keep the persisted lifecycle fields visible
+        # for diagnosis, but do not let a peer's PID/stopped state evict this
+        # locally healthy task. Generic Hermes gateways retain the strict
+        # single-process status contract.
         add_check(
             "runtime_status_current_pid",
             runtime_pid == os.getpid(),
             f"runtime status belongs to pid {runtime_pid!r}, current pid is {os.getpid()}",
+            required=not static_gateway_owner,
         )
         add_check(
             "gateway_state_running",
             runtime.get("gateway_state") == "running",
             f"gateway_state is {runtime.get('gateway_state')!r}, not 'running'",
+            required=not static_gateway_owner,
         )
         add_check(
             "api_server_platform_connected",
             self.is_connected and api_server_state.get("state") == "connected",
             f"api_server platform state is {api_server_state.get('state')!r}, not 'connected'",
+            required=not static_gateway_owner,
+        )
+        add_check(
+            "api_server_local_connected",
+            self.is_connected,
+            "local api server adapter is not connected",
         )
         add_check(
             "http_server_bound",
@@ -2237,14 +2263,18 @@ class APIServerAdapter(BasePlatformAdapter):
             is_gateway_runtime_lock_active(),
             "gateway runtime lock is not held",
         )
+        if static_gateway_owner:
+            add_check(
+                "runtime_lock_owned_by_current_process",
+                is_gateway_runtime_lock_owned_by_current_process(),
+                "gateway runtime lock is owned by another process",
+            )
 
-        run_gateway = os.getenv("HERMES_RUN_GATEWAY", "").strip().lower()
         if run_gateway in _TRUE_REQUEST_BOOL_STRINGS:
-            owner = os.getenv("HERMES_GATEWAY_OWNER", "").strip()
             add_check(
                 "intended_gateway_owner",
-                owner == "main-hermes",
-                f"HERMES_GATEWAY_OWNER is {owner!r}, not 'main-hermes'",
+                gateway_owner == "main-hermes",
+                f"HERMES_GATEWAY_OWNER is {gateway_owner!r}, not 'main-hermes'",
             )
 
         # AE-117: a draining gateway is intentionally not ready — deploy
@@ -2257,7 +2287,7 @@ class APIServerAdapter(BasePlatformAdapter):
             "gateway drain mode is engaged (finishing in-flight runs)",
         )
 
-        ready = all(checks.values())
+        ready = not reasons
         payload = {
             "status": "ready" if ready else "not_ready",
             "platform": "hermes-agent",
@@ -2265,6 +2295,7 @@ class APIServerAdapter(BasePlatformAdapter):
             "source_revision": get_source_revision(),
             "checks": checks,
             "reasons": reasons,
+            "advisories": advisories,
             "gateway_state": runtime.get("gateway_state"),
             "api_server_state": api_server_state.get("state"),
             "active_agents": runtime.get("active_agents", 0),
@@ -2275,7 +2306,7 @@ class APIServerAdapter(BasePlatformAdapter):
             "updated_at": runtime.get("updated_at"),
             "pid": os.getpid(),
             "runtime_pid": runtime_pid,
-            "gateway_owner": os.getenv("HERMES_GATEWAY_OWNER", "").strip() or None,
+            "gateway_owner": gateway_owner or None,
         }
         return payload, 200 if ready else 503
 
