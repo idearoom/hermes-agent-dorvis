@@ -129,12 +129,13 @@ def test_pg_construction_refuses_to_boot_on_drift(monkeypatch):
         PgSessionDB(dsn="postgresql://invalid.invalid/nope")
 
 
-def test_persisted_marker_upgrades_from_last_audited_schema_surface():
-    """The known additive upstream DDL change upgrades in place.
+def test_persisted_marker_retains_last_audited_schema_surface_for_rollback():
+    """The known additive upstream DDL change keeps the rollback marker.
 
-    Unknown hashes still fail closed; this one transition is safe because the
-    new Postgres DDL is applied before marker verification while bootstrap is
-    serialized behind the existing advisory lock.
+    The new Postgres DDL is applied before marker verification, but the prior
+    runtime rejects the new surface hash. Retaining the old marker keeps a
+    one-release rollback bootable while this runtime accepts both audited
+    surfaces. Unknown hashes still fail closed.
     """
 
     previous_hash = (
@@ -163,11 +164,45 @@ def test_persisted_marker_upgrades_from_last_audited_schema_surface():
     conn = _Conn()
     PgSessionDB._assert_persisted_schema_markers(object(), conn)
 
-    assert any(
+    assert not any(
         sql.startswith("UPDATE hermes_state.state_meta SET value")
+        for sql, _params in conn.executed
+    )
+
+
+def test_fresh_store_persists_rollback_compatible_schema_surface():
+    """A database first created by this build remains bootable by the prior one."""
+
+    previous_hash = (
+        "df28fdc5fd8be0e48373abed404a6cd33ccf88f2fa11962ac29d53d75ced15a0"
+    )
+
+    class _Result:
+        def __init__(self, row):
+            self._row = row
+
+        def fetchone(self):
+            return self._row
+
+    class _Conn:
+        def __init__(self):
+            self.executed = []
+
+        def execute(self, sql, params=None):
+            self.executed.append((sql, params))
+            if "SELECT version" in sql:
+                return _Result((EXPECTED_SCHEMA_VERSION,))
+            if "SELECT value" in sql:
+                return _Result(None)
+            return _Result(None)
+
+    conn = _Conn()
+    PgSessionDB._assert_persisted_schema_markers(object(), conn)
+
+    assert any(
+        sql.startswith("INSERT INTO hermes_state.state_meta")
         and params
         == (
-            EXPECTED_SCHEMA_SURFACE_SHA256,
             "pg_backend_schema_surface_sha256",
             previous_hash,
         )

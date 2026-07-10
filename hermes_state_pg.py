@@ -70,13 +70,22 @@ EXPECTED_SCHEMA_SURFACE_SHA256 = (
     "c330e63b92990f7d5528e2f2faf980d147f125ca491833e65bf7834e81fbfbdc"
 )
 
-# Explicitly audited, additive predecessor surfaces that may be upgraded in
-# place after PG_SCHEMA_SQL has applied the new IF NOT EXISTS DDL. Keep this
-# allowlist narrow: every other unknown marker still fails closed.
+# Keep the persisted marker on the previous audited surface for one release.
+# The prior runtime rejects EXPECTED_SCHEMA_SURFACE_SHA256, so advancing the
+# shared marker here would make rollback fail even though this upstream change
+# is only an additive, empty-on-Postgres partial index.
+_ROLLBACK_COMPATIBLE_SCHEMA_SURFACE_SHA256 = (
+    "df28fdc5fd8be0e48373abed404a6cd33ccf88f2fa11962ac29d53d75ced15a0"
+)
+
+# Explicitly audited, additive predecessor surfaces that may be accepted after
+# PG_SCHEMA_SQL has applied the new IF NOT EXISTS DDL. Retain the
+# predecessor marker during the rollback window; every other unknown marker
+# still fails closed.
 _COMPATIBLE_PREVIOUS_SCHEMA_SURFACE_SHA256 = frozenset(
     {
         # Upstream 2ebf9a90: before the legacy-SQLite active=NULL repair index.
-        "df28fdc5fd8be0e48373abed404a6cd33ccf88f2fa11962ac29d53d75ced15a0",
+        _ROLLBACK_COMPATIBLE_SCHEMA_SURFACE_SHA256,
     }
 )
 
@@ -780,26 +789,21 @@ class PgSessionDB(SessionDB):
             conn.execute(
                 f"INSERT INTO {_SCHEMA}.state_meta (key, value) VALUES (%s, %s) "
                 "ON CONFLICT (key) DO NOTHING",
-                (_META_SURFACE_KEY, EXPECTED_SCHEMA_SURFACE_SHA256),
+                (
+                    _META_SURFACE_KEY,
+                    _ROLLBACK_COMPATIBLE_SCHEMA_SURFACE_SHA256,
+                ),
             )
         elif row[0] != EXPECTED_SCHEMA_SURFACE_SHA256:
             if row[0] in _COMPATIBLE_PREVIOUS_SCHEMA_SURFACE_SHA256:
                 # _init_pg_schema applies all additive DDL before reaching
                 # this marker check, and the enclosing advisory lock
-                # serializes blue/green bootstraps. Advance only this
-                # explicitly audited predecessor after the expansion lands.
-                conn.execute(
-                    f"UPDATE {_SCHEMA}.state_meta SET value = %s "
-                    "WHERE key = %s AND value = %s",
-                    (
-                        EXPECTED_SCHEMA_SURFACE_SHA256,
-                        _META_SURFACE_KEY,
-                        row[0],
-                    ),
-                )
+                # serializes blue/green bootstraps. Keep this explicitly
+                # audited predecessor persisted so the prior runtime can boot
+                # after a rollback; the new additive index is still present.
                 logger.info(
-                    "upgraded Postgres session-store schema surface marker "
-                    "from %s to %s",
+                    "retaining rollback-compatible Postgres session-store "
+                    "schema surface marker %s while build expects %s",
                     row[0],
                     EXPECTED_SCHEMA_SURFACE_SHA256,
                 )

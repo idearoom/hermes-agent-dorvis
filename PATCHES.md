@@ -35,9 +35,10 @@ notable resolutions:
 - **Postgres session store** — upstream added the
   `idx_messages_active_null` legacy-SQLite repair index without bumping schema
   v19. Postgres already enforces `messages.active NOT NULL DEFAULT 1`; the
-  adapter mirrors the partial index, advances only the explicitly audited
-  prior schema-surface marker after additive DDL lands under the bootstrap
-  advisory lock, and continues to reject every unknown marker.
+  adapter mirrors the partial index and accepts both audited surfaces after
+  additive DDL lands under the bootstrap advisory lock. It deliberately keeps
+  the prior marker persisted for the one-release rollback window and continues
+  to reject every unknown marker.
 - Hook-surface audit: the only matching upstream signature change was the
   `pre_tool_call` approval generalization above; no Dorvis lifecycle-hook call
   sites were removed.
