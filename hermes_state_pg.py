@@ -67,7 +67,17 @@ _SCHEMA = "hermes_state"
 # migration per ADR 0177's coexistence rule), then updates these constants.
 EXPECTED_SCHEMA_VERSION = 19
 EXPECTED_SCHEMA_SURFACE_SHA256 = (
-    "df28fdc5fd8be0e48373abed404a6cd33ccf88f2fa11962ac29d53d75ced15a0"
+    "c330e63b92990f7d5528e2f2faf980d147f125ca491833e65bf7834e81fbfbdc"
+)
+
+# Explicitly audited, additive predecessor surfaces that may be upgraded in
+# place after PG_SCHEMA_SQL has applied the new IF NOT EXISTS DDL. Keep this
+# allowlist narrow: every other unknown marker still fails closed.
+_COMPATIBLE_PREVIOUS_SCHEMA_SURFACE_SHA256 = frozenset(
+    {
+        # Upstream 2ebf9a90: before the legacy-SQLite active=NULL repair index.
+        "df28fdc5fd8be0e48373abed404a6cd33ccf88f2fa11962ac29d53d75ced15a0",
+    }
 )
 
 # state_meta keys used by the Pg backend's persisted markers.
@@ -260,6 +270,11 @@ PG_SCHEMA_SQL: List[str] = [
     f"CREATE INDEX IF NOT EXISTS idx_compression_locks_expires ON {_SCHEMA}.compression_locks(expires_at)",
     f"CREATE INDEX IF NOT EXISTS idx_messages_session_active "
     f"ON {_SCHEMA}.messages(session_id, active, timestamp)",
+    # Mirrors upstream's legacy-SQLite repair index. Postgres declares active
+    # NOT NULL, so this remains empty; retaining it keeps the audited schema
+    # surface aligned without requiring a data migration.
+    f"CREATE INDEX IF NOT EXISTS idx_messages_active_null "
+    f"ON {_SCHEMA}.messages(active) WHERE active IS NULL",
     f"CREATE INDEX IF NOT EXISTS idx_sessions_session_key "
     f"ON {_SCHEMA}.sessions(session_key, started_at DESC)",
     f"CREATE INDEX IF NOT EXISTS idx_sessions_gateway_peer "
@@ -768,12 +783,33 @@ class PgSessionDB(SessionDB):
                 (_META_SURFACE_KEY, EXPECTED_SCHEMA_SURFACE_SHA256),
             )
         elif row[0] != EXPECTED_SCHEMA_SURFACE_SHA256:
-            raise RuntimeError(
-                "Postgres session store was initialized against a different "
-                f"upstream schema surface (db={row[0]}, "
-                f"build={EXPECTED_SCHEMA_SURFACE_SHA256}). Rebase drift — "
-                "re-audit hermes_state_pg.py and migrate deliberately."
-            )
+            if row[0] in _COMPATIBLE_PREVIOUS_SCHEMA_SURFACE_SHA256:
+                # _init_pg_schema applies all additive DDL before reaching
+                # this marker check, and the enclosing advisory lock
+                # serializes blue/green bootstraps. Advance only this
+                # explicitly audited predecessor after the expansion lands.
+                conn.execute(
+                    f"UPDATE {_SCHEMA}.state_meta SET value = %s "
+                    "WHERE key = %s AND value = %s",
+                    (
+                        EXPECTED_SCHEMA_SURFACE_SHA256,
+                        _META_SURFACE_KEY,
+                        row[0],
+                    ),
+                )
+                logger.info(
+                    "upgraded Postgres session-store schema surface marker "
+                    "from %s to %s",
+                    row[0],
+                    EXPECTED_SCHEMA_SURFACE_SHA256,
+                )
+            else:
+                raise RuntimeError(
+                    "Postgres session store was initialized against a different "
+                    f"upstream schema surface (db={row[0]}, "
+                    f"build={EXPECTED_SCHEMA_SURFACE_SHA256}). Rebase drift — "
+                    "re-audit hermes_state_pg.py and migrate deliberately."
+                )
 
     def _init_schema(self) -> None:  # pragma: no cover - safety net
         self._init_pg_schema()

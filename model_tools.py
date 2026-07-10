@@ -1270,11 +1270,16 @@ def handle_function_call(
                 # the parent's tool set via the process-global.
                 sandbox_enabled = enabled_tools if enabled_tools is not None else _last_resolved_tool_names
                 def _dispatch(next_args: Dict[str, Any]) -> Any:
+                    dispatch_kwargs = {
+                        "task_id": task_id,
+                        "turn_id": turn_id,
+                        "enabled_tools": sandbox_enabled,
+                    }
+                    if session_id is not None:
+                        dispatch_kwargs["session_id"] = session_id
                     return registry.dispatch(
                         function_name, next_args,
-                        task_id=task_id,
-                        turn_id=turn_id,
-                        enabled_tools=sandbox_enabled,
+                        **dispatch_kwargs,
                     )
             else:
                 def _dispatch(next_args: Dict[str, Any]) -> Any:

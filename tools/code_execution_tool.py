@@ -1435,7 +1435,9 @@ def execute_code(
         clear_current_thread_interrupt()
 
     if env_type != "local":
-        return _execute_remote(code, task_id, enabled_tools, turn_id=turn_id)
+        if turn_id is not None:
+            return _execute_remote(code, task_id, enabled_tools, turn_id=turn_id)
+        return _execute_remote(code, task_id, enabled_tools)
 
     # --- Local execution path (UDS) --- below this line is unchanged ---
 

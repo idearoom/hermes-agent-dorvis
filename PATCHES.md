@@ -4,8 +4,43 @@ This fork carries IdeaRoom-specific runtime patches on top of NousResearch
 `hermes-agent` upstream. Keep this file current whenever a patch is added,
 removed, rebased, or promoted.
 
-Current upstream base for the carried branch: `2ebf9a90b762f21e33318b342e921b17e3d81946`
-(merged into fork `main` as `37bc3ce4a`; previous base `388268ecde085a22c15474fea1723db161a930da`).
+Current upstream base for the carried branch: `a7f65e3bcd937cd095ba599ab5927af2093a0d95`
+(merged into fork `main` as `0f9225f34`; previous base
+`2ebf9a90b762f21e33318b342e921b17e3d81946`).
+
+### 2026-07-09 rebase notes (2ebf9a90 → a7f65e3bc)
+
+All carried patches survived; none were absorbed or dropped. Conflicted and
+notable resolutions:
+
+- **GPT-5.6 model family** — upstream's Sol/Terra/Luna registration, Codex
+  OAuth discovery, native picker ordering, usage pricing, 272K Codex-route
+  context metadata, and compaction-threshold coverage were accepted intact.
+- **Request metadata and hook directives** — upstream generalized
+  `pre_tool_call` from block-only results to block-or-approval directives.
+  Dorvis `request_metadata` propagation now flows through that generalized
+  helper and every backward-compatible wrapper, preserving upstream's
+  fail-closed approval gate and the observability contract.
+- **Stateful compression quality gate** — upstream added Codex app-server
+  compaction modes and generalized the 85% Codex compaction autoraise through
+  GPT-5.6. Both remain active alongside the Dorvis quality gate and its cache-
+  busting config keys. Upstream's in-place hygiene-compaction fixes were kept.
+- **MCP Hermes context keying** — upstream added per-server call lifecycle
+  tracking plus stdio recycle/watchdog hardening. `_mark_server_call_started`
+  and the opt-in `_meta.hermes.task_id` construction now both execute on the
+  same call path.
+- **Execute-code request context** — the carried per-turn budget now forwards
+  upstream's `session_id` contract alongside `turn_id`, while omitting absent
+  optional context so legacy remote-dispatch shims remain compatible.
+- **Postgres session store** — upstream added the
+  `idx_messages_active_null` legacy-SQLite repair index without bumping schema
+  v19. Postgres already enforces `messages.active NOT NULL DEFAULT 1`; the
+  adapter mirrors the partial index, advances only the explicitly audited
+  prior schema-surface marker after additive DDL lands under the bootstrap
+  advisory lock, and continues to reject every unknown marker.
+- Hook-surface audit: the only matching upstream signature change was the
+  `pre_tool_call` approval generalization above; no Dorvis lifecycle-hook call
+  sites were removed.
 
 ### 2026-07-06 rebase notes (388268ec → 2ebf9a90)
 
