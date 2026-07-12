@@ -1,5 +1,5 @@
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -842,7 +842,44 @@ def test_run_reference_captures_usage_and_cost(monkeypatch):
     assert acct.usage.input_tokens == 600
     assert acct.usage.cache_read_tokens == 400
     assert acct.usage.output_tokens == 200
+    assert acct.usage.request_count == 1
+    assert acct.usage_complete is True
+    assert acct.usage_warnings == ()
     assert acct.cost_usd == 0.0123
+
+
+@pytest.mark.parametrize(
+    ("runtime"),
+    [
+        {"provider": "anthropic", "model": "claude", "api_mode": "anthropic_messages"},
+        {"provider": "openai-codex", "model": "gpt", "api_mode": "codex_responses"},
+    ],
+)
+def test_reference_normalizes_auxiliary_adapter_usage_shape(monkeypatch, runtime):
+    """Auxiliary adapters return OpenAI-chat usage even when the underlying
+    provider speaks native Anthropic or Responses."""
+    from agent.moa_loop import _run_reference
+
+    monkeypatch.setattr(
+        "agent.moa_loop.call_llm",
+        lambda **_kwargs: _response_with_usage(
+            prompt=100,
+            completion=10,
+            cached=20,
+        ),
+    )
+    monkeypatch.setattr("agent.moa_loop._slot_runtime", lambda _slot: runtime)
+
+    _label, _text, acct = _run_reference(
+        {"provider": runtime["provider"], "model": runtime["model"]},
+        [{"role": "user", "content": "state?"}],
+    )
+
+    assert acct.usage.input_tokens == 80
+    assert acct.usage.cache_read_tokens == 20
+    assert acct.usage.output_tokens == 10
+    assert acct.usage.total_tokens == 110
+    assert acct.usage_complete is True
 
 
 def test_references_parallel_sum_and_consume(monkeypatch, tmp_path):
@@ -893,24 +930,238 @@ moa:
     facade = MoAChatCompletions("review")
     facade.create(messages=[{"role": "user", "content": "turn one"}], tools=[])
 
-    usage, cost = facade.consume_reference_usage()
+    usage, cost, warnings = facade.consume_reference_usage()
     # Two advisors × (1000 input, 100 output) = 2000 input, 200 output.
     assert usage.input_tokens == 2000
     assert usage.output_tokens == 200
+    assert usage.request_count == 2
     # Two advisors × $0.01 each = $0.02.
     assert cost == pytest.approx(0.02)
+    assert warnings == ()
 
     # consume clears — a second consume with no new create() is zeroed.
-    usage2, cost2 = facade.consume_reference_usage()
+    usage2, cost2, warnings2 = facade.consume_reference_usage()
     assert usage2.input_tokens == 0
     assert cost2 is None
+    assert warnings2 == ()
 
     # A repeat create() with the SAME advisory view is a cache HIT: advisors
     # do not re-run, so pending advisor spend is zero (no double-charge).
     facade.create(messages=[{"role": "user", "content": "turn one"}], tools=[])
-    usage3, cost3 = facade.consume_reference_usage()
+    usage3, cost3, warnings3 = facade.consume_reference_usage()
     assert usage3.input_tokens == 0
     assert cost3 is None
+    assert warnings3 == ()
+
+
+def test_aggregator_retry_cache_hit_preserves_unconsumed_reference_accounting(
+    monkeypatch,
+    tmp_path,
+):
+    """Advisor usage/cost/warnings/trace survive an aggregator retry and are
+    consumed exactly once after the eventual acting response."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    (home / "config.yaml").write_text(
+        """
+moa:
+  default_preset: review
+  presets:
+    review:
+      reference_models:
+        - provider: openrouter
+          model: advisor
+      aggregator:
+        provider: openrouter
+        model: aggregator
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    from agent.runtime_usage import track_auxiliary_dispatch
+
+    aggregator_attempts = {"count": 0}
+    reference_calls = {"count": 0}
+
+    def fake_call_llm(**kwargs):
+        if kwargs["task"] == "moa_reference":
+            reference_calls["count"] += 1
+            try:
+                track_auxiliary_dispatch(
+                    lambda: (_ for _ in ()).throw(TimeoutError("advisor timeout")),
+                    task="moa_reference",
+                )
+            except TimeoutError:
+                pass
+            return track_auxiliary_dispatch(
+                lambda: _response_with_usage(prompt=20, completion=4),
+                task="moa_reference",
+            )
+        aggregator_attempts["count"] += 1
+        if aggregator_attempts["count"] == 1:
+            raise TimeoutError("aggregator timeout")
+        return _response("aggregator recovered")
+
+    monkeypatch.setattr("agent.moa_loop.call_llm", fake_call_llm)
+    monkeypatch.setattr(
+        "agent.moa_loop._slot_runtime",
+        lambda slot: {"provider": "openrouter", "model": slot.get("model")},
+    )
+    monkeypatch.setattr(
+        "agent.usage_pricing.estimate_usage_cost",
+        lambda *a, **k: SimpleNamespace(
+            amount_usd=0.01,
+            status="estimated",
+            source="table",
+        ),
+    )
+
+    from agent.moa_loop import MoAChatCompletions
+
+    facade = MoAChatCompletions("review")
+    request = {"messages": [{"role": "user", "content": "turn one"}], "tools": []}
+    with pytest.raises(TimeoutError, match="aggregator timeout"):
+        facade.create(**request)
+    facade.create(**request)
+
+    usage, cost, warnings = facade.consume_reference_usage()
+    assert reference_calls["count"] == 1
+    assert aggregator_attempts["count"] == 2
+    assert usage.input_tokens == 20
+    assert usage.output_tokens == 4
+    assert cost == pytest.approx(0.01)
+    assert warnings == ("dispatched_attempt_usage_unavailable",)
+
+    with patch("agent.moa_trace.save_moa_turn") as save_trace:
+        facade.consume_and_save_trace("session-1")
+        facade.consume_and_save_trace("session-1")
+    save_trace.assert_called_once()
+
+    usage2, cost2, warnings2 = facade.consume_reference_usage()
+    assert usage2.total_tokens == 0
+    assert cost2 is None
+    assert warnings2 == ()
+
+
+def test_reference_hidden_dispatch_failure_survives_later_success(monkeypatch):
+    from agent.moa_loop import _run_reference
+    from agent.runtime_usage import track_auxiliary_dispatch
+
+    response = _response_with_usage(prompt=20, completion=4)
+
+    def fake_call_llm(**_kwargs):
+        try:
+            track_auxiliary_dispatch(
+                lambda: (_ for _ in ()).throw(TimeoutError("timeout")),
+                task="moa_reference",
+            )
+        except TimeoutError:
+            pass
+        return track_auxiliary_dispatch(
+            lambda: response,
+            task="moa_reference",
+        )
+
+    monkeypatch.setattr("agent.moa_loop.call_llm", fake_call_llm)
+    monkeypatch.setattr(
+        "agent.moa_loop._slot_runtime",
+        lambda slot: {"provider": "openrouter", "model": slot.get("model")},
+    )
+
+    _label, _text, acct = _run_reference(
+        {"provider": "openrouter", "model": "advisor"},
+        [{"role": "user", "content": "state?"}],
+    )
+
+    assert acct.usage.input_tokens == 20
+    assert acct.usage.output_tokens == 4
+    assert acct.usage_complete is False
+    assert acct.usage_warnings == ("dispatched_attempt_usage_unavailable",)
+
+
+def test_reference_counts_distinct_invalid_response_before_success(monkeypatch):
+    from agent.moa_loop import _run_reference
+    from agent.runtime_usage import track_auxiliary_dispatch
+
+    invalid = _response_with_usage(
+        content="invalid-shape-but-billable",
+        prompt=5,
+        completion=1,
+    )
+    invalid.choices = []
+    valid = _response_with_usage(prompt=20, completion=4)
+
+    def fake_call_llm(**_kwargs):
+        track_auxiliary_dispatch(lambda: invalid, task="moa_reference")
+        track_auxiliary_dispatch(lambda: valid, task="moa_reference")
+        return valid
+
+    monkeypatch.setattr("agent.moa_loop.call_llm", fake_call_llm)
+    monkeypatch.setattr(
+        "agent.moa_loop._slot_runtime",
+        lambda slot: {"provider": "openrouter", "model": slot.get("model")},
+    )
+
+    _label, _text, acct = _run_reference(
+        {"provider": "openrouter", "model": "advisor"},
+        [{"role": "user", "content": "state?"}],
+    )
+
+    assert acct.usage.input_tokens == 25
+    assert acct.usage.output_tokens == 5
+    assert acct.usage_complete is True
+    assert acct.usage_warnings == ()
+
+
+def test_reference_missing_usage_is_explicitly_incomplete(monkeypatch):
+    from agent.moa_loop import _run_reference
+
+    monkeypatch.setattr(
+        "agent.moa_loop.call_llm",
+        lambda **_kwargs: _response("advice-without-usage"),
+    )
+    monkeypatch.setattr(
+        "agent.moa_loop._slot_runtime",
+        lambda slot: {"provider": "openrouter", "model": slot.get("model")},
+    )
+
+    _label, _text, acct = _run_reference(
+        {"provider": "openrouter", "model": "advisor"},
+        [{"role": "user", "content": "state?"}],
+    )
+
+    assert acct.usage_complete is False
+    assert acct.usage_warnings == ("provider_response_missing_usage",)
+
+
+def test_reference_mapping_response_usage_is_counted(monkeypatch):
+    from agent.moa_loop import _run_reference
+
+    monkeypatch.setattr(
+        "agent.moa_loop.call_llm",
+        lambda **_kwargs: {
+            "usage": {
+                "prompt_tokens": 12,
+                "completion_tokens": 3,
+                "total_tokens": 15,
+            }
+        },
+    )
+    monkeypatch.setattr("agent.moa_loop._extract_text", lambda _response: "advice")
+    monkeypatch.setattr(
+        "agent.moa_loop._slot_runtime",
+        lambda slot: {"provider": "openrouter", "model": slot.get("model")},
+    )
+
+    _label, _text, acct = _run_reference(
+        {"provider": "openrouter", "model": "advisor"},
+        [{"role": "user", "content": "state?"}],
+    )
+
+    assert acct.usage.input_tokens == 12
+    assert acct.usage.output_tokens == 3
+    assert acct.usage_complete is True
 
 
 def test_canonical_usage_add():

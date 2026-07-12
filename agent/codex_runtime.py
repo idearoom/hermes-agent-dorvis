@@ -70,6 +70,11 @@ def _record_codex_app_server_usage(agent, turn) -> dict[str, Any]:
             # Consume the marker so a later unrelated reading is not charged to
             # it and preflight deferral cannot stay latched indefinitely.
             compressor.update_from_response({})
+        from agent.runtime_usage import mark_primary_usage_missing
+        mark_primary_usage_missing(
+            agent,
+            reason="codex_turn_missing_usage",
+        )
         if agent._session_db and agent.session_id:
             try:
                 if not agent._session_db_created:
@@ -90,12 +95,13 @@ def _record_codex_app_server_usage(agent, turn) -> dict[str, Any]:
         return {}
 
     from agent.usage_pricing import CanonicalUsage, estimate_usage_cost
+    from agent.runtime_usage import validate_primary_usage_components
+    validate_primary_usage_components(agent, usage)
 
     input_tokens = _coerce_usage_int(usage.get("inputTokens"))
     cache_read_tokens = _coerce_usage_int(usage.get("cachedInputTokens"))
     output_tokens = _coerce_usage_int(usage.get("outputTokens"))
     reasoning_tokens = _coerce_usage_int(usage.get("reasoningOutputTokens"))
-    reported_total = _coerce_usage_int(usage.get("totalTokens"))
 
     canonical_usage = CanonicalUsage(
         input_tokens=input_tokens,
@@ -107,7 +113,10 @@ def _record_codex_app_server_usage(agent, turn) -> dict[str, Any]:
     )
     prompt_tokens = canonical_usage.prompt_tokens
     completion_tokens = canonical_usage.output_tokens
-    total_tokens = reported_total or canonical_usage.total_tokens
+    # Keep the exported parent bucket reconciling. A mismatched provider total
+    # is already recorded as a completeness warning above; exact input/cache/
+    # output components remain the strongest attributable count.
+    total_tokens = canonical_usage.total_tokens
     usage_dict = {
         "prompt_tokens": prompt_tokens,
         "completion_tokens": completion_tokens,
@@ -694,6 +703,12 @@ def run_codex_app_server_turn(
     try:
         turn = agent._codex_session.run_turn(user_input=user_message)
     except Exception as exc:
+        from agent.runtime_usage import mark_primary_dispatch_uncertain
+
+        mark_primary_dispatch_uncertain(
+            agent,
+            reason="codex_app_server_turn_dispatched_usage_unavailable",
+        )
         logger.exception("codex app-server turn failed")
         # Crash → unconditionally drop the session so the next turn
         # respawns from scratch instead of reusing a dead client.
@@ -1223,6 +1238,12 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                     attempt + 1, max_stream_retries + 1,
                     agent._client_log_context(), exc,
                 )
+                from agent.runtime_usage import mark_primary_dispatch_uncertain
+
+                mark_primary_dispatch_uncertain(
+                    agent,
+                    reason="codex_stream_attempt_abandoned_without_terminal_usage",
+                )
                 continue
             raise
 
@@ -1278,6 +1299,12 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                         "(attempt %s/%s); retrying. %s error=%s",
                         attempt + 1, max_stream_retries + 1,
                         agent._client_log_context(), exc,
+                    )
+                    from agent.runtime_usage import mark_primary_dispatch_uncertain
+
+                    mark_primary_dispatch_uncertain(
+                        agent,
+                        reason="codex_stream_attempt_abandoned_without_terminal_usage",
                     )
                     continue
                 raise

@@ -1603,6 +1603,13 @@ class TestSilentRetryMidToolCall:
         assert attempts["n"] == 2, (
             f"Expected silent retry (2 attempts), got {attempts['n']}"
         )
+        from agent.runtime_usage import snapshot_agent_usage
+
+        usage = snapshot_agent_usage(agent)
+        assert (
+            "primary:stream_attempt_abandoned_without_terminal_usage"
+            in usage["warnings"]
+        )
         # Response should carry the recovered tool call, not a warning stub.
         msg = response.choices[0].message
         tool_calls = getattr(msg, "tool_calls", None)

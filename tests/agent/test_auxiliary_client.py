@@ -1247,6 +1247,76 @@ class TestVisionClientFallback:
         assert response.usage.prompt_tokens == 3
         assert response.usage.completion_tokens == 4
 
+    def test_anthropic_auxiliary_usage_includes_cached_input_components(self):
+        from agent.auxiliary_client import AnthropicAuxiliaryClient
+
+        final_message = SimpleNamespace(
+            content=[SimpleNamespace(type="text", text="cached aux response")],
+            stop_reason="end_turn",
+            usage=SimpleNamespace(
+                input_tokens=3,
+                cache_read_input_tokens=5,
+                cache_creation_input_tokens=7,
+                output_tokens=4,
+            ),
+        )
+        real_client = SimpleNamespace(messages=SimpleNamespace(create=MagicMock()))
+        client = AnthropicAuxiliaryClient(
+            real_client,
+            "claude-sonnet-4-20250514",
+            "sk-test",
+            "https://api.anthropic.com",
+        )
+
+        with patch(
+            "agent.anthropic_adapter.create_anthropic_message",
+            return_value=final_message,
+        ):
+            response = client.chat.completions.create(
+                messages=[{"role": "user", "content": "summarize"}],
+                max_tokens=16,
+            )
+
+        assert response.usage.input_tokens == 3
+        assert response.usage.cache_read_input_tokens == 5
+        assert response.usage.cache_creation_input_tokens == 7
+        assert response.usage.output_tokens == 4
+        assert response.usage.prompt_tokens == 15
+        assert response.usage.completion_tokens == 4
+        assert response.usage.total_tokens == 19
+
+    def test_anthropic_auxiliary_ignores_lower_provider_total_when_components_are_exact(self):
+        from agent.auxiliary_client import AnthropicAuxiliaryClient
+
+        final_message = SimpleNamespace(
+            content=[SimpleNamespace(type="text", text="cached aux response")],
+            stop_reason="end_turn",
+            usage=SimpleNamespace(
+                input_tokens=3,
+                cache_read_input_tokens=5,
+                cache_creation_input_tokens=7,
+                output_tokens=4,
+                total_tokens=7,
+            ),
+        )
+        client = AnthropicAuxiliaryClient(
+            SimpleNamespace(messages=SimpleNamespace(create=MagicMock())),
+            "claude-sonnet-4-20250514",
+            "sk-test",
+            "https://api.anthropic.com",
+        )
+
+        with patch(
+            "agent.anthropic_adapter.create_anthropic_message",
+            return_value=final_message,
+        ):
+            response = client.chat.completions.create(
+                messages=[{"role": "user", "content": "summarize"}],
+                max_tokens=16,
+            )
+
+        assert response.usage.total_tokens == 19
+
     def test_anthropic_auxiliary_client_uses_model_output_limit_by_default(self):
         from agent.auxiliary_client import AnthropicAuxiliaryClient
 
@@ -2874,6 +2944,124 @@ class TestTransientTransportRetry:
         # Primary tried ONCE only — no same-provider timeout retry — then fallback.
         assert primary.chat.completions.create.call_count == 1
         assert fb_client.chat.completions.create.call_count == 1
+
+    def test_timeout_then_fallback_success_is_durably_partial_usage(self):
+        """A recovered auxiliary call cannot erase an already-dispatched
+        attempt whose provider usage never returned."""
+        from types import SimpleNamespace
+
+        from agent.runtime_usage import (
+            attribute_auxiliary_usage,
+            initialize_agent_usage_attribution,
+            snapshot_agent_usage,
+        )
+
+        class _Timeout(Exception):
+            pass
+
+        _Timeout.__name__ = "APITimeoutError"
+        primary = MagicMock()
+        primary.base_url = "https://openrouter.ai/api/v1"
+        primary.chat.completions.create.side_effect = _Timeout("Request timed out.")
+
+        fallback_response = SimpleNamespace(
+            usage=SimpleNamespace(
+                prompt_tokens=9,
+                completion_tokens=2,
+                total_tokens=11,
+            )
+        )
+        fb_client = MagicMock()
+        fb_client.base_url = "https://api.openai.com/v1"
+        fb_client.chat.completions.create.return_value = fallback_response
+
+        agent = SimpleNamespace(
+            session_prompt_tokens=0,
+            session_completion_tokens=0,
+            session_total_tokens=0,
+            session_api_calls=0,
+        )
+        initialize_agent_usage_attribution(agent)
+        p1, p2, p3 = self._patches(primary)
+        with (
+            attribute_auxiliary_usage(agent),
+            p1,
+            p2,
+            p3,
+            patch(
+                "agent.auxiliary_client._try_configured_fallback_chain",
+                return_value=(None, None, ""),
+            ),
+            patch(
+                "agent.auxiliary_client._try_main_agent_model_fallback",
+                return_value=(fb_client, "fb-model", "openai"),
+            ),
+        ):
+            result = call_llm(
+                task="compression",
+                messages=[{"role": "user", "content": "hi"}],
+            )
+
+        assert result is fallback_response
+        usage = snapshot_agent_usage(agent)
+        assert usage["breakdown"]["auxiliary"]["total_tokens"] == 11
+        assert usage["completeness"] == "partial"
+        assert usage["warnings"] == [
+            "auxiliary:compression:dispatched_attempt_usage_unavailable"
+        ]
+
+    def test_validation_accounting_failure_cannot_replace_provider_success(self):
+        """The real dispatch→validation chain keeps a successful response."""
+        from types import SimpleNamespace
+
+        from agent.runtime_usage import (
+            attribute_auxiliary_usage,
+            initialize_agent_usage_attribution,
+            snapshot_agent_usage,
+        )
+
+        response = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content="ok"))],
+            usage=SimpleNamespace(
+                prompt_tokens=9,
+                completion_tokens=2,
+                total_tokens=11,
+            ),
+        )
+        client = MagicMock()
+        client.base_url = "https://openrouter.ai/api/v1"
+        client.chat.completions.create.return_value = response
+        agent = SimpleNamespace(
+            session_prompt_tokens=0,
+            session_completion_tokens=0,
+            session_total_tokens=0,
+            session_api_calls=0,
+        )
+        initialize_agent_usage_attribution(agent)
+
+        with (
+            attribute_auxiliary_usage(agent),
+            patch(
+                "agent.auxiliary_client._resolve_task_provider_model",
+                return_value=("openrouter", "some-model", None, None, None),
+            ),
+            patch(
+                "agent.auxiliary_client._get_cached_client",
+                return_value=(client, "some-model"),
+            ),
+            patch(
+                "agent.runtime_usage.record_auxiliary_response",
+                side_effect=RuntimeError("accounting failed"),
+            ),
+        ):
+            result = call_llm(
+                task="compression",
+                messages=[{"role": "user", "content": "hi"}],
+            )
+
+        assert result is response
+        usage = snapshot_agent_usage(agent)
+        assert "auxiliary:compression:usage_accounting_failed" in usage["warnings"]
 
     def test_non_compression_still_retries_same_provider_on_timeout(self):
         """The timeout skip is scoped to compression only; other auxiliary

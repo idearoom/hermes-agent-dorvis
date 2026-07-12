@@ -755,7 +755,15 @@ def interruptible_api_call(agent, api_kwargs: dict):
     _call_start = time.time()
     agent._touch_activity("waiting for non-streaming API response")
 
-    t = threading.Thread(target=_call, daemon=True)
+    # Preserve run-scoped usage attribution across the request worker. This is
+    # especially important for MoA's auxiliary aggregator call, whose internal
+    # fallback attempts otherwise lose the parent agent ContextVar.
+    from tools.thread_context import propagate_context_to_thread
+
+    t = threading.Thread(
+        target=propagate_context_to_thread(_call),
+        daemon=True,
+    )
     t.start()
     _poll_count = 0
     while t.is_alive():
@@ -2377,7 +2385,12 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             except Exception as e:
                 result["error"] = e
 
-        t = threading.Thread(target=_bedrock_call, daemon=True)
+        from tools.thread_context import propagate_context_to_thread
+
+        t = threading.Thread(
+            target=propagate_context_to_thread(_bedrock_call),
+            daemon=True,
+        )
         t.start()
         while t.is_alive():
             t.join(timeout=0.3)
@@ -3386,6 +3399,16 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                                 )
                             except Exception:
                                 pass
+                        # This stream was already dispatched and may have
+                        # generated billable tokens, but it ended before a
+                        # terminal usage frame. A later successful retry cannot
+                        # make the run-level token figure complete.
+                        from agent.runtime_usage import mark_primary_dispatch_uncertain
+
+                        mark_primary_dispatch_uncertain(
+                            agent,
+                            reason="stream_attempt_abandoned_without_terminal_usage",
+                        )
                         continue
 
                     # SSE error events from proxies (e.g. OpenRouter sends
@@ -3451,6 +3474,12 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                                     )
                                 except Exception:
                                     pass
+                            from agent.runtime_usage import mark_primary_dispatch_uncertain
+
+                            mark_primary_dispatch_uncertain(
+                                agent,
+                                reason="stream_attempt_abandoned_without_terminal_usage",
+                            )
                             continue
                         # Retries exhausted. Log the final failure with
                         # full diagnostic detail (chain, headers,
@@ -3612,7 +3641,12 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         if _reasoning_floor is not None:
             _stream_stale_timeout = max(_stream_stale_timeout, _reasoning_floor)
 
-    t = threading.Thread(target=_call, daemon=True)
+    from tools.thread_context import propagate_context_to_thread
+
+    t = threading.Thread(
+        target=propagate_context_to_thread(_call),
+        daemon=True,
+    )
     t.start()
     _last_heartbeat = time.time()
     _HEARTBEAT_INTERVAL = 30.0  # seconds between gateway activity touches

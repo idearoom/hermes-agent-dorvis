@@ -43,6 +43,24 @@ class DummyAgent:
         self.warnings = []
         self.events = []
         self.built_prompts = []
+        self.session_prompt_tokens = 0
+        self.session_completion_tokens = 0
+        self.session_total_tokens = 0
+        self.session_api_calls = 0
+        self.session_input_tokens = 0
+        self.session_output_tokens = 0
+        self.session_cache_read_tokens = 0
+        self.session_cache_write_tokens = 0
+        self.session_reasoning_tokens = 0
+        self.session_estimated_cost_usd = 0.0
+        self._session_db = None
+        self.model = "gpt-5-codex"
+        self.provider = "openai-codex"
+        self.base_url = "https://chatgpt.com/backend-api/codex"
+        self.api_key = "test"
+        from agent.runtime_usage import initialize_agent_usage_attribution
+
+        initialize_agent_usage_attribution(self)
 
     def _emit_status(self, message):
         self.statuses.append(message)
@@ -162,6 +180,76 @@ def test_codex_app_server_compression_failure_preserves_bookkeeping():
     assert agent.context_compressor.compression_count == 0
     assert agent.context_compressor.last_prompt_tokens == 123
     assert agent.warnings
+    from agent.runtime_usage import snapshot_agent_usage
+
+    usage = snapshot_agent_usage(agent)
+    assert usage["completeness"] == "unavailable"
+    assert usage["warnings"] == [
+        "no_provider_usage_reported",
+        "primary:codex_compaction_dispatched_usage_unavailable",
+    ]
+
+
+def test_codex_app_server_success_without_compaction_usage_is_partial():
+    agent = DummyAgent(TurnResult(thread_id="thread-1", turn_id="compact-turn-1"))
+
+    compress_context(
+        agent,
+        [{"role": "user", "content": "hi"}],
+        "system",
+        approx_tokens=100000,
+        force=True,
+    )
+
+    from agent.runtime_usage import snapshot_agent_usage
+
+    usage = snapshot_agent_usage(agent)
+    assert usage["completeness"] == "partial"
+    assert usage["warnings"] == ["primary:codex_turn_missing_usage"]
+
+
+def test_failed_compaction_preserves_reported_usage_as_captured(monkeypatch):
+    agent = DummyAgent(
+        TurnResult(
+            error="compact failed",
+            token_usage_last={
+                "inputTokens": 5,
+                "cachedInputTokens": 3,
+                "outputTokens": 2,
+                "reasoningOutputTokens": 1,
+                "totalTokens": 10,
+            },
+        )
+    )
+    monkeypatch.setattr(
+        "agent.usage_pricing.estimate_usage_cost",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            amount_usd=None,
+            status="unknown",
+            source="none",
+        ),
+    )
+
+    compress_context(
+        agent,
+        [{"role": "user", "content": "hi"}],
+        "system",
+        approx_tokens=100000,
+        force=True,
+    )
+
+    from agent.runtime_usage import snapshot_agent_usage
+
+    usage = snapshot_agent_usage(agent)
+    assert usage["breakdown"]["parent"] == {
+        "input_tokens": 8,
+        "output_tokens": 2,
+        "total_tokens": 10,
+    }
+    assert usage["completeness"] == "partial"
+    assert usage["warnings"] == [
+        "primary:codex_compaction_dispatched_usage_unavailable"
+    ]
 
 
 def test_codex_app_server_native_compaction_notice_emits_status_and_event():

@@ -1407,10 +1407,30 @@ class _AnthropicCompletionsAdapter:
 
         usage = None
         if hasattr(response, "usage") and response.usage:
-            prompt_tokens = getattr(response.usage, "input_tokens", 0) or 0
-            completion_tokens = getattr(response.usage, "output_tokens", 0) or 0
-            total_tokens = getattr(response.usage, "total_tokens", 0) or (prompt_tokens + completion_tokens)
+            input_tokens = getattr(response.usage, "input_tokens", 0) or 0
+            cache_read_input_tokens = (
+                getattr(response.usage, "cache_read_input_tokens", 0) or 0
+            )
+            cache_creation_input_tokens = (
+                getattr(response.usage, "cache_creation_input_tokens", 0) or 0
+            )
+            output_tokens = getattr(response.usage, "output_tokens", 0) or 0
+            prompt_tokens = (
+                input_tokens
+                + cache_read_input_tokens
+                + cache_creation_input_tokens
+            )
+            completion_tokens = output_tokens
+            # Exact components are stronger than provider ``total_tokens``.
+            # Some Anthropic-compatible routes report a total that excludes
+            # cached input; forwarding it would create a falsely reconciling,
+            # lower complete total at the central accounting seam.
+            total_tokens = prompt_tokens + completion_tokens
             usage = SimpleNamespace(
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                cache_read_input_tokens=cache_read_input_tokens,
+                cache_creation_input_tokens=cache_creation_input_tokens,
                 prompt_tokens=prompt_tokens,
                 completion_tokens=completion_tokens,
                 total_tokens=total_tokens,
@@ -3627,7 +3647,7 @@ def _retry_same_provider_sync(
     if _is_anthropic_compat_endpoint(resolved_provider, retry_base):
         retry_kwargs["messages"] = _convert_openai_images_to_anthropic(retry_kwargs["messages"])
     return _validate_llm_response(
-        retry_client.chat.completions.create(**retry_kwargs), task,
+        _tracked_auxiliary_create(retry_client, retry_kwargs, task), task,
     )
 
 
@@ -3686,7 +3706,7 @@ async def _retry_same_provider_async(
     if _is_anthropic_compat_endpoint(resolved_provider, retry_base):
         retry_kwargs["messages"] = _convert_openai_images_to_anthropic(retry_kwargs["messages"])
     return _validate_llm_response(
-        await retry_client.chat.completions.create(**retry_kwargs), task,
+        await _tracked_auxiliary_create_async(retry_client, retry_kwargs, task), task,
     )
 
 
@@ -3873,7 +3893,7 @@ def _call_fallback_candidate_sync(
         base_url=fb_base)
     try:
         return _validate_llm_response(
-            fb_client.chat.completions.create(**fb_kwargs), task)
+            _tracked_auxiliary_create(fb_client, fb_kwargs, task), task)
     except Exception as fb_err:
         if not _is_auth_error(fb_err):
             raise
@@ -3890,7 +3910,7 @@ def _call_fallback_candidate_sync(
                     base_url=str(getattr(retry_client, "base_url", "") or fb_base))
                 try:
                     return _validate_llm_response(
-                        retry_client.chat.completions.create(**retry_kwargs), task)
+                        _tracked_auxiliary_create(retry_client, retry_kwargs, task), task)
                 except Exception as retry_err:
                     if not _is_auth_error(retry_err):
                         raise
@@ -3939,7 +3959,7 @@ async def _call_fallback_candidate_async(
         base_url=fb_base)
     try:
         return _validate_llm_response(
-            await fb_client.chat.completions.create(**fb_kwargs), task)
+            await _tracked_auxiliary_create_async(fb_client, fb_kwargs, task), task)
     except Exception as fb_err:
         if not _is_auth_error(fb_err):
             raise
@@ -3957,7 +3977,9 @@ async def _call_fallback_candidate_async(
                     base_url=str(getattr(retry_client, "base_url", "") or fb_base))
                 try:
                     return _validate_llm_response(
-                        await retry_client.chat.completions.create(**retry_kwargs), task)
+                        await _tracked_auxiliary_create_async(
+                            retry_client, retry_kwargs, task
+                        ), task)
                 except Exception as retry_err:
                     if not _is_auth_error(retry_err):
                         raise
@@ -6799,6 +6821,32 @@ def _build_call_kwargs(
     return kwargs
 
 
+def _tracked_auxiliary_create(client: Any, kwargs: dict, task: str = None) -> Any:
+    """Dispatch one sync auxiliary attempt through run-scoped accounting."""
+
+    from agent.runtime_usage import track_auxiliary_dispatch
+
+    return track_auxiliary_dispatch(
+        lambda: client.chat.completions.create(**kwargs),
+        task=task,
+    )
+
+
+async def _tracked_auxiliary_create_async(
+    client: Any,
+    kwargs: dict,
+    task: str = None,
+) -> Any:
+    """Dispatch one async auxiliary attempt through run-scoped accounting."""
+
+    from agent.runtime_usage import track_auxiliary_dispatch_async
+
+    return await track_auxiliary_dispatch_async(
+        lambda: client.chat.completions.create(**kwargs),
+        task=task,
+    )
+
+
 def _validate_llm_response(
     response: Any,
     task: Optional[str] = None,
@@ -6827,6 +6875,26 @@ def _validate_llm_response(
         )
     from agent.aux_accounting import record_aux_usage
     record_aux_usage(response, task, provider=provider, base_url=base_url)
+    # Count provider responses before shape validation. A malformed response
+    # can still carry billable usage and may trigger a fallback; each distinct
+    # response must be attributed once, while a recovered re-validation of the
+    # same object must not count twice.
+    from agent.runtime_usage import (
+        mark_auxiliary_usage_accounting_failed,
+        record_auxiliary_response,
+    )
+    try:
+        record_auxiliary_response(response, task=task)
+    except Exception:
+        # Validation is downstream of a successful provider response. Usage
+        # bookkeeping must never replace that success with an application
+        # failure; the tracked dispatch seam already attempted the same
+        # identity-deduplicated record and this warning remains fail-closed.
+        logger.debug(
+            "Auxiliary response validation accounting failed",
+            exc_info=True,
+        )
+        mark_auxiliary_usage_accounting_failed(task=task)
     # Allow SimpleNamespace responses from adapters (CodexAuxiliaryClient,
     # AnthropicAuxiliaryClient) — they have .choices[0].message.
     try:
@@ -7100,7 +7168,7 @@ def call_llm(
         # for the transient retry every auxiliary task shares. (PR #16587)
         try:
             return _validate_llm_response(
-                client.chat.completions.create(**kwargs), task,
+                _tracked_auxiliary_create(client, kwargs, task), task,
                 provider=resolved_provider, base_url=_base_info)
         except Exception as transient_err:
             if not _is_transient_transport_error(transient_err):
@@ -7133,7 +7201,7 @@ def call_llm(
                 time.sleep(_backoff)
                 try:
                     return _validate_llm_response(
-                        client.chat.completions.create(**kwargs), task)
+                        _tracked_auxiliary_create(client, kwargs, task), task)
                 except Exception as retry_transient:
                     if not _is_transient_transport_error(retry_transient):
                         raise
@@ -7150,7 +7218,7 @@ def call_llm(
             )
             try:
                 return _validate_llm_response(
-                    client.chat.completions.create(**retry_kwargs), task)
+                    _tracked_auxiliary_create(client, retry_kwargs, task), task)
             except Exception as retry_err:
                 retry_err_str = str(retry_err)
                 # If retry still fails, fall through to the max_tokens /
@@ -7188,7 +7256,7 @@ def call_llm(
             kwargs.pop("max_completion_tokens", None)
             try:
                 return _validate_llm_response(
-                    client.chat.completions.create(**kwargs), task)
+                    _tracked_auxiliary_create(client, kwargs, task), task)
             except Exception as retry_err:
                 # If the max_tokens retry also hits a payment or connection
                 # error, fall through to the fallback chain below.
@@ -7218,7 +7286,7 @@ def call_llm(
                 kwargs["model"] = healed_model
                 try:
                     return _validate_llm_response(
-                        client.chat.completions.create(**kwargs), task)
+                        _tracked_auxiliary_create(client, kwargs, task), task)
                 except Exception as retry_err:
                     first_err = retry_err
 
@@ -7251,7 +7319,9 @@ def call_llm(
                     kwargs["model"] = refreshed_model
                 try:
                     return _validate_llm_response(
-                        refreshed_client.chat.completions.create(**kwargs), task)
+                        _tracked_auxiliary_create(
+                            refreshed_client, kwargs, task
+                        ), task)
                 except Exception as retry_err:
                     if not (
                         _is_auth_error(retry_err)
@@ -7279,7 +7349,7 @@ def call_llm(
                 if refreshed_model and refreshed_model != kwargs.get("model"):
                     kwargs["model"] = refreshed_model
                 return _validate_llm_response(
-                    refreshed_client.chat.completions.create(**kwargs), task)
+                    _tracked_auxiliary_create(refreshed_client, kwargs, task), task)
 
         # ── Auth refresh retry ───────────────────────────────────────
         auth_refresh_provider = _auth_refresh_provider_for_route(
@@ -7328,7 +7398,7 @@ def call_llm(
             if _is_rate_limit_error(first_err) and not _is_payment_error(first_err):
                 try:
                     return _validate_llm_response(
-                        client.chat.completions.create(**kwargs), task)
+                        _tracked_auxiliary_create(client, kwargs, task), task)
                 except Exception as retry_err:
                     if not (_is_auth_error(retry_err) or _is_payment_error(retry_err) or _is_rate_limit_error(retry_err)):
                         raise
@@ -7686,7 +7756,7 @@ async def async_call_llm(
         # for the rationale. (PR #16587)
         try:
             return _validate_llm_response(
-                await client.chat.completions.create(**kwargs), task,
+                await _tracked_auxiliary_create_async(client, kwargs, task), task,
                 provider=resolved_provider, base_url=_client_base)
         except Exception as transient_err:
             if not _is_transient_transport_error(transient_err):
@@ -7707,7 +7777,7 @@ async def async_call_llm(
                 task or "call", transient_err,
             )
             return _validate_llm_response(
-                await client.chat.completions.create(**kwargs), task)
+                await _tracked_auxiliary_create_async(client, kwargs, task), task)
     except Exception as first_err:
         if "temperature" in kwargs and _is_unsupported_temperature_error(first_err):
             retry_kwargs = dict(kwargs)
@@ -7718,7 +7788,9 @@ async def async_call_llm(
             )
             try:
                 return _validate_llm_response(
-                    await client.chat.completions.create(**retry_kwargs), task)
+                    await _tracked_auxiliary_create_async(
+                        client, retry_kwargs, task
+                    ), task)
             except Exception as retry_err:
                 retry_err_str = str(retry_err)
                 if not (
@@ -7752,7 +7824,7 @@ async def async_call_llm(
             kwargs.pop("max_completion_tokens", None)
             try:
                 return _validate_llm_response(
-                    await client.chat.completions.create(**kwargs), task)
+                    await _tracked_auxiliary_create_async(client, kwargs, task), task)
             except Exception as retry_err:
                 # If the max_tokens retry also hits a payment or connection
                 # error, fall through to the fallback chain below.
@@ -7781,7 +7853,9 @@ async def async_call_llm(
                 kwargs["model"] = healed_model
                 try:
                     return _validate_llm_response(
-                        await client.chat.completions.create(**kwargs), task)
+                        await _tracked_auxiliary_create_async(
+                            client, kwargs, task
+                        ), task)
                 except Exception as retry_err:
                     first_err = retry_err
 
@@ -7813,7 +7887,9 @@ async def async_call_llm(
                     kwargs["model"] = refreshed_model
                 try:
                     return _validate_llm_response(
-                        await refreshed_client.chat.completions.create(**kwargs), task)
+                        await _tracked_auxiliary_create_async(
+                            refreshed_client, kwargs, task
+                        ), task)
                 except Exception as retry_err:
                     if not (
                         _is_auth_error(retry_err)
@@ -7840,7 +7916,9 @@ async def async_call_llm(
                 if refreshed_model and refreshed_model != kwargs.get("model"):
                     kwargs["model"] = refreshed_model
                 return _validate_llm_response(
-                    await refreshed_client.chat.completions.create(**kwargs), task)
+                    await _tracked_auxiliary_create_async(
+                        refreshed_client, kwargs, task
+                    ), task)
 
         # ── Auth refresh retry (mirrors sync call_llm) ───────────────
         auth_refresh_provider = _auth_refresh_provider_for_route(
@@ -7884,7 +7962,9 @@ async def async_call_llm(
             if _is_rate_limit_error(first_err) and not _is_payment_error(first_err):
                 try:
                     return _validate_llm_response(
-                        await client.chat.completions.create(**kwargs), task)
+                        await _tracked_auxiliary_create_async(
+                            client, kwargs, task
+                        ), task)
                 except Exception as retry_err:
                     if not (_is_auth_error(retry_err) or _is_payment_error(retry_err) or _is_rate_limit_error(retry_err)):
                         raise

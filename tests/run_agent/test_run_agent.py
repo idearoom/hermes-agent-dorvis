@@ -416,6 +416,38 @@ def _mock_response(
     return resp
 
 
+class _PendingMoAClient:
+    """Public MoA client shape with one pending advisor-accounting payload."""
+
+    def __init__(self, *, response=None, error=None, usage=None, cost=None, warnings=()):
+        completion = MagicMock()
+        if error is not None:
+            completion.create.side_effect = error
+        else:
+            completion.create.return_value = response
+        self.chat = SimpleNamespace(completions=completion)
+        self._usage = usage
+        self._cost = cost
+        self._warnings = tuple(warnings)
+        self._consumed = False
+        self.trace_calls = []
+        self.last_aggregator_slot = {
+            "provider": "openrouter",
+            "model": "aggregator/model",
+        }
+
+    def consume_reference_usage(self):
+        from agent.usage_pricing import CanonicalUsage
+
+        if self._consumed:
+            return CanonicalUsage(request_count=0), None, ()
+        self._consumed = True
+        return self._usage, self._cost, self._warnings
+
+    def consume_and_save_trace(self, session_id=None, aggregator_output_fallback=None):
+        self.trace_calls.append((session_id, aggregator_output_fallback))
+
+
 # ===================================================================
 # Group 1: Pure Functions
 # ===================================================================
@@ -4202,6 +4234,13 @@ class TestRunConversation:
             result = agent.run_conversation("hello")
         assert result["final_response"] == "Final answer"
         assert result["completed"] is True
+        from agent.runtime_usage import snapshot_agent_usage
+        usage = snapshot_agent_usage(agent)
+        assert usage["completeness"] == "unavailable"
+        assert usage["warnings"] == [
+            "no_provider_usage_reported",
+            "primary:provider_response_missing_usage",
+        ]
 
     def test_codex_content_filter_incomplete_routes_to_policy_fallback(self, agent):
         self._setup_agent(agent)
@@ -4527,6 +4566,53 @@ class TestRunConversation:
         ):
             result = agent.run_conversation("hello")
         assert result["interrupted"] is True
+        from agent.runtime_usage import snapshot_agent_usage
+
+        usage = snapshot_agent_usage(agent)
+        assert usage["completeness"] == "unavailable"
+        assert "primary:dispatched_attempt_usage_unavailable" in usage["warnings"]
+
+    def test_invalid_billable_response_then_success_counts_both_once(self, agent):
+        """Shape-invalid responses can still carry usage and must survive the
+        retry that produces the acting response."""
+        self._setup_agent(agent)
+        invalid = SimpleNamespace(
+            choices=[],
+            model="test/model",
+            usage=SimpleNamespace(
+                prompt_tokens=7,
+                completion_tokens=1,
+                total_tokens=8,
+            ),
+        )
+        valid = _mock_response(
+            content="Recovered",
+            finish_reason="stop",
+            usage={
+                "prompt_tokens": 11,
+                "completion_tokens": 2,
+                "total_tokens": 13,
+            },
+        )
+        with (
+            patch.object(agent, "_interruptible_api_call", side_effect=[invalid, valid]),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+            patch("agent.conversation_loop.jittered_backoff", return_value=0.0),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["final_response"] == "Recovered"
+        from agent.runtime_usage import snapshot_agent_usage
+
+        usage = snapshot_agent_usage(agent)
+        assert usage["completeness"] == "complete"
+        assert usage["breakdown"]["parent"] == {
+            "input_tokens": 18,
+            "output_tokens": 3,
+            "total_tokens": 21,
+        }
 
     def test_invalid_tool_name_retry(self, agent):
         """Model hallucinates an invalid tool name, agent retries and succeeds."""
@@ -5448,6 +5534,86 @@ class TestRunConversation:
         assert result["final_response"] is not None
         assert "Thinking Budget Exhausted" in result["final_response"]
         assert "/thinkon" in result["final_response"]
+
+    def test_moa_advisor_accounting_survives_truncated_early_return(self, agent):
+        from agent.runtime_usage import snapshot_agent_usage
+        from agent.usage_pricing import CanonicalUsage
+
+        self._setup_agent(agent)
+        agent.provider = "moa"
+        agent.base_url = "moa://local"
+        agent._base_url_lower = agent.base_url
+        response = _mock_response(
+            content="<think>unfinished reasoning</think>",
+            finish_reason="length",
+            usage={"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12},
+        )
+        moa_client = _PendingMoAClient(
+            response=response,
+            usage=CanonicalUsage(input_tokens=30, output_tokens=5),
+            cost=0.25,
+            warnings=("advisor_usage_uncertain",),
+        )
+        agent.client = moa_client
+
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello")
+
+        usage = snapshot_agent_usage(agent)
+        assert result["completed"] is False
+        assert usage["breakdown"]["parent"] == {
+            "input_tokens": 40,
+            "output_tokens": 7,
+            "total_tokens": 47,
+        }
+        assert usage["completeness"] == "partial"
+        assert "primary:moa_reference:advisor_usage_uncertain" in usage["warnings"]
+        assert agent.session_estimated_cost_usd == pytest.approx(0.25)
+        assert len(moa_client.trace_calls) == 1
+
+    def test_moa_advisor_accounting_survives_final_aggregator_failure(self, agent):
+        from agent.runtime_usage import snapshot_agent_usage
+        from agent.usage_pricing import CanonicalUsage
+        from agent import conversation_loop as _conv_loop
+
+        self._setup_agent(agent)
+        agent.provider = "moa"
+        agent.base_url = "moa://local"
+        agent._base_url_lower = agent.base_url
+        agent._api_max_retries = 1
+        moa_client = _PendingMoAClient(
+            error=RuntimeError("aggregator unavailable"),
+            usage=CanonicalUsage(input_tokens=30, output_tokens=5),
+            cost=0.25,
+            warnings=("advisor_usage_uncertain",),
+        )
+        agent.client = moa_client
+
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+            patch.object(agent, "_try_recover_primary_transport", return_value=False),
+            patch.object(_conv_loop, "jittered_backoff", return_value=0.0),
+        ):
+            result = agent.run_conversation("hello")
+
+        usage = snapshot_agent_usage(agent)
+        assert result["completed"] is False
+        assert result["failed"] is True
+        assert usage["breakdown"]["parent"] == {
+            "input_tokens": 30,
+            "output_tokens": 5,
+            "total_tokens": 35,
+        }
+        assert usage["completeness"] == "partial"
+        assert "primary:moa_reference:advisor_usage_uncertain" in usage["warnings"]
+        assert agent.session_estimated_cost_usd == pytest.approx(0.25)
+        assert len(moa_client.trace_calls) == 1
 
     def test_length_empty_content_without_think_tags_retries_normally(self, agent):
         """When finish_reason='length' and content is None but no think tags,

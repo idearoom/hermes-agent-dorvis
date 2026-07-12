@@ -1496,11 +1496,22 @@ def run_conversation(
                             allow_stream=False,
                             is_github_responses=agent._is_copilot_url(),
                         )
-                    if _use_streaming:
-                        return agent._interruptible_streaming_api_call(
-                            next_api_kwargs, on_first_delta=_stop_spinner
-                        )
-                    return agent._interruptible_api_call(next_api_kwargs)
+                    # Request construction/middleware above can fail before a
+                    # provider call begins. Track only this already-preflighted
+                    # execution seam: once invoked, an exception/interruption
+                    # may represent billable work whose terminal usage never
+                    # reached us. Returned responses are provisionally retained
+                    # so malformed-response retries are not lost.
+                    from agent.runtime_usage import track_primary_dispatch
+
+                    def _dispatch():
+                        if _use_streaming:
+                            return agent._interruptible_streaming_api_call(
+                                next_api_kwargs, on_first_delta=_stop_spinner
+                            )
+                        return agent._interruptible_api_call(next_api_kwargs)
+
+                    return track_primary_dispatch(agent, _dispatch)
 
                 from hermes_cli.middleware import run_llm_execution_middleware
 
@@ -2236,6 +2247,11 @@ def run_conversation(
                 
                 # Track actual token usage from response for context management
                 if hasattr(response, 'usage') and response.usage:
+                    from agent.runtime_usage import (
+                        commit_primary_response,
+                        validate_primary_usage_components,
+                    )
+                    validate_primary_usage_components(agent, response.usage)
                     canonical_usage = normalize_usage(
                         response.usage,
                         provider=agent.provider,
@@ -2253,13 +2269,38 @@ def run_conversation(
                     # the bulk of a MoA turn — is invisible in token counts.
                     _moa_ref_cost = None
                     _moa_client = getattr(agent, "client", None)
-                    if _moa_client is not None and hasattr(_moa_client, "consume_reference_usage"):
+                    if (
+                        agent.provider == "moa"
+                        and _moa_client is not None
+                        and hasattr(_moa_client, "consume_reference_usage")
+                    ):
                         try:
-                            _ref_usage, _moa_ref_cost = _moa_client.consume_reference_usage()
+                            (
+                                _ref_usage,
+                                _moa_ref_cost,
+                                _moa_usage_warnings,
+                            ) = _moa_client.consume_reference_usage()
                             if _ref_usage is not None:
                                 canonical_usage = canonical_usage + _ref_usage
+                            if _moa_usage_warnings:
+                                from agent.runtime_usage import (
+                                    mark_moa_reference_usage_incomplete,
+                                )
+
+                                mark_moa_reference_usage_incomplete(
+                                    agent,
+                                    _moa_usage_warnings,
+                                )
                         except Exception as _moa_acct_exc:  # pragma: no cover - defensive
                             logger.debug("MoA reference usage accounting failed: %s", _moa_acct_exc)
+                            from agent.runtime_usage import (
+                                mark_moa_reference_usage_incomplete,
+                            )
+
+                            mark_moa_reference_usage_incomplete(
+                                agent,
+                                ("usage_rollup_failed",),
+                            )
                     # Flush the full-turn MoA trace (references + aggregator I/O)
                     # to disk when moa.save_traces is on. No-op otherwise and
                     # for non-MoA clients. Uses the live session_id so traces
@@ -2268,7 +2309,11 @@ def run_conversation(
                     # token stream went to the live consumer), so pass the
                     # resolved streamed acting text as a fallback — makes the
                     # trace self-contained instead of only pointing at state.db.
-                    if _moa_client is not None and hasattr(_moa_client, "consume_and_save_trace"):
+                    if (
+                        agent.provider == "moa"
+                        and _moa_client is not None
+                        and hasattr(_moa_client, "consume_and_save_trace")
+                    ):
                         try:
                             _agg_streamed_text = (
                                 getattr(agent, "_current_streamed_assistant_text", "") or ""
@@ -2321,15 +2366,7 @@ def run_conversation(
                         agent.context_compressor._context_probed = False
                         agent.context_compressor._context_probe_persistable = False
 
-                    agent.session_prompt_tokens += prompt_tokens
-                    agent.session_completion_tokens += completion_tokens
-                    agent.session_total_tokens += total_tokens
-                    agent.session_api_calls += 1
-                    agent.session_input_tokens += canonical_usage.input_tokens
-                    agent.session_output_tokens += canonical_usage.output_tokens
-                    agent.session_cache_read_tokens += canonical_usage.cache_read_tokens
-                    agent.session_cache_write_tokens += canonical_usage.cache_write_tokens
-                    agent.session_reasoning_tokens += canonical_usage.reasoning_tokens
+                    commit_primary_response(agent, response, canonical_usage)
 
                     # Log API call details for debugging/observability
                     _cache_pct = ""
@@ -2434,7 +2471,7 @@ def run_conversation(
                     
                     if agent.verbose_logging:
                         logging.debug(f"Token usage: prompt={usage_dict['prompt_tokens']:,}, completion={usage_dict['completion_tokens']:,}, total={usage_dict['total_tokens']:,}")
-                    
+
                     # Surface cache hit stats for any provider that reports
                     # them — not just those where we inject cache_control
                     # markers.  OpenAI/Kimi/DeepSeek/Qwen all do automatic
@@ -2456,6 +2493,16 @@ def run_conversation(
                             f"{cached:,}/{prompt:,} tokens "
                             f"({hit_pct:.0f}% hit, {written:,} written)"
                         )
+                else:
+                    # A response without provider usage may still contain text
+                    # or tool calls, but the run aggregate cannot honestly be
+                    # called complete. Keep the known counters and surface a
+                    # durable partial-status warning through the gateway.
+                    from agent.runtime_usage import mark_primary_usage_missing
+                    mark_primary_usage_missing(
+                        agent,
+                        reason="provider_response_missing_usage",
+                    )
                 
                 _retry.has_retried_429 = False  # Reset on success
                 # Note: don't clear the retry buffer here — an "API call

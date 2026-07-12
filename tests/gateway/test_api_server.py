@@ -737,6 +737,68 @@ def _make_api_agent(final_response: str = "ok") -> MagicMock:
 
 class TestAgentExecution:
     @pytest.mark.asyncio
+    async def test_chained_response_attempts_use_fresh_non_cumulative_usage(self, adapter):
+        first = _make_api_agent("first")
+        first.session_prompt_tokens = 10
+        first.session_completion_tokens = 2
+        first.session_total_tokens = 12
+        second = _make_api_agent("repair")
+        second.session_prompt_tokens = 3
+        second.session_completion_tokens = 1
+        second.session_total_tokens = 4
+
+        with patch.object(adapter, "_create_agent", side_effect=[first, second]):
+            _, first_usage = await adapter._run_agent(
+                user_message="initial",
+                conversation_history=[],
+                session_id="session-initial",
+            )
+            _, repair_usage = await adapter._run_agent(
+                user_message="repair",
+                conversation_history=[
+                    {"role": "assistant", "content": "first"},
+                ],
+                session_id="session-repair",
+            )
+
+        assert first_usage["total_tokens"] == 12
+        assert repair_usage["total_tokens"] == 4
+        assert repair_usage["input_tokens"] == 3
+
+    @pytest.mark.asyncio
+    async def test_run_agent_usage_aggregates_auxiliary_and_delegated_tokens(self, adapter):
+        from agent.runtime_usage import initialize_agent_usage_attribution
+
+        mock_agent = _make_api_agent()
+        initialize_agent_usage_attribution(mock_agent)
+        mock_agent.session_api_calls = 1
+        mock_agent.session_auxiliary_input_tokens = 5
+        mock_agent.session_auxiliary_output_tokens = 1
+        mock_agent.session_auxiliary_total_tokens = 6
+        mock_agent.session_auxiliary_response_count = 1
+        mock_agent.session_delegated_input_tokens = 13
+        mock_agent.session_delegated_output_tokens = 4
+        mock_agent.session_delegated_total_tokens = 17
+        mock_agent.session_delegated_response_count = 1
+
+        with patch.object(adapter, "_create_agent", return_value=mock_agent):
+            _, usage = await adapter._run_agent(
+                user_message="hello",
+                conversation_history=[],
+                session_id="session-aggregate",
+            )
+
+        assert usage["input_tokens"] == 19
+        assert usage["output_tokens"] == 7
+        assert usage["total_tokens"] == 26
+        assert usage["completeness"] == "complete"
+        assert usage["breakdown"] == {
+            "parent": {"input_tokens": 1, "output_tokens": 2, "total_tokens": 3},
+            "auxiliary": {"input_tokens": 5, "output_tokens": 1, "total_tokens": 6},
+            "delegated": {"input_tokens": 13, "output_tokens": 4, "total_tokens": 17},
+        }
+
+    @pytest.mark.asyncio
     async def test_run_agent_uses_session_id_as_task_id(self, adapter):
         mock_agent = MagicMock()
         mock_agent.run_conversation.return_value = {"final_response": "ok"}
@@ -757,7 +819,12 @@ class TestAgentExecution:
         # here doesn't set an explicit session_id string so the guard skips
         # the annotation — header will fall back to the provided session_id.
         assert result["final_response"] == "ok"
-        assert usage == {"input_tokens": 1, "output_tokens": 2, "total_tokens": 3}
+        assert usage["input_tokens"] == 1
+        assert usage["output_tokens"] == 2
+        assert usage["total_tokens"] == 3
+        assert usage["scope"] == "run_aggregate"
+        assert usage["completeness"] == "complete"
+        assert usage["warnings"] == []
         mock_agent.run_conversation.assert_called_once_with(
             user_message="hello",
             conversation_history=[],
@@ -823,7 +890,10 @@ class TestAgentExecution:
             )
 
         assert result["final_response"] == "ok"
-        assert usage == {"input_tokens": 1, "output_tokens": 2, "total_tokens": 3}
+        assert usage["input_tokens"] == 1
+        assert usage["output_tokens"] == 2
+        assert usage["total_tokens"] == 3
+        assert usage["completeness"] == "complete"
         mock_agent.shutdown_memory_provider.assert_called_once_with(mock_agent._session_messages)
         mock_agent.close.assert_not_called()
 

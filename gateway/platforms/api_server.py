@@ -193,13 +193,19 @@ def _agent_token_count(agent: Any, name: str, default: Optional[int] = 0) -> Opt
 
 
 def _session_usage_snapshot(agent: Any) -> Dict[str, Any]:
-    input_tokens = _agent_token_count(agent, "session_prompt_tokens", 0) or 0
-    output_tokens = _agent_token_count(agent, "session_completion_tokens", 0) or 0
-    total_tokens = _agent_token_count(agent, "session_total_tokens", 0) or 0
+    from agent.runtime_usage import snapshot_agent_usage
+    attributed = snapshot_agent_usage(agent)
+    input_tokens = _coerce_token_count(attributed.get("input_tokens"), 0) or 0
+    output_tokens = _coerce_token_count(attributed.get("output_tokens"), 0) or 0
+    total_tokens = _coerce_token_count(attributed.get("total_tokens"), 0) or 0
     usage: Dict[str, Any] = {
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
         "total_tokens": total_tokens,
+        "scope": "run_aggregate",
+        "completeness": attributed.get("completeness", "partial"),
+        "warnings": attributed.get("warnings", []),
+        "breakdown": attributed.get("breakdown", {}),
     }
 
     try:
@@ -211,7 +217,9 @@ def _session_usage_snapshot(agent: Any) -> Dict[str, Any]:
         ctx_max = _coerce_token_count(getattr(comp, "context_length", None), None)
         if ctx_max:
             if ctx_used is None:
-                ctx_used = total_tokens
+                # Context is a property of the parent conversation, not the
+                # separate auxiliary/child sessions included in run totals.
+                ctx_used = _agent_token_count(agent, "session_total_tokens", 0) or 0
             usage["context_used"] = ctx_used
             usage["context_max"] = ctx_max
             usage["context_percent"] = max(0, min(100, round(ctx_used / ctx_max * 100)))
@@ -248,6 +256,10 @@ def _session_usage_snapshot(agent: Any) -> Dict[str, Any]:
 
 
 _RESPONSES_USAGE_EXTRA_KEYS = (
+    "scope",
+    "completeness",
+    "warnings",
+    "breakdown",
     "context_used",
     "context_max",
     "context_percent",
@@ -5253,6 +5265,10 @@ class APIServerAdapter(BasePlatformAdapter):
                     session_key=gateway_session_key or session_id or "",
                     session_id=session_id or "",
                 )
+                # A fresh AIAgent is created for every HTTP response attempt,
+                # including previous_response_id chains. Conversation history
+                # is restored separately; usage counters therefore remain a
+                # per-response delta that headless workers can safely sum.
                 try:
                     agent = self._create_agent(
                         ephemeral_system_prompt=ephemeral_system_prompt,
@@ -5598,11 +5614,7 @@ class APIServerAdapter(BasePlatformAdapter):
                                             clear_session_vars(session_tokens)
                                         except Exception:
                                             pass
-                            u = {
-                                "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
-                                "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
-                                "total_tokens": getattr(agent, "session_total_tokens", 0) or 0,
-                            }
+                            u = _session_usage_snapshot(agent)
                             return r, u
                         finally:
                             self._shutdown_agent_memory_provider(agent)

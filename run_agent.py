@@ -6396,22 +6396,40 @@ class AIAgent:
         # replaces the value with the live runtime after fallback restoration.
         # Keep the scope local instead of storing ContextVar tokens on the agent,
         # which may be observed from another thread.
+        from agent.runtime_usage import (
+            attribute_auxiliary_usage,
+            finalize_moa_pending_accounting,
+        )
+        # ``call_llm`` is also used by child AIAgents. Every child enters this
+        # same forwarder on its own thread, so auxiliary usage is attributed to
+        # the correct session before delegate_task rolls the child up.
         with scoped_runtime_main({}):
-            try:
-                return run_conversation(
-                    self,
-                    user_message,
-                    system_message,
-                    conversation_history,
-                    task_id,
-                    stream_callback,
-                    persist_user_message,
-                    persist_user_timestamp=persist_user_timestamp,
-                    moa_config=moa_config,
-                )
-            finally:
-                reset_accounting_context(acct_token)
-                reset_conversation_context(token)
+            with attribute_auxiliary_usage(self):
+                try:
+                    return run_conversation(
+                        self,
+                        user_message,
+                        system_message,
+                        conversation_history,
+                        task_id,
+                        stream_callback,
+                        persist_user_message,
+                        persist_user_timestamp=persist_user_timestamp,
+                        moa_config=moa_config,
+                    )
+                finally:
+                # Every gateway snapshot happens after this public run boundary.
+                # Fold advisor accounting even when the conversation loop exits
+                # before its normal aggregator-usage block.
+                    try:
+                        finalize_moa_pending_accounting(self)
+                    except Exception:
+                        logger.debug(
+                            "MoA final accounting boundary failed",
+                            exc_info=True,
+                        )
+                    reset_accounting_context(acct_token)
+                    reset_conversation_context(token)
 
     def chat(self, message: str, stream_callback: Optional[callable] = None) -> str:
         """

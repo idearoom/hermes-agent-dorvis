@@ -658,6 +658,67 @@ def test_run_codex_stream_returns_collected_items_when_stream_ends_without_termi
     assert response.output == [output_item]
 
 
+def test_codex_connect_retry_then_success_keeps_usage_partial(monkeypatch):
+    """A connect attempt abandoned before terminal usage cannot be erased by
+    the Codex stream helper's internal retry."""
+    import httpx
+
+    from agent.runtime_usage import (
+        commit_primary_response,
+        snapshot_agent_usage,
+        track_primary_dispatch,
+    )
+    from agent.usage_pricing import normalize_usage
+
+    agent = _build_agent(monkeypatch)
+    output_item = SimpleNamespace(
+        type="message",
+        status="completed",
+        content=[SimpleNamespace(type="output_text", text="recovered")],
+    )
+    success = _FakeCreateStream([
+        SimpleNamespace(type="response.output_item.done", item=output_item),
+        SimpleNamespace(
+            type="response.completed",
+            response=SimpleNamespace(
+                id="resp-recovered",
+                status="completed",
+                usage=SimpleNamespace(
+                    input_tokens=8,
+                    output_tokens=2,
+                    total_tokens=10,
+                ),
+            ),
+        ),
+    ])
+    calls = {"count": 0}
+
+    def _fake_create(**_kwargs):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            raise httpx.RemoteProtocolError("connection dropped")
+        return success
+
+    client = SimpleNamespace(responses=SimpleNamespace(create=_fake_create))
+    response = track_primary_dispatch(
+        agent,
+        lambda: agent._run_codex_stream(_codex_request_kwargs(), client=client),
+    )
+    commit_primary_response(
+        agent,
+        response,
+        normalize_usage(response.usage, api_mode="codex_responses"),
+    )
+
+    usage = snapshot_agent_usage(agent)
+    assert calls["count"] == 2
+    assert usage["total_tokens"] == 10
+    assert usage["completeness"] == "partial"
+    assert usage["warnings"] == [
+        "primary:codex_stream_attempt_abandoned_without_terminal_usage"
+    ]
+
+
 def test_consume_codex_stream_routes_commentary_phase_deltas_to_reasoning(monkeypatch):
     from agent.codex_runtime import _consume_codex_event_stream
 

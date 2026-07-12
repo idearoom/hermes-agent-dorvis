@@ -76,6 +76,29 @@ def test_codex_success_flushes_and_reports_persisted():
     assert result["agent_persisted"] is True
 
 
+def test_codex_app_server_dispatched_failure_marks_usage_uncertain():
+    agent = _make_agent(session_db=None)
+    agent._codex_session.run_turn.side_effect = RuntimeError("app server died")
+
+    result = run_codex_app_server_turn(
+        agent,
+        user_message="hello",
+        original_user_message="hello",
+        messages=[{"role": "user", "content": "hello"}],
+        effective_task_id="task-1",
+    )
+
+    assert result["completed"] is False
+    from agent.runtime_usage import snapshot_agent_usage
+
+    usage = snapshot_agent_usage(agent)
+    assert usage["completeness"] == "unavailable"
+    assert usage["warnings"] == [
+        "no_provider_usage_reported",
+        "primary:codex_app_server_turn_dispatched_usage_unavailable",
+    ]
+
+
 def test_codex_turn_persists_each_message_exactly_once():
     """The user turn (flushed at turn start) must not be duplicated; the
     projected assistant message must land once.  Uses a real SessionDB and the

@@ -1855,6 +1855,18 @@ def _apply_summary_budget(results: List[Dict[str, Any]], parent_agent) -> None:
         )
 
 
+def _best_effort_child_usage_snapshot(child: Any) -> Optional[Dict[str, Any]]:
+    """Snapshot child usage without letting instrumentation fail delegation."""
+
+    try:
+        from agent.runtime_usage import snapshot_agent_usage
+
+        return snapshot_agent_usage(child)
+    except Exception:
+        logger.debug("Subagent usage snapshot failed", exc_info=True)
+        return None
+
+
 def _run_single_child(
     task_index: int,
     goal: str,
@@ -2169,6 +2181,7 @@ def _run_single_child(
                 "api_calls": child_api_calls,
                 "duration_seconds": duration,
                 "_child_role": getattr(child, "_delegate_role", None),
+                "_child_usage": _best_effort_child_usage_snapshot(child),
                 "diagnostic_path": diagnostic_path,
             }
         finally:
@@ -2292,6 +2305,9 @@ def _run_single_child(
                 )
                 else 0.0
             ),
+            # Private rollup payload. The parent consumes and removes this
+            # before returning the delegate_task result to the model.
+            "_child_usage": _best_effort_child_usage_snapshot(child),
         }
         if status == "failed":
             entry["error"] = result.get("error", "Subagent did not produce a response.")
@@ -2416,6 +2432,7 @@ def _run_single_child(
             "child_session_id": _string_attr(child, "session_id"),
             "subagent_id": _subagent_id,
             "_child_role": getattr(child, "_delegate_role", None),
+            "_child_usage": _best_effort_child_usage_snapshot(child),
         }
 
     finally:
@@ -2885,6 +2902,77 @@ def delegate_task(
         for entry in results:
             child_role = entry.pop("_child_role", None)
             child_cost = entry.pop("_child_cost_usd", 0.0)
+            child_usage = entry.pop("_child_usage", None)
+            if parent_agent is not None and isinstance(child_usage, dict):
+                try:
+                    from agent.runtime_usage import rollup_delegated_usage
+                    rollup_delegated_usage(
+                        parent_agent,
+                        child_usage,
+                        child_session_id=entry.get("child_session_id"),
+                    )
+                    if entry.get("status") in {"timeout", "interrupted"}:
+                        from agent.runtime_usage import mark_delegated_usage_uncertain
+                        mark_delegated_usage_uncertain(
+                            parent_agent,
+                            reason=f"child_{entry.get('status')}_before_final_usage",
+                        )
+                    # The public child token summary now describes the same
+                    # complete-or-qualified child aggregate that was rolled up,
+                    # rather than silently exposing only the child's parent loop.
+                    _child_input = child_usage.get("input_tokens")
+                    _child_output = child_usage.get("output_tokens")
+                    _valid_child_input = (
+                        isinstance(_child_input, int)
+                        and not isinstance(_child_input, bool)
+                        and _child_input >= 0
+                    )
+                    _valid_child_output = (
+                        isinstance(_child_output, int)
+                        and not isinstance(_child_output, bool)
+                        and _child_output >= 0
+                    )
+                    _public_child_total = (
+                        _child_input + _child_output
+                        if _valid_child_input and _valid_child_output
+                        else child_usage.get("total_tokens", 0)
+                    )
+                    _public_completeness = child_usage.get(
+                        "completeness", "partial"
+                    )
+                    if entry.get("status") in {"timeout", "interrupted"}:
+                        _public_completeness = "partial"
+                    entry["tokens"] = {
+                        "input": _child_input if _valid_child_input else 0,
+                        "output": _child_output if _valid_child_output else 0,
+                        "total": _public_child_total,
+                        "completeness": _public_completeness,
+                    }
+                except Exception:
+                    logger.debug("Subagent usage rollup failed", exc_info=True)
+                    try:
+                        from agent.runtime_usage import mark_delegated_usage_uncertain
+                        mark_delegated_usage_uncertain(
+                            parent_agent,
+                            reason="child_usage_rollup_failed",
+                        )
+                    except Exception:
+                        logger.debug(
+                            "Subagent usage uncertainty marker failed",
+                            exc_info=True,
+                        )
+            elif parent_agent is not None:
+                try:
+                    from agent.runtime_usage import mark_delegated_usage_uncertain
+                    mark_delegated_usage_uncertain(
+                        parent_agent,
+                        reason="child_usage_snapshot_missing",
+                    )
+                except Exception:
+                    logger.debug(
+                        "Missing subagent usage uncertainty marker failed",
+                        exc_info=True,
+                    )
             try:
                 if child_cost:
                     _children_cost_total += float(child_cost)

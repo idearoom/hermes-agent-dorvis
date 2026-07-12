@@ -1192,6 +1192,127 @@ class TestSubagentCostRollup(unittest.TestCase):
         # Parent cost unchanged.
         self.assertEqual(parent.session_estimated_cost_usd, 0.10)
         self.assertEqual(len(result["results"]), 1)
+        from agent.runtime_usage import snapshot_agent_usage
+        usage = snapshot_agent_usage(parent)
+        self.assertEqual(usage["completeness"], "unavailable")
+        self.assertIn(
+            "delegated:child_usage_snapshot_missing",
+            usage["warnings"],
+        )
+
+    def test_completed_child_usage_rolls_once_and_private_payload_is_removed(self):
+        parent = self._make_parent_with_cost_counters()
+        child_usage = {
+            "input_tokens": 15,
+            "output_tokens": 4,
+            "total_tokens": 19,
+            "completeness": "complete",
+            "warnings": [],
+            "breakdown": {
+                "parent": {
+                    "input_tokens": 10,
+                    "output_tokens": 3,
+                    "total_tokens": 13,
+                },
+                "auxiliary": {
+                    "input_tokens": 5,
+                    "output_tokens": 1,
+                    "total_tokens": 6,
+                },
+                "delegated": {
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "total_tokens": 0,
+                },
+            },
+        }
+        with patch("tools.delegate_tool._run_single_child") as mock_run:
+            mock_run.return_value = {
+                "task_index": 0,
+                "status": "completed",
+                "summary": "done",
+                "api_calls": 1,
+                "duration_seconds": 0.5,
+                "_child_role": "leaf",
+                "_child_cost_usd": 0.0,
+                "_child_usage": child_usage,
+            }
+            result = json.loads(delegate_task(goal="aggregate", parent_agent=parent))
+
+        public = result["results"][0]
+        self.assertNotIn("_child_usage", public)
+        self.assertEqual(
+            public["tokens"],
+            {
+                "input": 15,
+                "output": 4,
+                "total": 19,
+                "completeness": "complete",
+            },
+        )
+        from agent.runtime_usage import snapshot_agent_usage
+
+        usage = snapshot_agent_usage(parent)
+        self.assertEqual(usage["breakdown"]["delegated"]["total_tokens"], 19)
+        self.assertEqual(usage["total_tokens"], 19)
+
+    def test_timed_out_child_rollup_is_always_partial(self):
+        parent = self._make_parent_with_cost_counters()
+        with patch("tools.delegate_tool._run_single_child") as mock_run:
+            mock_run.return_value = {
+                "task_index": 0,
+                "status": "timeout",
+                "summary": None,
+                "error": "timed out",
+                "api_calls": 1,
+                "duration_seconds": 1.0,
+                "_child_usage": {
+                    "input_tokens": 8,
+                    "output_tokens": 2,
+                    "total_tokens": 10,
+                    "completeness": "complete",
+                    "warnings": [],
+                    "breakdown": {},
+                },
+            }
+            delegate_task(goal="slow", parent_agent=parent)
+
+        from agent.runtime_usage import snapshot_agent_usage
+
+        usage = snapshot_agent_usage(parent)
+        self.assertEqual(usage["completeness"], "partial")
+        self.assertEqual(usage["breakdown"]["delegated"]["total_tokens"], 10)
+        self.assertIn(
+            "delegated:child_timeout_before_final_usage",
+            usage["warnings"],
+        )
+
+    def test_snapshot_failure_does_not_turn_completed_child_into_error(self):
+        parent = self._make_parent_with_cost_counters()
+        with (
+            patch("run_agent.AIAgent") as MockAgent,
+            patch(
+                "agent.runtime_usage.snapshot_agent_usage",
+                side_effect=RuntimeError("instrumentation failed"),
+            ),
+        ):
+            child = MagicMock()
+            child.model = "claude-sonnet-4-6"
+            child.session_prompt_tokens = 2
+            child.session_completion_tokens = 1
+            child.session_estimated_cost_usd = 0.0
+            child.run_conversation.return_value = {
+                "final_response": "done",
+                "completed": True,
+                "interrupted": False,
+                "api_calls": 1,
+                "messages": [],
+            }
+            MockAgent.return_value = child
+            result = json.loads(delegate_task(goal="work", parent_agent=parent))
+
+        self.assertEqual(result["results"][0]["status"], "completed")
+        self.assertEqual(result["results"][0]["summary"], "done")
 
 
 class TestBlockedTools(unittest.TestCase):

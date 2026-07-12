@@ -11,7 +11,7 @@ from __future__ import annotations
 import hashlib
 import logging
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any
+from typing import Any, Mapping
 
 from agent.auxiliary_client import call_llm
 from agent.message_content import flatten_message_text
@@ -48,6 +48,8 @@ class _RefAccounting:
 
     __slots__ = (
         "usage",
+        "usage_complete",
+        "usage_warnings",
         "cost_usd",
         "cost_status",
         "cost_source",
@@ -65,6 +67,8 @@ class _RefAccounting:
         cost_status: str | None = None,
         cost_source: str | None = None,
         *,
+        usage_complete: bool = True,
+        usage_warnings: Any = None,
         messages: Any = None,
         output: str | None = None,
         model: str | None = None,
@@ -72,6 +76,10 @@ class _RefAccounting:
         temperature: Any = None,
     ):
         self.usage = usage
+        self.usage_complete = bool(usage_complete)
+        self.usage_warnings = tuple(
+            str(value) for value in (usage_warnings or ()) if value
+        )
         self.cost_usd = cost_usd
         self.cost_status = cost_status
         self.cost_source = cost_source
@@ -279,9 +287,10 @@ def _run_reference(
     real maximum); ``temperature`` is only the user's configured preset value,
     which call_llm may still override per model.
 
-    The reference's token usage is normalized with the slot's OWN resolved
-    provider/api_mode (advisors may run on a different provider than the
-    aggregator, with different usage wire shapes) and returned as a
+    The reference's token usage is normalized from ``call_llm``'s public
+    OpenAI-chat-shaped adapter response, then priced with the slot's OWN
+    resolved provider/model (advisors may run on a different provider than the
+    aggregator) and returned as a
     ``CanonicalUsage`` so the caller can fold advisor spend into session
     accounting. Without this, the entire reference fan-out — often the bulk of
     a MoA turn's token spend — is invisible to cost tracking, which only ever
@@ -296,12 +305,14 @@ def _run_reference(
 
     label = _slot_label(slot)
     runtime = _slot_runtime(slot)
+    usage = CanonicalUsage(request_count=0)
+    usage_warnings: set[str] = set()
+    messages = [{"role": "system", "content": _REFERENCE_SYSTEM_PROMPT}, *ref_messages]
     try:
         # Prepend the advisory-role system prompt so the reference understands
         # it is analyzing state for an aggregator, not acting on the task. The
         # trimmed view (_reference_messages) already strips the agent's own
         # system prompt, so this is the only system message the reference sees.
-        messages = [{"role": "system", "content": _REFERENCE_SYSTEM_PROMPT}, *ref_messages]
         # Apply the same Anthropic-style prompt-caching decoration the main
         # agent loop applies (system_and_3 breakpoints). The advisory view is
         # append-only across iterations (new turns append before the trailing
@@ -314,25 +325,64 @@ def _run_reference(
         # (their caching is automatic; markers are ignored harmlessly, but we
         # only decorate when the policy says the route honors them).
         messages = _maybe_apply_moa_cache_control(messages, runtime)
-        response = call_llm(
-            task="moa_reference",
-            messages=messages,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            reasoning_config=_slot_reasoning_config(slot),
-            **runtime,
+        # ``call_llm`` can dispatch multiple provider attempts internally
+        # (transient retry, parameter recovery, credential/provider fallback)
+        # before returning one final response. Observe every dispatch so a
+        # hidden timeout cannot be erased by a later success, and count exact
+        # usage from distinct invalid responses once. MoA reference tokens are
+        # intentionally NOT added to the central auxiliary bucket; this local
+        # aggregate is folded into the acting primary bucket below.
+        from agent.runtime_usage import (
+            observe_auxiliary_attempts,
+            usage_has_exact_input_output,
         )
-        usage = CanonicalUsage()
-        raw_usage = getattr(response, "usage", None)
-        if raw_usage:
+
+        observed_responses: dict[int, Any] = {}
+
+        def _observe_attempt(*, response: Any = None, reason: Any = None) -> None:
+            nonlocal usage
+            if reason:
+                usage_warnings.add(str(reason))
+                return
+            response_key = id(response)
+            if observed_responses.get(response_key) is response:
+                return
+            observed_responses[response_key] = response
+            raw_usage = (
+                response.get("usage")
+                if isinstance(response, Mapping)
+                else getattr(response, "usage", None)
+            )
+            if raw_usage is None:
+                usage_warnings.add("provider_response_missing_usage")
+                return
+            if not usage_has_exact_input_output(raw_usage):
+                usage_warnings.add("usage_components_missing_invalid_or_mismatched")
             try:
-                usage = normalize_usage(
+                usage = usage + normalize_usage(
                     raw_usage,
-                    provider=runtime.get("provider"),
-                    api_mode=runtime.get("api_mode"),
+                    # ``call_llm``'s public contract is an OpenAI-chat-shaped
+                    # response even when its underlying route is native
+                    # Anthropic or Codex Responses. Normalize the adapter's
+                    # returned shape; the underlying provider still governs
+                    # pricing below.
+                    api_mode="chat_completions",
                 )
             except Exception:  # pragma: no cover - defensive
-                usage = CanonicalUsage()
+                usage_warnings.add("usage_normalization_failed")
+
+        with observe_auxiliary_attempts(_observe_attempt):
+            response = call_llm(
+                task="moa_reference",
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                reasoning_config=_slot_reasoning_config(slot),
+                **runtime,
+            )
+        # Defensive compatibility for a custom call_llm implementation that
+        # returns a response without using the central dispatch wrapper.
+        _observe_attempt(response=response)
         # Price this advisor at ITS OWN model/provider rate (with correct
         # cache-read/cache-write split), not the aggregator's. This is why
         # advisor cost is summed as dollars rather than by folding tokens into
@@ -359,6 +409,8 @@ def _run_reference(
             cost_usd,
             cost_status,
             cost_source,
+            usage_complete=not usage_warnings,
+            usage_warnings=sorted(usage_warnings),
             messages=messages,
             output=_output_text,
             model=slot.get("model"),
@@ -368,9 +420,12 @@ def _run_reference(
         return label, _output_text, acct
     except Exception as exc:
         logger.warning("MoA reference model %s failed: %s", label, exc)
+        usage_warnings.add("reference_failed")
         return label, f"[failed: {exc}]", _RefAccounting(
-            CanonicalUsage(),
-            messages=[{"role": "system", "content": _REFERENCE_SYSTEM_PROMPT}, *ref_messages],
+            usage,
+            usage_complete=False,
+            usage_warnings=sorted(usage_warnings),
+            messages=messages,
             output=f"[failed: {exc}]",
             model=slot.get("model"),
             provider=runtime.get("provider") or slot.get("provider"),
@@ -416,7 +471,11 @@ def _run_references_parallel(
                 results[idx] = (
                     _slot_label(slot),
                     "[skipped: MoA presets cannot recursively reference MoA]",
-                    _RefAccounting(CanonicalUsage()),
+                    _RefAccounting(
+                        CanonicalUsage(request_count=0),
+                        usage_complete=False,
+                        usage_warnings=("recursive_reference_skipped",),
+                    ),
                 )
                 continue
             futures[
@@ -814,28 +873,30 @@ class MoAChatCompletions:
         # for free, without re-firing on a pure no-op re-call.
         self._ref_cache_key: tuple | None = None
         self._ref_cache_outputs: list[tuple[str, str, Any]] = []
-        # Token usage + estimated cost of the reference fan-out from the most
-        # recent cache-MISS create() call, awaiting consumption by session
-        # accounting. Set on every create() (zeroed on a cache HIT so per-turn
-        # advisor spend is counted exactly once). Consumed via
+        # Unconsumed token usage + estimated cost from reference fan-outs.
+        # Cache hits never add spend, but they also must not erase a prior
+        # cache-miss result when an aggregator failure/retry re-enters create()
+        # before the conversation loop consumes it. Consumed exactly once via
         # ``consume_reference_usage``.
         from agent.usage_pricing import CanonicalUsage
 
-        self._pending_reference_usage: Any = CanonicalUsage()
+        self._pending_reference_usage: Any = CanonicalUsage(request_count=0)
         self._pending_reference_cost: Any = None
+        self._pending_reference_usage_warnings: tuple[str, ...] = ()
         # Resolved aggregator slot ({provider, model, ...}) from the most recent
         # create(); read by session cost accounting to price the aggregator's
         # acting turn at its real model instead of the virtual preset name.
         self.last_aggregator_slot: Any = None
         # Full-turn trace parts stashed on a cache-MISS create(), awaiting the
         # caller to stitch in the live session_id + resolved aggregator output
-        # and flush to the trace file (only when moa.save_traces is on).
+        # and flush to the trace file (only when moa.save_traces is on). A
+        # cache-hit retry preserves an unconsumed trace.
         self._pending_trace: Any = None
 
-    def consume_reference_usage(self) -> tuple[Any, Any]:
-        """Pop pending reference-fan-out usage + cost, resetting both to empty.
+    def consume_reference_usage(self) -> tuple[Any, Any, tuple[str, ...]]:
+        """Pop pending reference usage, cost, and completeness warnings.
 
-        Returns ``(CanonicalUsage, cost_usd_or_None)`` for the most recent
+        Returns ``(CanonicalUsage, cost_usd_or_None, warnings)`` for the most recent
         ``create()`` and clears the pending values, so a subsequent read (e.g.
         a streaming retry re-entering accounting) cannot double-count. Usage is
         always a ``CanonicalUsage`` (zeroed if none); cost is a summed-dollars
@@ -843,11 +904,13 @@ class MoAChatCompletions:
         """
         from agent.usage_pricing import CanonicalUsage
 
-        usage = self._pending_reference_usage or CanonicalUsage()
+        usage = self._pending_reference_usage or CanonicalUsage(request_count=0)
         cost = self._pending_reference_cost
-        self._pending_reference_usage = CanonicalUsage()
+        warnings = self._pending_reference_usage_warnings
+        self._pending_reference_usage = CanonicalUsage(request_count=0)
         self._pending_reference_cost = None
-        return usage, cost
+        self._pending_reference_usage_warnings = ()
+        return usage, cost, warnings
 
     def consume_and_save_trace(
         self, session_id: Any = None, aggregator_output_fallback: Any = None
@@ -855,9 +918,10 @@ class MoAChatCompletions:
         """Flush the pending full-turn trace to disk, if one is pending.
 
         No-op when tracing is off (``save_moa_turn`` checks the config), when
-        there is no pending trace (a cache-HIT iteration ran no references), or
-        when the aggregator input was never recorded. Clears the pending trace
-        so a repeat consume cannot double-write. Best-effort — never raises.
+        there is no pending trace, or when the aggregator input was never
+        recorded. A cache-hit retry can still complete an earlier unconsumed
+        trace. Clears the pending trace so a repeat consume cannot double-write.
+        Best-effort — never raises.
 
         ``aggregator_output_fallback`` is the aggregator's resolved acting text
         as the caller already holds it in memory (the streamed assistant text).
@@ -995,15 +1059,11 @@ class MoAChatCompletions:
         if _refs_from_cache:
             reference_outputs = list(self._ref_cache_outputs)
             # References already ran (and were accounted) earlier this turn;
-            # this create() is a repeat tool-iteration reusing the cached
-            # advice. Charging their tokens/cost again here would multiply
-            # advisor spend by the tool-iteration count, so pending is zero.
-            self._pending_reference_usage = CanonicalUsage()
-            self._pending_reference_cost = None
-            # Likewise no trace on a cache HIT — the full turn was already
-            # traced on the MISS that ran the references. A repeat iteration is
-            # not a new MoA turn.
-            self._pending_trace = None
+            # this create() is an aggregator retry/re-entry reusing cached
+            # advice. Do not add the references again, but also do not erase
+            # accounting that the conversation loop has not consumed yet.
+            # Once consumed, these pending fields are already zero, so an
+            # ordinary later cache hit remains a no-charge reuse.
         else:
             reference_outputs = _run_references_parallel(
                 reference_models,
@@ -1016,32 +1076,47 @@ class MoAChatCompletions:
             # Sum the advisor fan-out's token usage AND cost so the caller can
             # fold advisor spend into session accounting exactly once per turn.
             # Only the freshly run references (cache MISS) contribute; a cache
-            # HIT above zeroes this. Token counts sum directly (each already
+            # HIT above contributes nothing. Token counts sum directly (each already
             # normalized per-advisor provider/api_mode); cost sums in dollars
             # because each advisor was priced at its OWN model rate — advisors
             # may be cheaper/pricier than the aggregator, so their tokens must
             # NOT be repriced at the aggregator's rate.
-            _ref_usage = CanonicalUsage()
+            _ref_usage = CanonicalUsage(request_count=0)
             _ref_cost: Any = None
+            _ref_usage_warnings: set[str] = set()
             for _lbl, _txt, _acct in reference_outputs:
                 if isinstance(_acct, _RefAccounting):
                     if isinstance(_acct.usage, CanonicalUsage):
                         _ref_usage = _ref_usage + _acct.usage
                     if _acct.cost_usd is not None:
                         _ref_cost = (_ref_cost or 0) + _acct.cost_usd
-            self._pending_reference_usage = _ref_usage
-            self._pending_reference_cost = _ref_cost
+                    if not _acct.usage_complete:
+                        _ref_usage_warnings.update(_acct.usage_warnings)
+            self._pending_reference_usage = (
+                self._pending_reference_usage + _ref_usage
+            )
+            if _ref_cost is not None:
+                self._pending_reference_cost = (
+                    (self._pending_reference_cost or 0) + _ref_cost
+                )
+            self._pending_reference_usage_warnings = tuple(
+                sorted(
+                    set(self._pending_reference_usage_warnings)
+                    | _ref_usage_warnings
+                )
+            )
             # Stash the full reference fan-out for trace persistence. The
             # aggregator input/label are filled in below once agg_messages is
             # built; the aggregator OUTPUT is stitched in by the caller
             # (consume_and_save_trace) once the response resolves — the caller
             # holds the live session_id and the resolved aggregator response.
-            self._pending_trace = {
-                "preset": self.preset_name,
-                "reference_outputs": list(reference_outputs),
-                "aggregator_slot": aggregator,
-                "aggregator_temperature": aggregator_temperature,
-            }
+            if self._pending_trace is None:
+                self._pending_trace = {
+                    "preset": self.preset_name,
+                    "reference_outputs": list(reference_outputs),
+                    "aggregator_slot": aggregator,
+                    "aggregator_temperature": aggregator_temperature,
+                }
 
             # Surface each reference model's answer to the display BEFORE the
             # aggregator acts — once per turn (only on the iteration that

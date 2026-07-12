@@ -1654,7 +1654,16 @@ def _compress_context_via_codex_app_server(
     except Exception:
         pass
 
-    result = codex_session.compact_thread()
+    try:
+        result = codex_session.compact_thread()
+    except BaseException:
+        from agent.runtime_usage import mark_primary_dispatch_uncertain
+
+        mark_primary_dispatch_uncertain(
+            agent,
+            reason="codex_compaction_dispatched_usage_unavailable",
+        )
+        raise
     if getattr(result, "should_retire", False):
         try:
             codex_session.close()
@@ -1663,9 +1672,34 @@ def _compress_context_via_codex_app_server(
         agent._codex_session = None
 
     if getattr(result, "interrupted", False) or getattr(result, "error", None):
+        from agent.runtime_usage import mark_primary_dispatch_uncertain
+
+        mark_primary_dispatch_uncertain(
+            agent,
+            reason="codex_compaction_dispatched_usage_unavailable",
+        )
+        # Some failed compactions still include a terminal tokenUsage update.
+        # Preserve those known counts as captured usage while retaining the
+        # uncertainty warning for work that may have happened after/beyond the
+        # last reported frame.
+        if getattr(result, "token_usage_last", None):
+            try:
+                from agent.codex_runtime import _record_codex_app_server_usage
+
+                _record_codex_app_server_usage(agent, result)
+            except Exception:
+                logger.debug(
+                    "codex failed-compaction usage bookkeeping failed",
+                    exc_info=True,
+                )
+                mark_primary_dispatch_uncertain(
+                    agent,
+                    reason="codex_compaction_usage_bookkeeping_failed",
+                )
         try:
             agent._emit_warning(
-                f"⚠ Codex app-server compaction failed: {result.error}"
+                "⚠ Codex app-server compaction failed: "
+                f"{getattr(result, 'error', None) or 'interrupted'}"
             )
         except Exception:
             pass
@@ -1694,6 +1728,12 @@ def _compress_context_via_codex_app_server(
             _record_codex_app_server_usage(agent, result)
     except Exception:
         logger.debug("codex compaction bookkeeping failed", exc_info=True)
+        from agent.runtime_usage import mark_primary_dispatch_uncertain
+
+        mark_primary_dispatch_uncertain(
+            agent,
+            reason="codex_compaction_usage_bookkeeping_failed",
+        )
 
     try:
         from tools.file_tools import reset_file_dedup

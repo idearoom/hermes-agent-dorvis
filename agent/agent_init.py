@@ -2086,6 +2086,11 @@ def init_agent(
     agent.session_estimated_cost_usd = 0.0
     agent.session_cost_status = "unknown"
     agent.session_cost_source = "none"
+    # Separate run-attribution buckets preserve the primary counters above for
+    # context/session behavior while letting gateway responses report actual
+    # parent + auxiliary + delegated model usage with completeness semantics.
+    from agent.runtime_usage import initialize_agent_usage_attribution
+    initialize_agent_usage_attribution(agent)
     
     # ── Ollama num_ctx injection ──
     # Ollama defaults to 2048 context regardless of the model's capabilities.
