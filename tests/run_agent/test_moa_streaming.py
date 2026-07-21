@@ -144,18 +144,19 @@ def test_create_does_not_forward_timeout_when_not_streaming(monkeypatch, tmp_pat
 # call_llm-level: stream branch returns the raw SDK stream
 # --------------------------------------------------------------------------
 
-def test_call_llm_stream_returns_raw_stream_and_skips_validation(monkeypatch):
-    """call_llm(stream=True) returns the client's raw stream object directly,
+def test_call_llm_stream_returns_observed_stream_and_skips_validation(monkeypatch):
+    """call_llm(stream=True) transparently proxies the client's stream,
     attaches stream/stream_options to the request, and does NOT run response
     validation (which assumes a complete response)."""
     from agent import auxiliary_client as ac
 
     captured = {}
+    raw_stream = iter(["chunk-1", "chunk-2"])
 
     class _Completions:
         def create(self, **kwargs):
             captured.update(kwargs)
-            return "RAW_STREAM"
+            return raw_stream
 
     fake_client = SimpleNamespace(
         chat=SimpleNamespace(completions=_Completions()),
@@ -181,7 +182,8 @@ def test_call_llm_stream_returns_raw_stream_and_skips_validation(monkeypatch):
         stream_options={"include_usage": True},
     )
 
-    assert out == "RAW_STREAM"
+    assert out._stream is raw_stream
+    assert list(out) == ["chunk-1", "chunk-2"]
     assert captured.get("stream") is True
     assert captured.get("stream_options") == {"include_usage": True}
 

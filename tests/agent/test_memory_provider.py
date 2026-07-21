@@ -5,7 +5,7 @@ import threading
 import time
 import pytest
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from agent.memory_provider import MemoryProvider
 from agent.memory_manager import MemoryManager, inject_memory_provider_tools
@@ -262,6 +262,37 @@ class TestMemoryManager:
         mgr.flush_pending(timeout=5)
         assert p1.synced_turns == [("user msg", "assistant msg")]
         assert p2.synced_turns == [("user msg", "assistant msg")]
+
+    def test_sync_all_emits_accepted_write_after_each_provider_returns(self):
+        mgr = MemoryManager()
+        mgr.add_provider(FakeMemoryProvider("hindsight"))
+        captured = []
+
+        with (
+            patch(
+                "agent.runtime_usage.current_observer_context",
+                return_value={
+                    "session_id": "sess-observed",
+                    "task_id": "task-1",
+                    "turn_id": "turn-1",
+                    "request_metadata": {"source": "dorvis-web"},
+                },
+            ),
+            patch(
+                "hermes_cli.plugins.invoke_hook",
+                side_effect=lambda name, **kwargs: captured.append((name, kwargs)),
+            ),
+        ):
+            mgr.sync_all("user msg", "assistant msg", session_id="sess-observed")
+            assert mgr.flush_pending(timeout=5)
+
+        assert [name for name, _ in captured] == ["memory_write"]
+        payload = captured[0][1]
+        assert payload["provider"] == "hindsight"
+        assert payload["action"] == "sync_turn"
+        assert payload["status"] == "accepted"
+        assert payload["session_id"] == "sess-observed"
+        assert payload["request_metadata"] == {"source": "dorvis-web"}
 
     def test_sync_all_passes_messages_to_opted_in_provider(self):
         mgr = MemoryManager()
@@ -1221,6 +1252,53 @@ class TestOnMemoryWriteBridge:
         )
 
         assert p.memory_writes == [("add", "user", "legacy provider fact")]
+
+    def test_committed_memory_tool_write_emits_one_typed_observer_event(self):
+        mgr = MemoryManager()
+        p = MetadataMemoryProvider("ext")
+        mgr.add_provider(p)
+        captured = []
+
+        with patch(
+            "hermes_cli.plugins.invoke_hook",
+            side_effect=lambda name, **kwargs: captured.append((name, kwargs)),
+        ):
+            mgr.notify_memory_tool_write(
+                {"success": True},
+                {"action": "add", "target": "user", "content": "prefers dark mode"},
+                build_metadata=lambda: {
+                    "session_id": "session-memory-write",
+                    "turn_id": "turn-memory-write",
+                    "tool_call_id": "tool-memory-write",
+                    "request_metadata": {"source": "dorvis-web"},
+                },
+            )
+
+        assert p.memory_writes[0][:3] == ("add", "user", "prefers dark mode")
+        assert [name for name, _ in captured] == ["memory_write"]
+        payload = captured[0][1]
+        assert payload["status"] == "committed"
+        assert payload["action"] == "add"
+        assert payload["target"] == "user"
+        assert payload["content"] == "prefers dark mode"
+        assert payload["session_id"] == "session-memory-write"
+        assert payload["turn_id"] == "turn-memory-write"
+        assert payload["tool_call_id"] == "tool-memory-write"
+
+    def test_uncommitted_memory_tool_result_emits_no_write_event(self):
+        mgr = MemoryManager()
+        captured = []
+
+        with patch(
+            "hermes_cli.plugins.invoke_hook",
+            side_effect=lambda name, **kwargs: captured.append((name, kwargs)),
+        ):
+            mgr.notify_memory_tool_write(
+                {"success": False},
+                {"action": "add", "target": "user", "content": "not committed"},
+            )
+
+        assert captured == []
 
     def test_on_memory_write_replace(self):
         """on_memory_write fires for 'replace' actions."""

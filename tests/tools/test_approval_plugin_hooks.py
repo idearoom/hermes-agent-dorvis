@@ -193,8 +193,9 @@ class TestSmartModeFiresHooks:
         assert [name for name, _ in captured] == [
             "pre_approval_request",
             "post_approval_response",
+            "guardrail_decision",
         ]
-        pre, post = (kwargs for _, kwargs in captured)
+        pre, post = (kwargs for _, kwargs in captured[:2])
         assert pre["surface"] == post["surface"] == "smart"
         assert post["choice"] == choice
         assert post["decided_by"] == "aux_llm"
@@ -206,6 +207,32 @@ class TestSmartModeFiresHooks:
         if pattern_key is not None:
             assert pre["pattern_key"] == pattern_key
             assert pre["pattern_keys"] == [pattern_key]
+
+        decision = captured[-1][1]
+        assert decision["canonical_name"] == "approval"
+        assert decision["decision"] == ("allow" if approved else "deny")
+        assert decision["decided_by"] == "aux_llm"
+        assert decision["status"] == "ok"
+
+    def test_yolo_bypass_emits_typed_guardrail_decision(
+        self, isolated_session, monkeypatch
+    ):
+        monkeypatch.setattr(approval_module, "_YOLO_MODE_FROZEN", True)
+        captured = []
+
+        with patch(
+            "hermes_cli.plugins.invoke_hook",
+            side_effect=lambda name, **kwargs: captured.append((name, kwargs)),
+        ):
+            result = check_all_command_guards("rm -rf /tmp/yolo-observer", "local")
+
+        assert result["approved"] is True
+        assert [name for name, _ in captured] == ["guardrail_decision"]
+        payload = captured[0][1]
+        assert payload["canonical_name"] == "approval"
+        assert payload["decision"] == "bypass"
+        assert payload["decided_by"] == "yolo"
+        assert payload["status"] == "ok"
 
     @pytest.mark.parametrize("guard,value", [
         (check_all_command_guards, "rm -rf /tmp/smart-order"),
@@ -233,6 +260,7 @@ class TestSmartModeFiresHooks:
             "pre_approval_request",
             "smart_approve",
             "post_approval_response",
+            "guardrail_decision",
         ]
 
     @pytest.mark.parametrize("guard,value", [
@@ -256,7 +284,10 @@ class TestSmartModeFiresHooks:
             result = guard(value, "local")
 
         assert result["approved"] is True
-        assert force_values == [True, True]
+        # Smart-decision observers redact the request/response pair; the
+        # normalized guardrail observer independently redacts its subject,
+        # description, and message.
+        assert force_values == [True, True, True, True, True]
 
     @pytest.mark.parametrize("guard,value", [
         (check_all_command_guards, "rm -rf /tmp/smart-hook-crash"),
@@ -341,5 +372,3 @@ class TestSmartModeFiresHooks:
             "smart_approve",
             "smart_deny",
         ]
-
-

@@ -3924,5 +3924,151 @@ def request_elicitation_consent(
     return "decline"
 
 
+def _guardrail_decision_payload(result: dict, *, surface: str) -> dict:
+    approved = result.get("approved") is True
+    outcome = str(result.get("outcome") or "").strip()
+    if result.get("smart_approved"):
+        decision, decided_by = "allow", "aux_llm"
+    elif result.get("smart_denied"):
+        decision, decided_by = "deny", "aux_llm"
+    elif result.get("user_approved"):
+        decision, decided_by = "allow", "human"
+    elif result.get("user_consent") is False:
+        decision = "timeout" if outcome == "timeout" else "deny"
+        decided_by = "human"
+    elif result.get("approval_pending") or result.get("status") == "approval_required":
+        decision, decided_by = "pending", "human"
+    elif approved and (_YOLO_MODE_FROZEN or is_current_session_yolo_enabled()):
+        decision, decided_by = "bypass", "yolo"
+    elif approved and _get_approval_mode() == "off":
+        decision, decided_by = "bypass", "config"
+    elif approved and surface in {"docker", "modal", "daytona", "singularity", "vercel_sandbox"}:
+        decision, decided_by = "bypass", "sandbox"
+    elif approved:
+        decision, decided_by = "allow", "policy"
+    else:
+        decision, decided_by = "deny", "policy"
+    return {
+        "decision": decision,
+        "decided_by": decided_by,
+        "status": "cancelled" if decision in {"timeout", "cancelled"} else "ok",
+    }
+
+
+def _emit_guardrail_decision(
+    *,
+    subject: str,
+    surface: str,
+    result: dict,
+    canonical_name: str = "approval",
+) -> None:
+    try:
+        from agent.redact import redact_sensitive_text
+        from agent.runtime_usage import current_observer_context
+        from hermes_cli.plugins import invoke_hook
+
+        context = current_observer_context()
+        session_id = context.get("session_id") or get_current_session_key(default="")
+        if not session_id:
+            return
+        # Guard inputs routinely contain shell commands, code, and credentials.
+        # Observer payload construction is fail-closed while policy execution is
+        # fail-open: if forced redaction fails, skip telemetry and preserve the
+        # decision returned to the caller.
+        safe_subject = redact_sensitive_text(subject, force=True)
+        safe_description = redact_sensitive_text(
+            str(result.get("description") or ""), force=True
+        )
+        safe_message = redact_sensitive_text(
+            str(result.get("message") or ""), force=True
+        )
+        invoke_hook(
+            "guardrail_decision",
+            canonical_name=canonical_name,
+            subject=safe_subject,
+            surface=surface,
+            **_guardrail_decision_payload(result, surface=surface),
+            pattern_key=result.get("pattern_key"),
+            description=safe_description,
+            message=safe_message,
+            session_id=session_id,
+            task_id=context.get("task_id") or "",
+            turn_id=context.get("turn_id") or _approval_turn_id.get(),
+            tool_call_id=_approval_tool_call_id.get(),
+            request_metadata=context.get("request_metadata") or {},
+        )
+    except Exception:
+        # Policy and approval behavior must never depend on telemetry.
+        logger.debug("guardrail_decision hook failed", exc_info=True)
+
+
+def _observe_guard_function(fn, *, surface_arg: int, subject_arg: int = 0):
+    """Wrap a public guard once so every return path gets a terminal event."""
+
+    @functools.wraps(fn)
+    def wrapped(*args, **kwargs):
+        result = fn(*args, **kwargs)
+        surface = str(
+            args[surface_arg]
+            if len(args) > surface_arg
+            else kwargs.get("env_type") or fn.__name__
+        )
+        subject = str(
+            args[subject_arg]
+            if len(args) > subject_arg
+            else kwargs.get("command")
+            or kwargs.get("code")
+            or kwargs.get("tool_name")
+            or ""
+        )
+        _emit_guardrail_decision(subject=subject, surface=surface, result=result)
+        return result
+
+    return wrapped
+
+
+def _observe_elicitation_function(fn):
+    @functools.wraps(fn)
+    def wrapped(message, description, *args, **kwargs):
+        choice = fn(message, description, *args, **kwargs)
+        result = {
+            "approved": choice == "accept",
+            "outcome": "cancelled" if choice == "cancel" else "",
+            "description": description,
+            "message": choice,
+            "user_consent": choice == "accept",
+        }
+        if choice == "cancel":
+            result["user_consent"] = False
+        _emit_guardrail_decision(
+            subject=message,
+            surface=str(kwargs.get("surface") or "mcp-elicitation"),
+            result=result,
+            canonical_name="elicitation",
+        )
+        return choice
+
+    return wrapped
+
+
+# Wrap at module finalization so internal branch structure remains unchanged
+# while every public guard path produces exactly one normalized outcome.
+check_dangerous_command = _observe_guard_function(
+    check_dangerous_command, surface_arg=1
+)
+check_all_command_guards = _observe_guard_function(
+    check_all_command_guards, surface_arg=1
+)
+check_execute_code_guard = _observe_guard_function(
+    check_execute_code_guard, surface_arg=1
+)
+request_tool_approval = _observe_guard_function(
+    request_tool_approval, surface_arg=99
+)
+request_elicitation_consent = _observe_elicitation_function(
+    request_elicitation_consent
+)
+
+
 # Load permanent allowlist from config on module import
 load_permanent_allowlist()

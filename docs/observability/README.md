@@ -156,6 +156,15 @@ API hooks describe provider attempts inside the agent loop:
 The sanitized `request`, `response`, and `error` fields are the canonical
 observer inputs for new consumers.
 
+Auxiliary model work uses the parallel request-scoped family
+`pre_auxiliary_api_request`, `post_auxiliary_api_request`, and
+`auxiliary_api_request_error`. Each central `call_llm` dispatch receives a
+distinct opaque `api_request_id`, even when it is a retry of the same logical
+task. Payloads include `purpose`, effective provider/model/base URL/API mode,
+request/response, timing, terminal usage when available, and structured error.
+Streaming calls close only when the stream is exhausted, errors, or is closed;
+observer failure never changes dispatch or stream behavior.
+
 ### Tool Lifecycle
 
 Tool hooks describe individual tool calls:
@@ -202,6 +211,21 @@ Common fields include `command`, `description`, `pattern_key`,
 Approval hooks are observer-only. Plugins cannot pre-answer or veto approvals
 from these hooks. To prevent a tool from reaching approval, use
 `pre_tool_call` blocking.
+
+`guardrail_decision` is the normalized terminal policy event. It covers
+allow, deny, bypass, pending, timeout, and cancellation outcomes across policy,
+human, auxiliary-model, sandbox, configuration, and yolo decision sources.
+Sensitive command/code fields are forcibly sanitized before the event; a
+sanitization failure skips telemetry without changing the decision.
+
+### Memory Mutation Lifecycle
+
+`memory_write` reports only a write that crossed a real mutation boundary:
+`status=committed` for a successful built-in memory mutation and
+`status=accepted` after an external provider's completed-turn `sync_turn`
+returns. Fields include provider, action, target, content, session/task/turn
+correlation, execution context, and request metadata. Rejected, staged, or
+uncommitted built-in operations do not emit a committed write.
 
 ### Subagent Lifecycle
 

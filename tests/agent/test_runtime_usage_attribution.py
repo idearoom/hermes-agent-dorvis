@@ -3,6 +3,7 @@ import asyncio
 import concurrent.futures
 import gc
 import weakref
+from unittest.mock import patch
 
 from agent.runtime_usage import (
     attribute_auxiliary_usage,
@@ -15,6 +16,7 @@ from agent.runtime_usage import (
     snapshot_agent_usage,
     track_auxiliary_dispatch,
     track_auxiliary_dispatch_async,
+    track_auxiliary_stream_dispatch,
     track_primary_dispatch,
     validate_primary_usage_components,
 )
@@ -107,6 +109,90 @@ def test_contextvar_attribution_propagates_to_tool_worker_context():
 
     usage = snapshot_agent_usage(agent)
     assert usage["breakdown"]["auxiliary"]["total_tokens"] == 10
+
+
+def test_auxiliary_dispatch_emits_one_terminal_observer_generation_per_attempt():
+    agent = _agent(
+        session_id="session-aux-observer",
+        _current_turn_id="turn-aux-observer",
+        _request_metadata={"source": "dorvis-web", "chat": {"id": "chat-1"}},
+    )
+    captured = []
+
+    with patch(
+        "hermes_cli.plugins.invoke_hook",
+        side_effect=lambda name, **kwargs: captured.append((name, kwargs)),
+    ), attribute_auxiliary_usage(agent):
+        response = track_auxiliary_dispatch(
+            lambda: _response(prompt=13, completion=5, total=18),
+            task="compression",
+            provider="openai-codex",
+            model="gpt-5.6-codex",
+            base_url="https://chatgpt.com/backend-api/codex",
+            api_mode="codex_responses",
+            request={"method": "POST", "body": {"messages": [{"role": "user", "content": "compress"}]}},
+        )
+
+    assert response.usage.total_tokens == 18
+    assert [name for name, _ in captured] == [
+        "pre_auxiliary_api_request",
+        "post_auxiliary_api_request",
+    ]
+    started, completed = (payload for _, payload in captured)
+    assert started["api_request_id"] == completed["api_request_id"]
+    assert started["api_request_id"].startswith("aux-")
+    assert started["purpose"] == "compression"
+    assert started["provider"] == "openai-codex"
+    assert started["model"] == "gpt-5.6-codex"
+    assert started["session_id"] == "session-aux-observer"
+    assert started["turn_id"] == "turn-aux-observer"
+    assert started["request"]["body"]["messages"][0]["content"] == "compress"
+    assert completed["usage"] == {
+        "input_tokens": 13,
+        "output_tokens": 5,
+        "total_tokens": 18,
+    }
+    assert completed["api_duration"] >= 0
+    assert completed["request_metadata"]["source"] == "dorvis-web"
+
+
+def test_auxiliary_retry_attempts_have_independent_terminal_error_events():
+    agent = _agent(
+        session_id="session-aux-retry",
+        _current_turn_id="turn-aux-retry",
+        _request_metadata={"source": "dorvis-headless-worker"},
+    )
+    captured = []
+
+    def fail():
+        raise TimeoutError("provider timed out")
+
+    with patch(
+        "hermes_cli.plugins.invoke_hook",
+        side_effect=lambda name, **kwargs: captured.append((name, kwargs)),
+    ), attribute_auxiliary_usage(agent):
+        for _ in range(2):
+            try:
+                track_auxiliary_dispatch(
+                    fail,
+                    task="title_generation",
+                    provider="openrouter",
+                    model="provider/model",
+                    base_url="https://openrouter.ai/api/v1",
+                    request={"method": "POST", "body": {"messages": []}},
+                )
+            except TimeoutError:
+                pass
+
+    starts = [payload for name, payload in captured if name == "pre_auxiliary_api_request"]
+    errors = [payload for name, payload in captured if name == "auxiliary_api_request_error"]
+    assert len(starts) == len(errors) == 2
+    assert len({payload["api_request_id"] for payload in starts}) == 2
+    assert {payload["api_request_id"] for payload in starts} == {
+        payload["api_request_id"] for payload in errors
+    }
+    assert all(payload["error"]["type"] == "TimeoutError" for payload in errors)
+    assert all(payload["ended_at"] for payload in errors)
 
 
 def test_missing_usage_is_never_described_as_a_complete_total():
@@ -514,6 +600,43 @@ def test_auxiliary_fallback_after_dispatched_exception_is_partial():
     assert usage["warnings"] == [
         "auxiliary:compression:dispatched_attempt_usage_unavailable"
     ]
+
+
+def test_auxiliary_stream_observer_terminalizes_after_last_chunk():
+    agent = _agent()
+    agent.session_id = "session-stream"
+    agent._current_task_id = "task-stream"
+    agent._current_turn_id = "turn-stream"
+    agent._request_metadata = {"source": "dorvis-web"}
+    terminal = _response(prompt=4, completion=2, total=6)
+    events = []
+
+    with (
+        attribute_auxiliary_usage(agent),
+        patch(
+            "hermes_cli.plugins.invoke_hook",
+            side_effect=lambda name, **kwargs: events.append((name, kwargs)),
+        ),
+    ):
+        stream = track_auxiliary_stream_dispatch(
+            lambda: iter([SimpleNamespace(usage=None), terminal]),
+            task="moa_aggregator",
+            provider="openrouter",
+            model="aggregate-model",
+            request={"stream": True},
+        )
+        assert list(stream)[-1] is terminal
+
+    assert [name for name, _ in events] == [
+        "pre_auxiliary_api_request",
+        "post_auxiliary_api_request",
+    ]
+    assert events[0][1]["api_request_id"] == events[1][1]["api_request_id"]
+    assert events[1][1]["usage"] == {
+        "input_tokens": 4,
+        "output_tokens": 2,
+        "total_tokens": 6,
+    }
 
 
 def test_auxiliary_attempt_observer_sees_hidden_failure_and_response():

@@ -20,9 +20,12 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from contextvars import ContextVar
+from datetime import datetime, timezone
 import logging
 import threading
+import time
 from typing import Any, Callable, Dict, Iterator, Mapping, Optional, TypeVar
+import uuid
 
 
 _ACTIVE_AGENT: ContextVar[Any] = ContextVar(
@@ -143,12 +146,26 @@ def track_auxiliary_dispatch(
     dispatch: Callable[[], _T],
     *,
     task: Optional[str] = None,
+    provider: Optional[str] = None,
+    model: Optional[str] = None,
+    base_url: Optional[str] = None,
+    api_mode: Optional[str] = None,
+    request: Any = None,
 ) -> _T:
     """Execute and attribute one synchronous auxiliary provider attempt."""
 
+    observer = _begin_auxiliary_observer_attempt(
+        task=task,
+        provider=provider,
+        model=model,
+        base_url=base_url,
+        api_mode=api_mode,
+        request=request,
+    )
     try:
         response = dispatch()
-    except BaseException:
+    except BaseException as exc:
+        _end_auxiliary_observer_attempt(observer, error=exc)
         _notify_auxiliary_attempt_observer(
             response=None,
             reason="dispatched_attempt_usage_unavailable",
@@ -167,19 +184,123 @@ def track_auxiliary_dispatch(
             task=task,
             reason="usage_accounting_failed",
         )
+    _end_auxiliary_observer_attempt(observer, response=response)
     return response
+
+
+class _ObservedAuxiliaryStream:
+    """Transparent iterator proxy that terminalizes telemetry on consumption."""
+
+    def __init__(self, stream: Any, observer: Optional[Dict[str, Any]], *, task: Optional[str]):
+        self._stream = stream
+        self._iterator = iter(stream)
+        self._observer = observer
+        self._task = task
+        self._last_chunk = None
+        self._terminal = False
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        try:
+            chunk = next(self._iterator)
+        except StopIteration:
+            self._finish(response=self._last_chunk)
+            raise
+        except BaseException as exc:
+            self._finish(error=exc)
+            raise
+        self._last_chunk = chunk
+        return chunk
+
+    def _finish(self, *, response: Any = None, error: Optional[BaseException] = None) -> None:
+        if self._terminal:
+            return
+        self._terminal = True
+        _end_auxiliary_observer_attempt(self._observer, response=response, error=error)
+        if error is None and response is not None:
+            try:
+                _record_tracked_auxiliary_response(response, task=self._task)
+            except Exception:
+                logger.debug("Auxiliary stream usage accounting failed", exc_info=True)
+
+    def close(self):
+        close = getattr(self._stream, "close", None)
+        try:
+            if callable(close):
+                return close()
+        finally:
+            if not self._terminal:
+                self._finish(error=RuntimeError("auxiliary stream closed before terminal chunk"))
+
+    def __enter__(self):
+        enter = getattr(self._stream, "__enter__", None)
+        if callable(enter):
+            enter()
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        if exc is not None:
+            self._finish(error=exc)
+        self.close()
+        return False
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._stream, name)
+
+
+def track_auxiliary_stream_dispatch(
+    dispatch: Callable[[], Any],
+    *,
+    task: Optional[str] = None,
+    provider: Optional[str] = None,
+    model: Optional[str] = None,
+    base_url: Optional[str] = None,
+    api_mode: Optional[str] = None,
+    request: Any = None,
+) -> Any:
+    """Dispatch a stream and keep its observer open until consume/close/error."""
+    observer = _begin_auxiliary_observer_attempt(
+        task=task,
+        provider=provider,
+        model=model,
+        base_url=base_url,
+        api_mode=api_mode,
+        request=request,
+    )
+    try:
+        stream = dispatch()
+    except BaseException as exc:
+        _end_auxiliary_observer_attempt(observer, error=exc)
+        raise
+    return _ObservedAuxiliaryStream(stream, observer, task=task)
 
 
 async def track_auxiliary_dispatch_async(
     dispatch: Callable[[], Any],
     *,
     task: Optional[str] = None,
+    provider: Optional[str] = None,
+    model: Optional[str] = None,
+    base_url: Optional[str] = None,
+    api_mode: Optional[str] = None,
+    request: Any = None,
 ) -> Any:
     """Execute and attribute one asynchronous auxiliary provider attempt."""
 
+    observer = _begin_auxiliary_observer_attempt(
+        task=task,
+        provider=provider,
+        model=model,
+        base_url=base_url,
+        api_mode=api_mode,
+        request=request,
+    )
     try:
         response = await dispatch()
-    except BaseException:
+    except BaseException as exc:
+        _end_auxiliary_observer_attempt(observer, error=exc)
         _notify_auxiliary_attempt_observer(
             response=None,
             reason="dispatched_attempt_usage_unavailable",
@@ -198,7 +319,157 @@ async def track_auxiliary_dispatch_async(
             task=task,
             reason="usage_accounting_failed",
         )
+    _end_auxiliary_observer_attempt(observer, response=response)
     return response
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _observer_jsonable(value: Any, *, depth: int = 0) -> Any:
+    """Best-effort JSON projection for observer payloads.
+
+    The downstream adapter owns policy-level capture and bounds. This narrow
+    runtime projection only prevents provider SDK objects from escaping into
+    hooks as opaque or unserialisable values.
+    """
+
+    if depth >= 8:
+        return "<max-depth>"
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, Mapping):
+        return {
+            str(key): _observer_jsonable(item, depth=depth + 1)
+            for key, item in list(value.items())[:200]
+        }
+    if isinstance(value, (list, tuple, set)):
+        return [_observer_jsonable(item, depth=depth + 1) for item in list(value)[:200]]
+    for method_name in ("model_dump", "to_dict", "dict"):
+        method = getattr(value, method_name, None)
+        if callable(method):
+            try:
+                return _observer_jsonable(method(), depth=depth + 1)
+            except Exception:
+                pass
+    try:
+        public = {
+            key: item
+            for key, item in vars(value).items()
+            if not str(key).startswith("_")
+        }
+    except Exception:
+        public = None
+    if public:
+        return _observer_jsonable(public, depth=depth + 1)
+    return str(value)[:20_000]
+
+
+def current_observer_context() -> Dict[str, Any]:
+    """Return invocation-scoped observer correlation for the active agent."""
+
+    agent = _ACTIVE_AGENT.get()
+    if agent is None:
+        return {}
+    return {
+        "session_id": str(getattr(agent, "session_id", "") or ""),
+        "task_id": str(getattr(agent, "_current_task_id", "") or ""),
+        "turn_id": str(getattr(agent, "_current_turn_id", "") or ""),
+        "request_metadata": dict(getattr(agent, "_request_metadata", None) or {}),
+    }
+
+
+def _invoke_observer_hook(name: str, **payload: Any) -> None:
+    if not payload.get("session_id"):
+        return
+    try:
+        from hermes_cli.plugins import invoke_hook
+
+        invoke_hook(name, **payload)
+    except Exception:
+        # Telemetry cannot alter provider execution, retry, or accounting.
+        logger.debug("Auxiliary observer hook %s failed", name, exc_info=True)
+
+
+def _begin_auxiliary_observer_attempt(
+    *,
+    task: Optional[str],
+    provider: Optional[str],
+    model: Optional[str],
+    base_url: Optional[str],
+    api_mode: Optional[str],
+    request: Any,
+) -> Optional[Dict[str, Any]]:
+    context = current_observer_context()
+    if not context.get("session_id"):
+        return None
+    started_at = _utc_now()
+    state = {
+        **context,
+        "api_request_id": f"aux-{uuid.uuid4().hex}",
+        "purpose": _safe_task(task),
+        "provider": str(provider or "unknown"),
+        "model": str(model or "unknown"),
+        "base_url": str(base_url or ""),
+        "api_mode": str(api_mode or "chat_completions"),
+        "started_at": started_at,
+        "request": _observer_jsonable(request),
+        "monotonic_started": time.perf_counter(),
+    }
+    _invoke_observer_hook(
+        "pre_auxiliary_api_request",
+        **{key: value for key, value in state.items() if key != "monotonic_started"},
+    )
+    return state
+
+
+def _observer_usage(response: Any) -> Optional[Dict[str, int]]:
+    input_tokens, output_tokens, total_tokens, _ = _usage_components(
+        _get(response, "usage")
+    )
+    usage = {
+        key: value
+        for key, value in {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "total_tokens": total_tokens,
+        }.items()
+        if value is not None
+    }
+    return usage or None
+
+
+def _end_auxiliary_observer_attempt(
+    state: Optional[Dict[str, Any]],
+    *,
+    response: Any = None,
+    error: Optional[BaseException] = None,
+) -> None:
+    if not state:
+        return
+    ended_at = _utc_now()
+    duration = max(0.0, time.perf_counter() - state["monotonic_started"])
+    common = {
+        key: value
+        for key, value in state.items()
+        if key not in {"monotonic_started", "request"}
+    }
+    common.update({"ended_at": ended_at, "api_duration": duration})
+    if error is not None:
+        _invoke_observer_hook(
+            "auxiliary_api_request_error",
+            **common,
+            error={"type": type(error).__name__, "message": str(error)},
+        )
+        return
+    _invoke_observer_hook(
+        "post_auxiliary_api_request",
+        **common,
+        usage=_observer_usage(response),
+        response=_observer_jsonable(response),
+        response_model=str(_get(response, "model") or state.get("model") or ""),
+    )
 
 
 def record_auxiliary_response(response: Any, *, task: Optional[str] = None) -> None:

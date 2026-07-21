@@ -603,15 +603,17 @@ def build_memory_write_metadata(
             or getattr(agent, "_memory_write_context", "foreground")
         ),
         "session_id": agent.session_id or "",
+        "turn_id": getattr(agent, "_current_turn_id", "") or "",
         "parent_session_id": agent._parent_session_id or "",
         "platform": agent.platform or os.environ.get("HERMES_SESSION_SOURCE", "cli"),
         "tool_name": "memory",
+        "request_metadata": dict(getattr(agent, "_request_metadata", None) or {}),
     }
     if task_id:
         metadata["task_id"] = task_id
     if tool_call_id:
         metadata["tool_call_id"] = tool_call_id
-    return {k: v for k, v in metadata.items() if v not in {None, ""}}
+    return {k: v for k, v in metadata.items() if v is not None and v != ""}
 
 
 def _run_review_in_thread(

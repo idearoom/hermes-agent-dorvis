@@ -157,7 +157,18 @@ VALID_HOOKS: Set[str] = {
     "pre_api_request",
     "post_api_request",
     "api_request_error",
+    # Provider-attempt lifecycle for centralized auxiliary ``call_llm`` work.
+    # These mirror the primary API hooks but remain a distinct family so
+    # consumers can preserve purpose and avoid counting nested calls as agent
+    # iterations. Every actual dispatch receives an opaque request id and one
+    # terminal success/error event. Observer-only and fail-open.
+    "pre_auxiliary_api_request",
+    "post_auxiliary_api_request",
+    "auxiliary_api_request_error",
     "memory_context_injected",
+    # One terminal event after a consequential memory mutation has committed
+    # (or been accepted by a provider with an explicitly qualified status).
+    "memory_write",
     "context_compression_started",
     "context_compression_completed",
     "context_compression_aborted",
@@ -191,6 +202,9 @@ VALID_HOOKS: Set[str] = {
     #   decided_by: "aux_llm"  -- only on surface="smart"
     "pre_approval_request",
     "post_approval_response",
+    # Normalized terminal policy result, including paths that intentionally do
+    # not prompt (allow, deny, yolo/config bypass, timeout, cancellation).
+    "guardrail_decision",
     # Kanban task lifecycle hooks. Fired by hermes_cli.kanban_db when a task
     # transitions state, AFTER the change is committed to the board DB (so the
     # hook always sees durable state and a slow plugin can never hold the

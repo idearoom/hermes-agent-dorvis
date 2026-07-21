@@ -659,6 +659,16 @@ class MemoryManager:
             return
         user_content = clean_user_content
 
+        # The background executor does not inherit ContextVars. Snapshot the
+        # invocation correlation at enqueue time so the accepted provider write
+        # remains attached to the turn that caused it.
+        try:
+            from agent.runtime_usage import current_observer_context
+
+            observer_context = current_observer_context()
+        except Exception:
+            observer_context = {}
+
         def _run() -> None:
             for provider in providers:
                 try:
@@ -675,6 +685,35 @@ class MemoryManager:
                             assistant_content,
                             session_id=session_id,
                         )
+                    try:
+                        from hermes_cli.plugins import invoke_hook
+
+                        invoke_hook(
+                            "memory_write",
+                            action="sync_turn",
+                            target="conversation",
+                            content={
+                                "user": user_content,
+                                "assistant": assistant_content,
+                            },
+                            status="accepted",
+                            provider=provider.name,
+                            session_id=str(
+                                observer_context.get("session_id") or session_id or ""
+                            ),
+                            task_id=str(observer_context.get("task_id") or ""),
+                            turn_id=str(observer_context.get("turn_id") or ""),
+                            tool_call_id="",
+                            write_origin="turn_sync",
+                            execution_context="background",
+                            request_metadata=dict(
+                                observer_context.get("request_metadata") or {}
+                            ),
+                        )
+                    except Exception:
+                        # Provider sync has already returned. Observer failure
+                        # cannot change accepted memory work or queue ordering.
+                        logger.debug("memory sync observer hook failed", exc_info=True)
                 except Exception as e:
                     logger.warning(
                         "Memory provider '%s' sync_turn failed: %s",
@@ -1108,6 +1147,28 @@ class MemoryManager:
                 old_text = op.get("old_text")
                 if old_text:
                     metadata["old_text"] = str(old_text)
+                try:
+                    from hermes_cli.plugins import invoke_hook
+
+                    invoke_hook(
+                        "memory_write",
+                        action=action,
+                        target=target,
+                        content=str(op.get("content") or ""),
+                        status="committed",
+                        provider="builtin",
+                        session_id=str(metadata.get("session_id") or ""),
+                        task_id=str(metadata.get("task_id") or ""),
+                        turn_id=str(metadata.get("turn_id") or ""),
+                        tool_call_id=str(metadata.get("tool_call_id") or ""),
+                        write_origin=metadata.get("write_origin"),
+                        execution_context=metadata.get("execution_context"),
+                        request_metadata=dict(metadata.get("request_metadata") or {}),
+                    )
+                except Exception:
+                    # The built-in mutation is already durable. Observer
+                    # failure cannot affect mirroring or the tool result.
+                    logger.debug("memory_write hook failed", exc_info=True)
                 self.on_memory_write(
                     action,
                     target,
