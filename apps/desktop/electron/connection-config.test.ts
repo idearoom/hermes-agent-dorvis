@@ -11,7 +11,8 @@
  */
 
 import assert from 'node:assert/strict'
-import test from 'node:test'
+
+import { test } from 'vitest'
 
 import {
   AT_COOKIE_VARIANTS,
@@ -20,7 +21,12 @@ import {
   buildGatewayWsUrlWithTicket,
   connectionScopeKey,
   cookiesHaveLiveSession,
+  cookiesHavePrivySession,
   cookiesHaveSession,
+  gatewayTicketFailure,
+  gatewayWsUrlIpcResult,
+  isGatewayAuthRejection,
+  modeIsRemoteLike,
   normalizeRemoteBaseUrl,
   normAuthMode,
   pathWithGlobalRemoteProfile,
@@ -45,6 +51,19 @@ test('normAuthMode coerces to token unless explicitly oauth', () => {
   assert.equal(normAuthMode('token'), 'token')
   assert.equal(normAuthMode(undefined), 'token')
   assert.equal(normAuthMode('weird'), 'token')
+})
+
+// --- modeIsRemoteLike ---
+
+test('modeIsRemoteLike is true for remote and cloud, false otherwise', () => {
+  // cloud resolves to a remote backend under the hood (Q6), so every resolution
+  // site treats it like remote.
+  assert.equal(modeIsRemoteLike('remote'), true)
+  assert.equal(modeIsRemoteLike('cloud'), true)
+  assert.equal(modeIsRemoteLike('local'), false)
+  assert.equal(modeIsRemoteLike(undefined), false)
+  assert.equal(modeIsRemoteLike(null), false)
+  assert.equal(modeIsRemoteLike('weird'), false)
 })
 
 // --- profileRemoteOverride ---
@@ -84,6 +103,22 @@ test('profileRemoteOverride returns the per-profile remote with defaulted auth m
 test('profileRemoteOverride preserves an explicit oauth auth mode', () => {
   const config = { profiles: { coder: { mode: 'remote', url: 'https://x', authMode: 'oauth' } } }
   assert.equal(profileRemoteOverride(config, 'coder').authMode, 'oauth')
+})
+
+test('profileRemoteOverride treats a cloud entry as a remote override', () => {
+  // A 'cloud' per-profile entry resolves to the same remote backend a 'remote'
+  // entry would (Q6) — the override must be returned, not dropped.
+  const config = {
+    profiles: {
+      coder: { mode: 'cloud', url: 'https://agent-1.agents.nousresearch.com', authMode: 'oauth' }
+    }
+  }
+
+  assert.deepEqual(profileRemoteOverride(config, 'coder'), {
+    url: 'https://agent-1.agents.nousresearch.com',
+    authMode: 'oauth',
+    token: undefined
+  })
 })
 
 test('profileRemoteOverride tolerates a missing/!object profiles map', () => {
@@ -332,6 +367,35 @@ test('cookiesHaveLiveSession is false for unrelated cookies and non-arrays', () 
   assert.equal(cookiesHaveLiveSession([]), false)
 })
 
+// --- cookiesHavePrivySession (Nous portal / Privy auth, NOT gateway cookies) ---
+
+test('cookiesHavePrivySession detects the privy-token access cookie', () => {
+  assert.equal(cookiesHavePrivySession([{ name: 'privy-token', value: 'jwt' }]), true)
+})
+
+test('cookiesHavePrivySession detects __Host-/__Secure- prefixes and the legacy privy-session name', () => {
+  assert.equal(cookiesHavePrivySession([{ name: '__Host-privy-token', value: 'x' }]), true)
+  assert.equal(cookiesHavePrivySession([{ name: '__Secure-privy-token', value: 'x' }]), true)
+  assert.equal(cookiesHavePrivySession([{ name: 'privy-session', value: 'x' }]), true)
+})
+
+test('cookiesHavePrivySession is false for an empty value', () => {
+  assert.equal(cookiesHavePrivySession([{ name: 'privy-token', value: '' }]), false)
+})
+
+test('cookiesHavePrivySession does NOT treat hermes gateway cookies as a portal session', () => {
+  // The whole point of Q7: a gateway session cookie is NOT a portal sign-in.
+  assert.equal(cookiesHavePrivySession([{ name: 'hermes_session_at', value: 'x' }]), false)
+  assert.equal(cookiesHavePrivySession([{ name: '__Host-hermes_session_rt', value: 'x' }]), false)
+})
+
+test('cookiesHavePrivySession is false for unrelated cookies and non-arrays', () => {
+  assert.equal(cookiesHavePrivySession([{ name: 'other', value: 'x' }]), false)
+  assert.equal(cookiesHavePrivySession(null), false)
+  assert.equal(cookiesHavePrivySession(undefined), false)
+  assert.equal(cookiesHavePrivySession([]), false)
+})
+
 // --- tokenPreview ---
 
 test('tokenPreview returns null for empty', () => {
@@ -370,12 +434,14 @@ test('resolveTestWsUrl (oauth, mint ok) builds a ?ticket= URL', async () => {
   assert.equal(url, 'wss://gw.example.com/api/ws?ticket=tkt-9')
 })
 
-test('resolveTestWsUrl (oauth, mint FAILS) throws — must NOT skip WS validation', async () => {
+test('resolveTestWsUrl (oauth, auth rejected) requests sign-in and does not skip WS validation', async () => {
+  const cause = Object.assign(new Error('ticket mint failed'), { statusCode: 401 })
+
   await assert.rejects(
     () =>
       resolveTestWsUrl('https://gw.example.com', 'oauth', null, {
         mintTicket: async () => {
-          throw new Error('401 ticket mint failed')
+          throw cause
         }
       }),
     (err: any) => {
@@ -389,6 +455,66 @@ test('resolveTestWsUrl (oauth, mint FAILS) throws — must NOT skip WS validatio
       return true
     }
   )
+})
+
+test('resolveTestWsUrl (oauth, transport failure) remains a retryable connection error', async () => {
+  const cause = new Error('socket timed out')
+
+  await assert.rejects(
+    () =>
+      resolveTestWsUrl('https://gw.example.com', 'oauth', null, {
+        mintTicket: async () => {
+          throw cause
+        }
+      }),
+    (err: any) => {
+      assert.match(err.message, /could not mint a WebSocket ticket/i)
+      assert.equal(err.needsOauthLogin, undefined)
+      assert.equal(err.cause, cause)
+
+      return true
+    }
+  )
+})
+
+test('gateway ticket failures classify only explicit auth rejection statuses as reauth', () => {
+  assert.equal(isGatewayAuthRejection({ statusCode: 401 }), true)
+  assert.equal(isGatewayAuthRejection({ statusCode: 403 }), true)
+  assert.equal(isGatewayAuthRejection({ needsOauthLogin: true }), true)
+  assert.equal(isGatewayAuthRejection({ statusCode: 500 }), false)
+  assert.equal(isGatewayAuthRejection(new Error('network timeout')), false)
+
+  const serverFailure = gatewayTicketFailure(new Error('network timeout'), 'sign in', 'retry connection') as any
+  assert.equal(serverFailure.message, 'retry connection')
+  assert.equal(serverFailure.needsOauthLogin, undefined)
+})
+
+test('gateway WS URL IPC result serializes success and the auth-vs-transport matrix', async () => {
+  assert.deepEqual(await gatewayWsUrlIpcResult(async () => 'wss://gateway.example.com/api/ws?ticket=fresh'), {
+    ok: true,
+    wsUrl: 'wss://gateway.example.com/api/ws?ticket=fresh'
+  })
+
+  for (const statusCode of [401, 403]) {
+    const error = Object.assign(new Error(`${statusCode}: rejected`), { statusCode })
+
+    assert.deepEqual(await gatewayWsUrlIpcResult(async () => Promise.reject(error)), {
+      error: `${statusCode}: rejected`,
+      needsOauthLogin: true,
+      ok: false
+    })
+  }
+
+  for (const error of [
+    Object.assign(new Error('500: unavailable'), { statusCode: 500 }),
+    new Error('Timed out connecting to Hermes backend after 8000ms'),
+    Object.assign(new Error('socket reset'), { code: 'ECONNRESET' })
+  ]) {
+    assert.deepEqual(await gatewayWsUrlIpcResult(async () => Promise.reject(error)), {
+      error: error.message,
+      ok: false
+    })
+  }
 })
 
 test('resolveTestWsUrl (oauth) requires a mintTicket function', async () => {
