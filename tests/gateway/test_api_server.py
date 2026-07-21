@@ -2993,6 +2993,33 @@ class TestResponsesStreaming:
         assert failed["response"]["usage"] == usage
 
     @pytest.mark.asyncio
+    async def test_stream_agent_exception_emits_failed_event(self, adapter):
+        """An agent exception remains a terminal Responses API failure."""
+        app = _create_app(adapter)
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(
+                adapter,
+                "_run_agent",
+                side_effect=RuntimeError("provider unavailable"),
+            ):
+                resp = await cli.post(
+                    "/v1/responses",
+                    json={"model": "hermes-agent", "input": "hi", "stream": True},
+                )
+                assert resp.status == 200
+                body = await resp.text()
+
+        failed = next(
+            event for event in _parse_sse_events(body)
+            if event.get("type") == "response.failed"
+        )
+        assert failed["response"]["status"] == "failed"
+        assert failed["error"]["type"] == "provider_error"
+        assert "provider unavailable" in failed["error"]["message"]
+        assert "UnboundLocalError" not in body
+
+    @pytest.mark.asyncio
     async def test_stream_string_false_returns_json_response(self, adapter):
         """Quoted false must not route Responses API requests into SSE mode."""
         mock_result = {
