@@ -1529,6 +1529,7 @@ def _build_child_agent(
             child_subagent_id=subagent_id,
             child_role=effective_role,
             child_goal=goal,
+            request_metadata=getattr(parent_agent, "_request_metadata", None) or {},
         )
     except Exception:
         logger.debug("subagent_start hook invocation failed", exc_info=True)

@@ -760,6 +760,36 @@ class TestToolNamePreservation(unittest.TestCase):
 class TestDelegateObservability(unittest.TestCase):
     """Tests for enriched metadata returned by _run_single_child."""
 
+    def test_subagent_start_receives_parent_request_metadata(self):
+        """The observer must correlate a child to the exact parent invocation."""
+        parent = _make_mock_parent(depth=0)
+
+        with (
+            patch("run_agent.AIAgent") as MockAgent,
+            patch("hermes_cli.plugins.invoke_hook") as invoke_hook,
+        ):
+            mock_child = MagicMock()
+            mock_child.session_id = "child-session"
+            mock_child.model = "claude-sonnet-4-6"
+            mock_child.session_prompt_tokens = 5
+            mock_child.session_completion_tokens = 2
+            mock_child.run_conversation.return_value = {
+                "final_response": "done",
+                "completed": True,
+                "interrupted": False,
+                "api_calls": 1,
+                "messages": [],
+            }
+            MockAgent.return_value = mock_child
+
+            delegate_task(goal="Trace this child", parent_agent=parent)
+
+        start = next(
+            call for call in invoke_hook.call_args_list
+            if call.args == ("subagent_start",)
+        )
+        self.assertEqual(start.kwargs["request_metadata"], parent._request_metadata)
+
     def test_observability_fields_present(self):
         """Completed child should return tool_trace, tokens, model, exit_reason."""
         parent = _make_mock_parent(depth=0)
