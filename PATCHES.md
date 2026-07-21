@@ -4,9 +4,43 @@ This fork carries IdeaRoom-specific runtime patches on top of NousResearch
 `hermes-agent` upstream. Keep this file current whenever a patch is added,
 removed, rebased, or promoted.
 
-Current upstream base for the carried branch: `a7f65e3bcd937cd095ba599ab5927af2093a0d95`
-(merged into fork `main` as `0f9225f34`; previous base
-`2ebf9a90b762f21e33318b342e921b17e3d81946`).
+Current upstream base for the carried branch: `64702f8f91661149128ca1a721f7a0fd4c22113b`
+(merged into fork `main` as `f576538b5`; previous base
+`a7f65e3bcd937cd095ba599ab5927af2093a0d95`).
+
+### 2026-07-21 rebase notes (a7f65e3bc → 64702f8f9)
+
+Thirty-six live Dorvis commits were carried. The historical skill-review API
+add/remove pair was not replayed because its net state is obsolete; runtime
+skill writes remain ungated. Conflicted and notable resolutions:
+
+- **Parallel tool execution** — upstream's concurrent dispatcher for safe
+  built-in tools, model guidance, and Codex `parallel_tool_calls` transport
+  flag were retained intact. MCP tools remain sequential by default and only
+  run concurrently when their server explicitly declares
+  `supports_parallel_tool_calls: true`; Dorvis task/session metadata keying is
+  preserved on the same call path.
+- **Request metadata and lifecycle hooks** — Dorvis request metadata was
+  grafted through upstream's profile-scoped API-server runtime and delegate
+  optional-argument forwarding. The lifecycle-hook signature audit found no
+  removed Dorvis hook seam in this upstream range.
+- **Stateful compression quality gate** — the Dorvis quality gate and
+  completed/aborted observations now compose with upstream's `memory_context`
+  argument, API-content sidecar, compression lock, and anti-thrash behavior.
+- **Large output handoff** — complete sanitized output handoff is retained
+  alongside upstream's explicit stdout truncation metadata for both local and
+  remote code execution.
+- **API-server lifecycle** — memory-provider cleanup, usage snapshots, and
+  drain-cap agent tracking now run inside upstream's per-profile scope. The
+  multiplexed route table and non-destructive run-stream transport TTL were
+  retained; transport expiry never cancels a live executor-backed run.
+- **Complete run token attribution** — the run aggregate composes with
+  upstream auxiliary session accounting, provider/cache-token normalization,
+  Codex compaction bookkeeping, MoA context propagation, and the gateway's
+  profile-scoped cleanup paths.
+- Fork `main` was advanced by merging the audited upstream commit instead of
+  fast-forwarding because fork-owned GHCR workflow commits make the two `main`
+  histories intentionally divergent.
 
 ### 2026-07-09 rebase notes (2ebf9a90 → a7f65e3bc)
 
