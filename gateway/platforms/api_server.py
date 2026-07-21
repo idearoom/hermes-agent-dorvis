@@ -1333,10 +1333,11 @@ class APIServerAdapter(BasePlatformAdapter):
         return web.json_response(
             _openai_error(
                 "Gateway is draining existing work; retry shortly.",
+                err_type="unavailable_error",
                 code="gateway_draining",
             ),
             status=503,
-            headers={"Retry-After": "1"},
+            headers={"Retry-After": "2"},
         )
 
     def _activate_admitted_request(self) -> None:

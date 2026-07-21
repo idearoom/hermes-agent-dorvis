@@ -616,12 +616,13 @@ class TestOrphanSweeperDuringDrain:
                 await adapter._sweep_orphaned_runs()
 
     @pytest.mark.asyncio
-    async def test_draining_active_run_is_not_swept(self, adapter):
+    async def test_draining_established_stream_is_not_swept(self, adapter):
         adapter._drain_mode.begin("test")
         run_id = "run_active_drain"
         mock_agent = MagicMock()
         adapter._run_streams[run_id] = asyncio.Queue()
         adapter._run_streams_created[run_id] = time.time() - adapter._RUN_STREAM_TTL - 1
+        adapter._run_stream_subscribers.add(run_id)
         adapter._active_run_agents[run_id] = mock_agent
 
         async def _never():
@@ -631,7 +632,8 @@ class TestOrphanSweeperDuringDrain:
         adapter._active_run_tasks[run_id] = pending
         try:
             await self._one_sweep(adapter)
-            # Still-active draining run survives the TTL sweep untouched.
+            # An established subscriber survives the transport TTL while the
+            # draining executor-backed run continues.
             assert run_id in adapter._run_streams
             assert run_id in adapter._active_run_tasks
             mock_agent.interrupt.assert_not_called()
@@ -659,4 +661,7 @@ class TestOrphanSweeperDuringDrain:
         adapter._active_run_agents[run_id] = mock_agent
         await self._one_sweep(adapter)
         assert run_id not in adapter._run_streams
-        mock_agent.interrupt.assert_called_once_with("Run stream orphaned")
+        # Current upstream treats the TTL as a transport-buffer bound, not a
+        # run lifetime: it never interrupts work merely because no SSE client
+        # subscribed before the buffer expired.
+        mock_agent.interrupt.assert_not_called()

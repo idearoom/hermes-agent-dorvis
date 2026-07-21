@@ -65,6 +65,7 @@ def _record_codex_app_server_usage(agent, turn) -> dict[str, Any]:
         if (
             compressor is not None
             and getattr(compressor, "awaiting_real_usage_after_compression", False)
+            and hasattr(compressor, "update_from_response")
         ):
             # No usage means this turn cannot adjudicate the pending compaction.
             # Consume the marker so a later unrelated reading is not charged to
