@@ -23,6 +23,8 @@ keep the exact logger name (``"agent.conversation_loop"``).
 from __future__ import annotations
 
 import os
+import json
+import re
 
 from agent.codex_responses_adapter import _summarize_user_message_for_log
 from agent.message_content import flatten_message_text
@@ -51,6 +53,51 @@ _VERIFICATION_CONTINUATION_FLAGS = (
     "_verification_stop_synthetic",
     "_pre_verify_synthetic",
 )
+
+_RESPONSE_METADATA_MAX_BYTES = 64 * 1024
+_RESPONSE_METADATA_KEY_RE = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
+
+
+def _response_metadata_from_hook_results(hook_results) -> dict:
+    """Collect bounded, JSON-safe terminal metadata from trusted plugins.
+
+    Hook output is observational: malformed, conflicting, or oversized values
+    are ignored and can never change the agent result. First writer wins for a
+    key so callback order stays deterministic.
+    """
+    collected = {}
+    total_bytes = 2
+    for hook_result in hook_results or []:
+        if not isinstance(hook_result, dict):
+            continue
+        metadata = hook_result.get("response_metadata")
+        if not isinstance(metadata, dict):
+            continue
+        for key in sorted(metadata):
+            if (
+                not isinstance(key, str)
+                or not _RESPONSE_METADATA_KEY_RE.fullmatch(key)
+                or key in collected
+            ):
+                continue
+            try:
+                encoded = json.dumps(
+                    metadata[key],
+                    ensure_ascii=False,
+                    allow_nan=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ).encode("utf-8")
+            except (TypeError, ValueError):
+                continue
+            added_bytes = len(key.encode("utf-8")) + len(encoded) + 5
+            if added_bytes > _RESPONSE_METADATA_MAX_BYTES:
+                continue
+            if total_bytes + added_bytes > _RESPONSE_METADATA_MAX_BYTES:
+                continue
+            collected[key] = metadata[key]
+            total_bytes += added_bytes
+    return collected
 
 
 def _drop_verification_continuation_scaffolding(messages) -> None:
@@ -613,7 +660,7 @@ def finalize_turn(
     # Plugins can use this for cleanup, flushing buffers, etc.
     try:
         from hermes_cli.plugins import invoke_hook as _invoke_hook
-        _invoke_hook(
+        _session_end_results = _invoke_hook(
             "on_session_end",
             session_id=agent.session_id,
             task_id=effective_task_id,
@@ -624,6 +671,11 @@ def finalize_turn(
             platform=getattr(agent, "platform", None) or "",
             request_metadata=getattr(agent, "_request_metadata", None) or {},
         )
+        _response_metadata = _response_metadata_from_hook_results(
+            _session_end_results
+        )
+        if _response_metadata:
+            result["response_metadata"] = _response_metadata
     except Exception as exc:
         logger.warning("on_session_end hook failed: %s", exc)
 

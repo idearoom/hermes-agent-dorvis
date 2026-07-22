@@ -3731,6 +3731,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 "created_at": created_at,
                 "model": model,
             }
+            if isinstance(result, dict) and isinstance(
+                result.get("response_metadata"), dict
+            ):
+                env["metadata"] = result["response_metadata"]
             return env
 
         final_response_text = ""
@@ -4494,6 +4498,8 @@ class APIServerAdapter(BasePlatformAdapter):
             "output": output_items,
             "usage": _responses_usage_payload(usage),
         }
+        if isinstance(result.get("response_metadata"), dict):
+            response_data["metadata"] = result["response_metadata"]
         response_session_id = (
             result.get("session_id") if isinstance(result, dict) else None
         ) or session_id

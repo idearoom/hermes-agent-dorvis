@@ -1487,6 +1487,32 @@ class TestChatCompletionsEndpoint:
         mock_agent.close.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_non_streaming_preserves_terminal_plugin_metadata(self, adapter):
+        mock_result = {
+            "final_response": "OK",
+            "messages": [],
+            "api_calls": 1,
+            "response_metadata": {
+                "dorvis_trace_manifest": {"trace_id": "1" * 32}
+            },
+        }
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (
+                    mock_result,
+                    {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+                )
+                resp = await cli.post(
+                    "/v1/responses",
+                    json={"model": "hermes-agent", "input": "Hello"},
+                )
+            data = await resp.json()
+            assert data["metadata"] == mock_result["response_metadata"]
+            stored = await cli.get(f"/v1/responses/{data['id']}")
+            assert (await stored.json())["metadata"] == mock_result["response_metadata"]
+
+    @pytest.mark.asyncio
     async def test_stream_true_returns_sse(self, adapter):
         """stream=true returns SSE format with the full response."""
         app = _create_app(adapter)
@@ -2905,6 +2931,35 @@ class TestResponsesStreaming:
                 assert '"logprobs": []' in body
                 assert "Hello" in body
                 assert " world" in body
+
+    @pytest.mark.asyncio
+    async def test_stream_terminal_event_preserves_plugin_metadata(self, adapter):
+        metadata = {"dorvis_trace_manifest": {"trace_id": "1" * 32}}
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            async def _mock_run_agent(**_kwargs):
+                return (
+                    {
+                        "final_response": "OK",
+                        "messages": [],
+                        "api_calls": 1,
+                        "response_metadata": metadata,
+                    },
+                    {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                )
+
+            with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent):
+                resp = await cli.post(
+                    "/v1/responses",
+                    json={"model": "hermes-agent", "input": "hi", "stream": True},
+                )
+                body = await resp.text()
+
+            completed = next(
+                event for event in _parse_sse_events(body)
+                if event.get("type") == "response.completed"
+            )
+            assert completed["response"]["metadata"] == metadata
 
     @pytest.mark.asyncio
     async def test_stream_completed_preserves_responses_usage_context(self, adapter):
