@@ -482,6 +482,65 @@ def test_background_review_metadata_snapshot_failure_degrades_without_interrupti
     assert captured_kwargs["request_metadata"] == {}
 
 
+def test_delegated_background_review_cannot_rejoin_the_delegate_trace(monkeypatch):
+    """A review spawned by a subagent still owns an independent trace."""
+    import agent.background_review as bg_review
+
+    captured_kwargs: dict = {}
+
+    class FakeReviewAgent:
+        def __init__(self, **kwargs):
+            captured_kwargs.update(kwargs)
+            self._session_messages = []
+
+        def run_conversation(self, **kwargs):
+            pass
+
+        def shutdown_memory_provider(self):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(run_agent_module, "AIAgent", FakeReviewAgent)
+    agent = _bare_agent()
+    agent._request_metadata = {
+        "source": "dorvis-web",
+        "chat": {"id": "chat-1"},
+        "chat_run": {"id": "chat-run-1"},
+        "delegation": {
+            "is_subagent": True,
+            "child_session_id": "delegate-session-1",
+        },
+        "dorvis_trace": {
+            "traceparent": f"00-{'1' * 32}-{'3' * 16}-01",
+            "envelope": {
+                "schema_name": "dorvis.trace.envelope.v1",
+                "schema_version": 1,
+                "trace_id": "1" * 32,
+                "root_operation_id": "2" * 16,
+                "runtime_dispatch_operation_id": "3" * 16,
+                "invocation_kind": "chat",
+                "session_id": "chat-1",
+                "invocation_id": "chat-run-1",
+            },
+        },
+    }
+
+    target, _prompt = bg_review.spawn_background_review_thread(
+        agent,
+        messages_snapshot=[],
+        review_skills=True,
+    )
+    target()
+
+    metadata = captured_kwargs["request_metadata"]
+    assert "dorvis_trace" not in metadata
+    assert "delegation" not in metadata
+    assert metadata["dorvis_background"]["parent_trace_id"] == "1" * 32
+    assert metadata["dorvis_background"]["parent_operation_id"] == "2" * 16
+
+
 # ---------------------------------------------------------------------------
 # memory_notifications mode: off | on | verbose
 # ---------------------------------------------------------------------------

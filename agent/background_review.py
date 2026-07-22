@@ -636,7 +636,10 @@ def _snapshot_background_request_metadata(agent: Any) -> Dict[str, Any]:
     foreground = metadata.pop("dorvis_trace", None)
     delegation = metadata.get("delegation")
     if isinstance(delegation, dict) and delegation.get("is_subagent"):
-        return metadata
+        # A background review can outlive the delegate root and must never
+        # resolve through the adapter's mutable child-session context. Link the
+        # independent review to the validated first-party ancestor instead.
+        metadata.pop("delegation", None)
     if str(metadata.get("source") or "") not in {
         "dorvis-web",
         "dorvis-headless-worker",
