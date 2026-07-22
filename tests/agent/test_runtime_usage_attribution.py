@@ -156,6 +156,42 @@ def test_auxiliary_dispatch_emits_one_terminal_observer_generation_per_attempt()
     assert completed["request_metadata"]["source"] == "dorvis-web"
 
 
+def test_auxiliary_observer_preserves_provider_total_mismatch_evidence():
+    agent = _agent(
+        session_id="session-aux-mismatch",
+        _current_turn_id="turn-aux-mismatch",
+        _request_metadata={"source": "dorvis-web", "chat": {"id": "chat-1"}},
+    )
+    captured = []
+    response = SimpleNamespace(
+        usage=SimpleNamespace(
+            input_tokens=4617,
+            output_tokens=1260,
+            reasoning_tokens=1005,
+            total_tokens=6882,
+        )
+    )
+
+    with patch(
+        "hermes_cli.plugins.invoke_hook",
+        side_effect=lambda name, **kwargs: captured.append((name, kwargs)),
+    ), attribute_auxiliary_usage(agent):
+        track_auxiliary_dispatch(
+            lambda: response,
+            task="compression",
+            provider="openrouter",
+            model="test-model",
+        )
+
+    completed = captured[-1][1]
+    assert completed["usage"]["total_tokens"] == 5877
+    assert completed["usage"]["provider_reported_total_tokens"] == 6882
+    assert completed["usage"]["usage_completeness"] == "partial"
+    assert completed["usage"]["usage_warnings"] == [
+        "total_does_not_match_input_output"
+    ]
+
+
 def test_auxiliary_retry_attempts_have_independent_terminal_error_events():
     agent = _agent(
         session_id="session-aux-retry",

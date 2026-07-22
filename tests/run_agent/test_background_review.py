@@ -361,6 +361,127 @@ def test_background_review_fork_skips_external_memory_plugins(monkeypatch):
     )
 
 
+def test_background_review_snapshots_isolated_causal_request_metadata(monkeypatch):
+    """The daemon fork must not inherit mutable foreground trace ownership.
+
+    The returned target can run after the foreground request has completed or
+    mutated its metadata. It therefore receives a deep snapshot with a new
+    background invocation identity and an explicit causal link, while the
+    foreground ``dorvis_trace`` envelope is removed so the fork cannot rejoin
+    the already-terminal trace.
+    """
+    import agent.background_review as bg_review
+
+    captured_kwargs: dict = {}
+
+    class FakeReviewAgent:
+        def __init__(self, **kwargs):
+            captured_kwargs.update(kwargs)
+            self._session_messages = []
+
+        def run_conversation(self, **kwargs):
+            pass
+
+        def shutdown_memory_provider(self):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(run_agent_module, "AIAgent", FakeReviewAgent)
+
+    agent = _bare_agent()
+    agent._request_metadata = {
+        "source": "dorvis-web",
+        "environment": "staging",
+        "caller": {
+            "email": "operator@example.test",
+            "name": "Operator",
+            "uid": "operator-1",
+        },
+        "chat": {"id": "chat-1", "type": "web"},
+        "dorvis_trace": {
+            "traceparent": f"00-{'1' * 32}-{'3' * 16}-01",
+            "envelope": {
+                "schema_name": "dorvis.trace.envelope.v1",
+                "schema_version": 1,
+                "trace_id": "1" * 32,
+                "root_operation_id": "2" * 16,
+                "runtime_dispatch_operation_id": "3" * 16,
+                "invocation_kind": "chat",
+                "session_id": "chat-1",
+                "invocation_id": "chat-run-1",
+            },
+        },
+    }
+
+    target, _prompt = bg_review.spawn_background_review_thread(
+        agent,
+        messages_snapshot=[{"role": "user", "content": "hello"}],
+        review_memory=True,
+    )
+    agent._request_metadata["caller"]["email"] = "mutated@example.test"
+    agent._request_metadata["dorvis_trace"]["envelope"]["trace_id"] = "9" * 32
+
+    target()
+
+    metadata = captured_kwargs["request_metadata"]
+    assert metadata["caller"]["email"] == "operator@example.test"
+    assert "dorvis_trace" not in metadata
+    background = metadata["dorvis_background"]
+    assert background == {
+        "schema_name": "dorvis.background.invocation.v1",
+        "schema_version": 1,
+        "invocation_kind": "background_review",
+        "invocation_id": background["invocation_id"],
+        "session_id": "chat-1",
+        "parent_trace_id": "1" * 32,
+        "parent_operation_id": "2" * 16,
+        "relationship": "caused_by",
+        "parent": background["parent"],
+    }
+    assert background["invocation_id"].startswith("background-review:")
+    assert background["parent"]["traceparent"] == f"00-{'1' * 32}-{'3' * 16}-01"
+    assert background["parent"]["envelope"]["trace_id"] == "1" * 32
+
+
+def test_background_review_metadata_snapshot_failure_degrades_without_interrupting(monkeypatch):
+    import agent.background_review as bg_review
+
+    captured_kwargs: dict = {}
+
+    class NonCopyable:
+        def __deepcopy__(self, memo):
+            raise TypeError("cannot copy")
+
+    class FakeReviewAgent:
+        def __init__(self, **kwargs):
+            captured_kwargs.update(kwargs)
+            self._session_messages = []
+
+        def run_conversation(self, **kwargs):
+            pass
+
+        def shutdown_memory_provider(self):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(run_agent_module, "AIAgent", FakeReviewAgent)
+    agent = _bare_agent()
+    agent._request_metadata = {"unsupported": NonCopyable()}
+
+    target, _prompt = bg_review.spawn_background_review_thread(
+        agent,
+        messages_snapshot=[],
+        review_memory=True,
+    )
+    target()
+
+    assert captured_kwargs["request_metadata"] == {}
+
+
 # ---------------------------------------------------------------------------
 # memory_notifications mode: off | on | verbose
 # ---------------------------------------------------------------------------

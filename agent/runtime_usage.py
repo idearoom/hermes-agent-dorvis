@@ -440,7 +440,14 @@ def _observer_usage(
             provider=str(state.get("provider") or ""),
             api_mode=str(state.get("api_mode") or "chat_completions"),
         )
-        parsed_input, parsed_output, parsed_total, _ = _usage_components(raw_usage)
+        parsed_input, parsed_output, parsed_total, warning_reasons = (
+            _usage_components(raw_usage)
+        )
+        provider_reported_total = _token_value(
+            raw_usage,
+            "total_tokens",
+            "totalTokens",
+        )
         if canonical.total_tokens == 0 and (parsed_total or 0) > 0:
             canonical = CanonicalUsage(
                 input_tokens=parsed_input or 0,
@@ -453,7 +460,17 @@ def _observer_usage(
             "cache_read_tokens": canonical.cache_read_tokens,
             "cache_write_tokens": canonical.cache_write_tokens,
             "reasoning_tokens": canonical.reasoning_tokens,
+            "usage_completeness": (
+                "partial" if warning_reasons else "complete"
+            ),
         }
+        if warning_reasons:
+            usage["usage_warnings"] = list(warning_reasons)
+        if (
+            provider_reported_total is not None
+            and provider_reported_total != canonical.total_tokens
+        ):
+            usage["provider_reported_total_tokens"] = provider_reported_total
         cost = estimate_usage_cost(
             str(state.get("model") or ""),
             canonical,
@@ -467,7 +484,9 @@ def _observer_usage(
             usage["cost_usd"] = float(cost.amount_usd)
         return usage
     except Exception:
-        input_tokens, output_tokens, total_tokens, _ = _usage_components(raw_usage)
+        input_tokens, output_tokens, total_tokens, warning_reasons = (
+            _usage_components(raw_usage)
+        )
         usage = {
             key: value
             for key, value in {
@@ -479,6 +498,11 @@ def _observer_usage(
         }
         if usage:
             usage["cost_status"] = "unknown"
+            usage["usage_completeness"] = (
+                "partial" if warning_reasons else "complete"
+            )
+            if warning_reasons:
+                usage["usage_warnings"] = list(warning_reasons)
         return usage or None
 
 

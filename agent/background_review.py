@@ -18,9 +18,11 @@ for invariants and PR review criteria.
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import os
+import secrets
 from typing import Any, Dict, List, Optional
 
 from agent.thread_scoped_output import thread_scoped_silence
@@ -616,10 +618,59 @@ def build_memory_write_metadata(
     return {k: v for k, v in metadata.items() if v is not None and v != ""}
 
 
+def _snapshot_background_request_metadata(agent: Any) -> Dict[str, Any]:
+    """Detach a background-review invocation from foreground trace ownership.
+
+    The snapshot is built before the daemon thread starts. That makes caller,
+    session, and causal identity immutable across the executor boundary while
+    preserving the foreground trace only as an explicit link target.
+    """
+    try:
+        metadata = copy.deepcopy(getattr(agent, "_request_metadata", None) or {})
+    except Exception:
+        logger.debug(
+            "background-review request metadata snapshot failed; degrading",
+            exc_info=True,
+        )
+        return {}
+    foreground = metadata.pop("dorvis_trace", None)
+    delegation = metadata.get("delegation")
+    if isinstance(delegation, dict) and delegation.get("is_subagent"):
+        return metadata
+    if str(metadata.get("source") or "") not in {
+        "dorvis-web",
+        "dorvis-headless-worker",
+    }:
+        return metadata
+    if not isinstance(foreground, dict):
+        return metadata
+    envelope = foreground.get("envelope")
+    if not isinstance(envelope, dict):
+        return metadata
+    session_id = str(envelope.get("session_id") or "")
+    parent_trace_id = str(envelope.get("trace_id") or "")
+    parent_operation_id = str(envelope.get("root_operation_id") or "")
+    if not (session_id and parent_trace_id and parent_operation_id):
+        return metadata
+    metadata["dorvis_background"] = {
+        "schema_name": "dorvis.background.invocation.v1",
+        "schema_version": 1,
+        "invocation_kind": "background_review",
+        "invocation_id": f"background-review:{secrets.token_hex(8)}",
+        "session_id": session_id,
+        "parent_trace_id": parent_trace_id,
+        "parent_operation_id": parent_operation_id,
+        "relationship": "caused_by",
+        "parent": foreground,
+    }
+    return metadata
+
+
 def _run_review_in_thread(
     agent: Any,
     messages_snapshot: List[Dict],
     prompt: str,
+    request_metadata: Dict[str, Any],
 ) -> None:
     """Worker function executed in the background-review daemon thread.
 
@@ -722,6 +773,7 @@ def _run_review_in_thread(
                 api_key=_rt.get("api_key") or None,
                 credential_pool=_rt.get("credential_pool"),
                 request_overrides=_rt.get("request_overrides") or {},
+                request_metadata=request_metadata,
                 parent_session_id=agent.session_id,
                 enabled_toolsets=getattr(agent, "enabled_toolsets", None),
                 disabled_toolsets=getattr(agent, "disabled_toolsets", None),
@@ -977,8 +1029,10 @@ def spawn_background_review_thread(
     else:
         prompt = getattr(agent, "_SKILL_REVIEW_PROMPT", _SKILL_REVIEW_PROMPT)
 
+    request_metadata = _snapshot_background_request_metadata(agent)
+
     def _target() -> None:
-        _run_review_in_thread(agent, messages_snapshot, prompt)
+        _run_review_in_thread(agent, messages_snapshot, prompt, request_metadata)
 
     return _target, prompt
 
