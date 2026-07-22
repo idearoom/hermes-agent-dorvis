@@ -6187,6 +6187,35 @@ class TestHookPayloadSanitizesSimpleNamespace:
         assert normalized_call["id"] == "call_1"
         assert normalized_call["function"]["name"] == "web_search"
 
+    def test_oversize_request_hook_retains_exact_field_digests(self, agent, monkeypatch):
+        monkeypatch.setenv("HERMES_PLUGIN_PAYLOAD_MAX_CHARS", "1000")
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "lookup",
+                    "description": "x" * 1200,
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+        ]
+
+        payload = agent._api_request_payload_for_hook(
+            {
+                "messages": [{"role": "user", "content": "hello"}],
+                "tools": tools,
+                "temperature": 0,
+            }
+        )
+
+        assert payload["_truncated"] is True
+        assert payload["body_field_sha256"]["tools"] == (
+            "89a1be6bacf5a0945fb455fa549b5f9256fa31c94bd982f164233042ba9baf89"
+        )
+        assert payload["body_parameters_sha256"] == (
+            "e4ff491169b8a9ea78518a7972422b5a24d5e3790e0d9a9e5cbfb384d9b621e0"
+        )
+
 
 class TestRetryExhaustion:
     """Regression: retry_count > max_retries was dead code (off-by-one).

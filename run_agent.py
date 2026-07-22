@@ -2563,18 +2563,52 @@ class AIAgent:
             "preview": encoded[:limit],
         }
 
+    @classmethod
+    def _hook_payload_sha256(cls, value: Any) -> str:
+        """Hash the complete JSON-compatible hook value before size truncation."""
+        normalized = cls._hook_jsonable(
+            value,
+            max_depth=64,
+            max_string=sys.maxsize,
+            max_sequence=sys.maxsize,
+        )
+        encoded = json.dumps(
+            normalized,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
     def _api_request_payload_for_hook(self, api_kwargs: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         body = {
             key: value
             for key, value in (api_kwargs or {}).items()
             if key not in {"timeout", "http_client"}
         }
-        return self._sanitize_hook_payload(
+        body_field_sha256 = {
+            str(key): self._hook_payload_sha256(value)
+            for key, value in body.items()
+        }
+        parameters = {
+            key: value
+            for key, value in body.items()
+            if key not in {"messages", "input", "tools"}
+        }
+        payload = self._sanitize_hook_payload(
             {
                 "method": "POST",
                 "body": body,
             }
         )
+        if not isinstance(payload, dict):
+            payload = {"_truncated": True, "original_type": type(body).__name__}
+        if payload.get("_truncated"):
+            payload.pop("preview", None)
+        payload["body_field_sha256"] = body_field_sha256
+        payload["body_parameters_sha256"] = self._hook_payload_sha256(parameters)
+        return payload
 
     def _api_response_payload_for_hook(
         self,
