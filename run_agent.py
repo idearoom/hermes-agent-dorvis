@@ -2392,6 +2392,24 @@ class AIAgent:
         summary.pop("raw_usage", None)
         summary["prompt_tokens"] = cu.prompt_tokens
         summary["total_tokens"] = cu.total_tokens
+        try:
+            from agent.usage_pricing import estimate_usage_cost
+
+            cost = estimate_usage_cost(
+                self.model,
+                cu,
+                provider=self.provider,
+                base_url=self.base_url,
+                api_key="",
+            )
+            summary["cost_status"] = cost.status
+            summary["cost_source"] = cost.source
+            if cost.amount_usd is not None:
+                summary["cost_usd"] = float(cost.amount_usd)
+        except Exception:
+            # Usage observation is fail-open. Missing pricing is represented
+            # honestly rather than changing or suppressing token buckets.
+            summary["cost_status"] = "unknown"
         return summary
 
     @staticmethod

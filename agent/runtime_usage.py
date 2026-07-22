@@ -424,20 +424,62 @@ def _begin_auxiliary_observer_attempt(
     return state
 
 
-def _observer_usage(response: Any) -> Optional[Dict[str, int]]:
-    input_tokens, output_tokens, total_tokens, _ = _usage_components(
-        _get(response, "usage")
-    )
-    usage = {
-        key: value
-        for key, value in {
-            "input_tokens": input_tokens,
-            "output_tokens": output_tokens,
-            "total_tokens": total_tokens,
-        }.items()
-        if value is not None
-    }
-    return usage or None
+def _observer_usage(
+    response: Any,
+    state: Optional[Mapping[str, Any]] = None,
+) -> Optional[Dict[str, Any]]:
+    raw_usage = _get(response, "usage")
+    if raw_usage is None:
+        return None
+    state = state or {}
+    try:
+        from agent.usage_pricing import CanonicalUsage, estimate_usage_cost, normalize_usage
+
+        canonical = normalize_usage(
+            raw_usage,
+            provider=str(state.get("provider") or ""),
+            api_mode=str(state.get("api_mode") or "chat_completions"),
+        )
+        parsed_input, parsed_output, parsed_total, _ = _usage_components(raw_usage)
+        if canonical.total_tokens == 0 and (parsed_total or 0) > 0:
+            canonical = CanonicalUsage(
+                input_tokens=parsed_input or 0,
+                output_tokens=parsed_output or 0,
+            )
+        usage: Dict[str, Any] = {
+            "input_tokens": canonical.input_tokens,
+            "output_tokens": canonical.output_tokens,
+            "total_tokens": canonical.total_tokens,
+            "cache_read_tokens": canonical.cache_read_tokens,
+            "cache_write_tokens": canonical.cache_write_tokens,
+            "reasoning_tokens": canonical.reasoning_tokens,
+        }
+        cost = estimate_usage_cost(
+            str(state.get("model") or ""),
+            canonical,
+            provider=str(state.get("provider") or ""),
+            base_url=str(state.get("base_url") or ""),
+            api_key="",
+        )
+        usage["cost_status"] = cost.status
+        usage["cost_source"] = cost.source
+        if cost.amount_usd is not None:
+            usage["cost_usd"] = float(cost.amount_usd)
+        return usage
+    except Exception:
+        input_tokens, output_tokens, total_tokens, _ = _usage_components(raw_usage)
+        usage = {
+            key: value
+            for key, value in {
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "total_tokens": total_tokens,
+            }.items()
+            if value is not None
+        }
+        if usage:
+            usage["cost_status"] = "unknown"
+        return usage or None
 
 
 def _end_auxiliary_observer_attempt(
@@ -466,7 +508,7 @@ def _end_auxiliary_observer_attempt(
     _invoke_observer_hook(
         "post_auxiliary_api_request",
         **common,
-        usage=_observer_usage(response),
+        usage=_observer_usage(response, state),
         response=_observer_jsonable(response),
         response_model=str(_get(response, "model") or state.get("model") or ""),
     )

@@ -147,11 +147,11 @@ def test_auxiliary_dispatch_emits_one_terminal_observer_generation_per_attempt()
     assert started["session_id"] == "session-aux-observer"
     assert started["turn_id"] == "turn-aux-observer"
     assert started["request"]["body"]["messages"][0]["content"] == "compress"
-    assert completed["usage"] == {
-        "input_tokens": 13,
-        "output_tokens": 5,
-        "total_tokens": 18,
-    }
+    assert completed["usage"]["input_tokens"] == 13
+    assert completed["usage"]["output_tokens"] == 5
+    assert completed["usage"]["total_tokens"] == 18
+    assert completed["usage"]["cost_status"] == "included"
+    assert completed["usage"]["cost_usd"] == 0.0
     assert completed["api_duration"] >= 0
     assert completed["request_metadata"]["source"] == "dorvis-web"
 
@@ -632,11 +632,11 @@ def test_auxiliary_stream_observer_terminalizes_after_last_chunk():
         "post_auxiliary_api_request",
     ]
     assert events[0][1]["api_request_id"] == events[1][1]["api_request_id"]
-    assert events[1][1]["usage"] == {
-        "input_tokens": 4,
-        "output_tokens": 2,
-        "total_tokens": 6,
-    }
+    assert events[1][1]["usage"]["input_tokens"] == 4
+    assert events[1][1]["usage"]["output_tokens"] == 2
+    assert events[1][1]["usage"]["total_tokens"] == 6
+    assert events[1][1]["usage"]["cost_status"] == "unknown"
+    assert "cost_usd" not in events[1][1]["usage"]
 
 
 def test_auxiliary_attempt_observer_sees_hidden_failure_and_response():
