@@ -670,7 +670,7 @@ def _run_review_in_thread(
     agent: Any,
     messages_snapshot: List[Dict],
     prompt: str,
-    request_metadata: Dict[str, Any],
+    request_metadata: Optional[Dict[str, Any]] = None,
 ) -> None:
     """Worker function executed in the background-review daemon thread.
 
@@ -681,6 +681,11 @@ def _run_review_in_thread(
     # Local import to avoid a hard circular dep at module load.
     from run_agent import AIAgent
     from tools.terminal_tool import set_approval_callback as _set_approval_callback
+
+    # Keep direct/internal callers compatible while ensuring they get the same
+    # detached snapshot semantics as the normal thread-factory path.
+    if request_metadata is None:
+        request_metadata = _snapshot_background_request_metadata(agent)
 
     # Install a non-interactive approval callback on this worker
     # thread so any dangerous-command guard the review agent trips
