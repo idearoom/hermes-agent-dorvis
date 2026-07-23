@@ -2558,6 +2558,85 @@ class TestResponsesEndpoint:
             assert stored_history.count({"role": "user", "content": "Now add 1 more"}) == 1
 
     @pytest.mark.asyncio
+    async def test_previous_response_id_ignores_private_persistence_metadata(self, adapter):
+        """Runtime-only message markers must not defeat transcript prefix detection."""
+        user = {"role": "user", "content": "What is 1+1?"}
+        runtime_user = {**user, "_db_persisted": True}
+        runtime_assistant = {
+            "role": "assistant",
+            "content": "2",
+            "_db_persisted": True,
+        }
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (
+                    {
+                        "final_response": "2",
+                        "messages": [runtime_user, runtime_assistant],
+                        "api_calls": 1,
+                    },
+                    {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+                )
+                resp = await cli.post(
+                    "/v1/responses",
+                    json={"model": "hermes-agent", "input": user["content"]},
+                )
+
+            assert resp.status == 200
+            response = await resp.json()
+            stored = adapter._response_store.get(response["id"])
+            assert stored["conversation_history"] == [
+                runtime_user,
+                runtime_assistant,
+            ]
+
+            second_user = {
+                "role": "user",
+                "content": "Now add 1 more",
+                "_db_persisted": True,
+            }
+            second_assistant = {
+                "role": "assistant",
+                "content": "3",
+                "_db_persisted": True,
+            }
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (
+                    {
+                        "final_response": "3",
+                        "messages": [
+                            runtime_user,
+                            runtime_assistant,
+                            second_user,
+                            second_assistant,
+                        ],
+                        "api_calls": 1,
+                    },
+                    {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+                )
+                chained = await cli.post(
+                    "/v1/responses",
+                    json={
+                        "model": "hermes-agent",
+                        "input": second_user["content"],
+                        "previous_response_id": response["id"],
+                    },
+                )
+
+            assert chained.status == 200
+            chained_response = await chained.json()
+            chained_history = adapter._response_store.get(
+                chained_response["id"]
+            )["conversation_history"]
+            assert [
+                message["content"]
+                for message in chained_history
+                if message["role"] == "user"
+            ] == [user["content"], second_user["content"]]
+
+    @pytest.mark.asyncio
     async def test_previous_response_id_stores_compacted_transcript_as_authoritative(self, adapter):
         """After compression, previous_response_id must resume compacted history."""
         prior_history = [

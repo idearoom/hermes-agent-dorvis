@@ -4917,6 +4917,35 @@ class APIServerAdapter(BasePlatformAdapter):
         return full_history
 
     @staticmethod
+    def _response_prefix_projection(value: Any) -> Any:
+        """Remove runtime-private fields before comparing transcript prefixes.
+
+        ``run_conversation`` stamps messages with persistence markers before
+        returning its authoritative transcript. The Responses handler's
+        request-side ``current_user`` has no such marker, so byte-for-byte
+        equality misclassifies the full transcript as a current-turn suffix
+        and appends the entire history again. Repeated
+        ``previous_response_id`` requests then grow the stored/provider-visible
+        history exponentially.
+
+        Underscore-prefixed fields are Hermes runtime bookkeeping, not message
+        semantics. Ignore them recursively for prefix detection while retaining
+        the original messages unchanged in the stored authoritative transcript.
+        """
+        if isinstance(value, dict):
+            return {
+                key: APIServerAdapter._response_prefix_projection(item)
+                for key, item in value.items()
+                if not str(key).startswith("_")
+            }
+        if isinstance(value, list):
+            return [
+                APIServerAdapter._response_prefix_projection(item)
+                for item in value
+            ]
+        return value
+
+    @staticmethod
     def _response_messages_turn_start_index(
         conversation_history: List[Dict[str, Any]],
         user_message: Any,
@@ -4930,9 +4959,19 @@ class APIServerAdapter(BasePlatformAdapter):
         prior = list(conversation_history)
         current_user = {"role": "user", "content": user_message}
         expected_prefix = prior + [current_user]
-        if agent_messages[:len(expected_prefix)] == expected_prefix:
+        projected_messages = APIServerAdapter._response_prefix_projection(
+            agent_messages
+        )
+        projected_expected = APIServerAdapter._response_prefix_projection(
+            expected_prefix
+        )
+        if projected_messages[:len(projected_expected)] == projected_expected:
             return len(expected_prefix)
-        if prior and agent_messages[:len(prior)] == prior:
+        projected_prior = APIServerAdapter._response_prefix_projection(prior)
+        if (
+            projected_prior
+            and projected_messages[:len(projected_prior)] == projected_prior
+        ):
             return len(prior)
         return 0
 
