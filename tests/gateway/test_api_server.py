@@ -2163,6 +2163,23 @@ class TestDeriveChatSessionId:
 
 
 class TestResponsesEndpoint:
+    @pytest.mark.parametrize(
+        "content",
+        [
+            "[CONTEXT COMPACTION — REFERENCE ONLY]\n## State Ledger",
+            (
+                "[PRIOR CONTEXT — for reference only; not a new message]\n"
+                "completed handoff\n"
+                "[END OF PRIOR CONTEXT — COMPACTION SUMMARY BELOW]\n"
+                "## State Ledger"
+            ),
+        ],
+    )
+    def test_compaction_summary_markers_are_authoritative(self, content):
+        assert APIServerAdapter._messages_include_compaction_summary(
+            [{"role": "assistant", "content": content}]
+        )
+
     @pytest.mark.asyncio
     async def test_missing_input_returns_400(self, adapter):
         app = _create_app(adapter)

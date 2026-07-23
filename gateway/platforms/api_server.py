@@ -128,6 +128,13 @@ CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 30.0
 MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
 MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
 CONTEXT_COMPACTION_PREFIX = "[CONTEXT COMPACTION"
+MERGED_PRIOR_CONTEXT_PREFIX = (
+    "[PRIOR CONTEXT — for reference only; not a new message]"
+)
+CONTEXT_COMPACTION_PREFIXES = (
+    CONTEXT_COMPACTION_PREFIX,
+    MERGED_PRIOR_CONTEXT_PREFIX,
+)
 _METADATA_STRING_LIMITS = {
     "email": 320,
     "name": 200,
@@ -4873,14 +4880,16 @@ class APIServerAdapter(BasePlatformAdapter):
         for msg in messages:
             content = msg.get("content")
             if isinstance(content, str):
-                if content.lstrip().startswith(CONTEXT_COMPACTION_PREFIX):
+                if content.lstrip().startswith(CONTEXT_COMPACTION_PREFIXES):
                     return True
             elif isinstance(content, list):
                 for part in content:
                     if (
                         isinstance(part, dict)
                         and isinstance(part.get("text"), str)
-                        and part["text"].lstrip().startswith(CONTEXT_COMPACTION_PREFIX)
+                        and part["text"].lstrip().startswith(
+                            CONTEXT_COMPACTION_PREFIXES
+                        )
                     ):
                         return True
         return False
