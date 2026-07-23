@@ -79,6 +79,7 @@ def test_handoff_in_protected_head_populates_previous_summary_before_update():
         turns_to_summarize,
         focus_topic=None,
         memory_context="",
+        boundary_context="",
     ):
         seen_turns.extend(turns_to_summarize)
         return "new summary from resumed turns"

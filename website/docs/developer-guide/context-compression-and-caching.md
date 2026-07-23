@@ -248,6 +248,13 @@ template:
 [Specific values, error messages, configuration details]
 ```
 
+The immediately preceding content-bearing assistant handoff can already be in
+the protected tail and therefore outside the middle section. The summarizer
+receives that one handoff separately as reconciliation-only boundary context.
+It uses the handoff to move completed work out of pending/remaining state; the
+handoff is not treated as a new instruction and remains verbatim in the tail
+seen by the primary model.
+
 Summary budget scales with the amount of content being compressed:
 - Formula: `content_tokens × 0.20` (the `_SUMMARY_RATIO` constant)
 - Minimum: 2,000 tokens
