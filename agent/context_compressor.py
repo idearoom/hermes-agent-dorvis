@@ -1197,7 +1197,9 @@ class ContextCompressor(ContextEngine):
             self, "_configured_threshold_percent", self.threshold_percent,
         )
         self.threshold_percent = self._effective_threshold_percent(
-            context_length, _configured_pct,
+            context_length,
+            _configured_pct,
+            enabled=getattr(self, "small_context_threshold_floor", True),
         )
         # max_tokens=None here means "caller didn't specify" → keep the existing
         # output reservation. A switch that genuinely changes the output budget
@@ -1271,7 +1273,10 @@ class ContextCompressor(ContextEngine):
 
     @staticmethod
     def _effective_threshold_percent(
-        context_length: int, threshold_percent: float,
+        context_length: int,
+        threshold_percent: float,
+        *,
+        enabled: bool = True,
     ) -> float:
         """Apply the small-context threshold floor (raise-only).
 
@@ -1279,10 +1284,15 @@ class ContextCompressor(ContextEngine):
         than ``_SMALL_CTX_THRESHOLD_PERCENT`` (75%) of the window.  An
         explicitly higher threshold (user config or per-model autoraise,
         e.g. Codex gpt-5.5's 85%) always wins; only lower values are raised.
-        Large-context models keep the configured value — at 512K+ the default
-        50% trigger already leaves ample post-compaction headroom.
+        Set ``enabled=False`` to preserve the configured percentage exactly.
+        Large-context models always keep the configured value — at 512K+ the
+        default 50% trigger already leaves ample post-compaction headroom.
         """
-        if context_length and context_length < _SMALL_CTX_WINDOW_LIMIT:
+        if (
+            enabled
+            and context_length
+            and context_length < _SMALL_CTX_WINDOW_LIMIT
+        ):
             return max(threshold_percent, _SMALL_CTX_THRESHOLD_PERCENT)
         return threshold_percent
 
@@ -1341,6 +1351,7 @@ class ContextCompressor(ContextEngine):
         config_context_length: int | None = None,
         provider: str = "",
         api_mode: str = "",
+        small_context_threshold_floor: bool = True,
         abort_on_summary_failure: bool = False,
         max_tokens: int | None = None,
         quality_gate_enabled: bool = False,
@@ -1353,6 +1364,7 @@ class ContextCompressor(ContextEngine):
         self.provider = provider
         self.api_mode = api_mode
         self.threshold_percent = threshold_percent
+        self.small_context_threshold_floor = small_context_threshold_floor
         self.protect_first_n = protect_first_n
         self.protect_last_n = protect_last_n
         self.summary_target_ratio = max(0.10, min(summary_target_ratio, 0.80))
@@ -1389,7 +1401,9 @@ class ContextCompressor(ContextEngine):
         # (switching small -> large must drop back to the configured value).
         self._configured_threshold_percent = self.threshold_percent
         self.threshold_percent = self._effective_threshold_percent(
-            self.context_length, self.threshold_percent,
+            self.context_length,
+            self.threshold_percent,
+            enabled=self.small_context_threshold_floor,
         )
         threshold_percent = self.threshold_percent
         # Floor: never compress below MINIMUM_CONTEXT_LENGTH tokens even if

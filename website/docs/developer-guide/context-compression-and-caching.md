@@ -82,6 +82,7 @@ All compression settings are read from `config.yaml` under the `compression` key
 compression:
   enabled: true              # Enable/disable compression (default: true)
   threshold: 0.50            # Fraction of context window (default: 0.50 = 50%)
+  small_context_threshold_floor: true  # Raise sub-512K models to at least 75%
   target_ratio: 0.20         # How much of threshold to keep as tail (default: 0.20)
   protect_last_n: 20         # Minimum protected tail messages (default: 20)
   codex_gpt55_autoraise: true  # gpt-5.5 on Codex OAuth: raise trigger to 85% (default: true)
@@ -101,6 +102,7 @@ auxiliary:
 | Parameter | Default | Range | Description |
 |-----------|---------|-------|-------------|
 | `threshold` | `0.50` | 0.0-1.0 | Compression triggers when prompt tokens ≥ `threshold × context_length` |
+| `small_context_threshold_floor` | `true` | bool | Raise sub-512K model thresholds to at least 75%. Set `false` to preserve `threshold` exactly |
 | `target_ratio` | `0.20` | 0.10-0.80 | Controls tail protection token budget: `threshold_tokens × target_ratio` |
 | `protect_last_n` | `20` | ≥1 | Minimum number of recent messages always preserved |
 | `protect_first_n` | `3` | (hardcoded) | System prompt + first exchange always preserved |

@@ -1468,6 +1468,9 @@ DEFAULT_CONFIG = {
                                       # floored at 0.75 (raise-only) so compaction
                                       # doesn't fire with half the window still free;
                                       # set this above 0.75 to override the floor.
+        "small_context_threshold_floor": True,
+                                      # Set False to preserve the configured
+                                      # threshold exactly for sub-512K models.
         "target_ratio": 0.20,         # fraction of threshold to preserve as recent tail
         "protect_last_n": 20,         # minimum recent messages to keep uncompressed
         "hygiene_hard_message_limit": 5000,  # gateway session-hygiene force-compress threshold by message count

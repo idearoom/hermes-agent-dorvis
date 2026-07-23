@@ -17311,6 +17311,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         ("compression", "enabled"),
         ("compression", "threshold"),
         ("compression", "codex_gpt55_autoraise"),
+        ("compression", "small_context_threshold_floor"),
         ("compression", "codex_app_server_auto"),
         ("compression", "target_ratio"),
         ("compression", "protect_first_n"),

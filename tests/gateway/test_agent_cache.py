@@ -229,6 +229,7 @@ class TestExtractCacheBustingConfig:
                     "enabled": False,
                     "threshold": 0.6,
                     "codex_gpt55_autoraise": False,
+                    "small_context_threshold_floor": False,
                     "target_ratio": 0.3,
                     "protect_first_n": 1,
                     "protect_last_n": 25,
@@ -242,6 +243,7 @@ class TestExtractCacheBustingConfig:
         assert out["compression.enabled"] is False
         assert out["compression.threshold"] == 0.6
         assert out["compression.codex_gpt55_autoraise"] is False
+        assert out["compression.small_context_threshold_floor"] is False
         assert out["compression.target_ratio"] == 0.3
         assert out["compression.protect_first_n"] == 1
         assert out["compression.protect_last_n"] == 25

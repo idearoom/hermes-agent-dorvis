@@ -18,10 +18,18 @@ import agent.context_compressor as cc
 from agent.context_compressor import ContextCompressor
 
 
-def _make(ctx: int, pct: float = 0.50) -> ContextCompressor:
+def _make(
+    ctx: int,
+    pct: float = 0.50,
+    *,
+    small_context_threshold_floor: bool = True,
+) -> ContextCompressor:
     with patch.object(cc, "get_model_context_length", return_value=ctx):
         return ContextCompressor(
-            model="test/model", threshold_percent=pct, quiet_mode=True,
+            model="test/model",
+            threshold_percent=pct,
+            small_context_threshold_floor=small_context_threshold_floor,
+            quiet_mode=True,
         )
 
 
@@ -42,6 +50,19 @@ class TestSmallContextThresholdFloor:
         # Explicit 85% (user config or Codex gpt-5.5 autoraise) is not lowered.
         comp = _make(128_000, pct=0.85)
         assert comp.threshold_percent == 0.85
+
+    def test_floor_can_be_disabled_to_preserve_configured_threshold(self):
+        comp = _make(
+            272_000,
+            pct=0.50,
+            small_context_threshold_floor=False,
+        )
+        assert comp.threshold_percent == 0.50
+        assert comp.threshold_tokens == 136_000
+
+        comp.update_model("small", 200_000)
+        assert comp.threshold_percent == 0.50
+        assert comp.threshold_tokens == 100_000
 
     def test_degenerate_minimum_window_still_uses_85(self):
         # 64K window: the MINIMUM_CONTEXT_LENGTH floor pushes the threshold

@@ -2225,6 +2225,7 @@ class TestCodexAppServerAutoConfig:
     def test_default_config_has_native_mode(self):
         assert DEFAULT_CONFIG["compression"]["codex_app_server_auto"] == "native"
         assert DEFAULT_CONFIG["compression"]["codex_gpt55_autoraise"] is True
+        assert DEFAULT_CONFIG["compression"]["small_context_threshold_floor"] is True
 
     def test_preserves_existing_codex_app_server_auto_value(self, tmp_path):
         with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):

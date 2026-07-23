@@ -210,6 +210,34 @@ def test_codex_gpt55_autoraise_still_applies_to_builtin_compressor():
     assert agent._compression_warning and "85%" in agent._compression_warning
 
 
+def test_small_context_threshold_floor_can_be_disabled_for_builtin_compressor():
+    """The configured threshold remains exact when both raises are disabled."""
+    cfg = {
+        "compression": {
+            "enabled": True,
+            "threshold": 0.50,
+            "codex_gpt55_autoraise": False,
+            "small_context_threshold_floor": False,
+        },
+        "agent": {},
+    }
+
+    with (
+        patch("hermes_cli.config.load_config", return_value=cfg),
+        patch("agent.context_compressor.get_model_context_length", return_value=272_000),
+        patch("run_agent.get_tool_definitions", return_value=[]),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI"),
+    ):
+        from run_agent import AIAgent
+
+        agent = AIAgent(**_codex_agent_kwargs())
+
+    assert agent._compression_threshold_autoraised is None
+    assert agent.context_compressor.threshold_percent == 0.50
+    assert agent.context_compressor.threshold_tokens == 136_000
+
+
 def test_codex_gpt55_autoraise_applies_when_plugin_engine_missing():
     """If the configured engine fails to load, the built-in compressor is
     active and the autoraise (plus its notice) must still apply."""

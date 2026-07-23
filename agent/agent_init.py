@@ -1629,6 +1629,9 @@ def init_agent(
     _codex_gpt55_autoraise_notice = str(
         _compression_cfg.get("codex_gpt55_autoraise_notice", True)
     ).lower() in {"true", "1", "yes"}
+    _small_context_threshold_floor = str(
+        _compression_cfg.get("small_context_threshold_floor", True)
+    ).lower() in {"true", "1", "yes"}
     agent._compression_threshold_autoraised = None
     try:
         from agent.auxiliary_client import (
@@ -1944,6 +1947,7 @@ def init_agent(
             config_context_length=_config_context_length,
             provider=agent.provider,
             api_mode=agent.api_mode,
+            small_context_threshold_floor=_small_context_threshold_floor,
             abort_on_summary_failure=compression_abort_on_summary_failure,
             max_tokens=agent.max_tokens,
             quality_gate_enabled=compression_quality_gate_enabled,
