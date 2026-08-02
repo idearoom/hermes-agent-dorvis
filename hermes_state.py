@@ -152,6 +152,38 @@ T = TypeVar("T")
 
 DEFAULT_DB_PATH = get_hermes_home() / "state.db"
 
+
+def is_default_state_db_path(db_path) -> bool:
+    """True when *db_path* is this process's own default ``state.db``."""
+    try:
+        return Path(db_path).resolve() == DEFAULT_DB_PATH.resolve()
+    except OSError:
+        return Path(db_path) == DEFAULT_DB_PATH
+
+
+def open_session_db_for_home(home, **kwargs) -> "SessionDB":
+    """Open the session store for a profile *home* without defeating dispatch.
+
+    IdeaRoom D6b (AE-115 / AE-182). ``SessionDB(db_path=...)`` deliberately
+    means "this exact SQLite file" and is never redirected — see
+    ``SessionDB.__new__``. That makes it the wrong constructor for callers that
+    really mean "the session store belonging to this home": when the home IS
+    the default one and ``HERMES_STATE_STORE_DSN`` is set, passing an explicit
+    path silently bypasses the Postgres dispatch and writes shared gateway
+    state to the local file instead — which is exactly the regression an
+    upstream rebase introduced in ``gateway/platforms/api_server.py``.
+
+    Use this helper for per-profile routing: the default home resolves through
+    the dispatch (Postgres when the DSN is set, SQLite otherwise) and any other
+    profile home opens its own on-disk file, which is always SQLite because
+    only one home can own the shared store.
+    """
+    db_path = Path(home) / "state.db"
+    if is_default_state_db_path(db_path):
+        return SessionDB(**kwargs)
+    return SessionDB(db_path=db_path, **kwargs)
+
+
 SCHEMA_VERSION = 22
 
 # Cap on user-controlled FTS5 query input before regex/sanitizer processing.

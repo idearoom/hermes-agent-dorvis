@@ -20,6 +20,11 @@ bodies run their (almost entirely standard) SQL through a small
 SQLite→Postgres statement translator (`?`→`%s`, ``INSERT OR IGNORE``→
 ``ON CONFLICT DO NOTHING``, ``json_extract``→``jsonb ->>``, ``LIKE``→``ILIKE``
 to keep SQLite's ASCII case-insensitive matching, ``X'0A'`` hex literals).
+A small ``STATEMENT_OVERRIDES`` table replaces whole statements that differ by
+*scoping* rather than syntax and so cannot be translated by pattern (today:
+the ``session_model_usage`` upsert, whose bare ``DO UPDATE SET`` self-
+references are ambiguous on Postgres).
+
 Only the genuinely dialect-divergent surfaces are overridden: construction,
 schema init, the write-transaction executor, FTS search (tsvector + ILIKE
 instead of FTS5/trigram), and SQLite maintenance (WAL checkpoints, VACUUM,
@@ -65,29 +70,46 @@ _SCHEMA = "hermes_state"
 # version or edits SCHEMA_SQL/DEFERRED_INDEX_SQL, PgSessionDB must refuse to
 # boot until a human re-audits PG_SCHEMA_SQL (and ships any expand/contract
 # migration per ADR 0177's coexistence rule), then updates these constants.
-EXPECTED_SCHEMA_VERSION = 19
+EXPECTED_SCHEMA_VERSION = 22
 EXPECTED_SCHEMA_SURFACE_SHA256 = (
+    "ffb802aede5aab2e95d1eb46188864c11b4b8e290c538ada64c06b9a14747654"
+)
+
+# ── Audited predecessor markers (AE-182) ───────────────────────────────────
+# The GPT-5.6 upstream rebase (fork commit e415d8591) carried hermes_state.py
+# from v19 to v22 without re-auditing this adapter, so every gateway boot
+# since then tripped the guard above and silently fell back to the local
+# SQLite/JSONL store. The v19→v22 delta is purely ADDITIVE (two sessions
+# columns, two messages columns, two new tables + their indexes), so the
+# Postgres side upgrades in place: PG_EXPAND_SQL applies the additive DDL and
+# _assert_persisted_schema_markers advances the persisted markers.
+#
+# Two v19-era surface markers exist in the wild depending on which build first
+# initialized a given database; both are explicitly audited as additive
+# predecessors of the v22 surface. Everything else still fails closed.
+_V19_SURFACE_SHA256_PRE_ACTIVE_NULL_INDEX = (
+    "df28fdc5fd8be0e48373abed404a6cd33ccf88f2fa11962ac29d53d75ced15a0"
+)
+_V19_SURFACE_SHA256 = (
     "c330e63b92990f7d5528e2f2faf980d147f125ca491833e65bf7834e81fbfbdc"
 )
 
-# Keep the persisted marker on the previous audited surface for one release.
-# The prior runtime rejects EXPECTED_SCHEMA_SURFACE_SHA256, so advancing the
-# shared marker here would make rollback fail even though this upstream change
-# is only an additive, empty-on-Postgres partial index.
-_ROLLBACK_COMPATIBLE_SCHEMA_SURFACE_SHA256 = (
-    "df28fdc5fd8be0e48373abed404a6cd33ccf88f2fa11962ac29d53d75ced15a0"
-)
-
-# Explicitly audited, additive predecessor surfaces that may be accepted after
-# PG_SCHEMA_SQL has applied the new IF NOT EXISTS DDL. Retain the
-# predecessor marker during the rollback window; every other unknown marker
-# still fails closed.
+# Persisted surface markers that may be accepted (and then advanced) after
+# _init_pg_schema has applied the additive IF NOT EXISTS / ADD COLUMN IF NOT
+# EXISTS DDL. Every other unknown marker still fails closed.
 _COMPATIBLE_PREVIOUS_SCHEMA_SURFACE_SHA256 = frozenset(
     {
         # Upstream 2ebf9a90: before the legacy-SQLite active=NULL repair index.
-        _ROLLBACK_COMPATIBLE_SCHEMA_SURFACE_SHA256,
+        _V19_SURFACE_SHA256_PRE_ACTIVE_NULL_INDEX,
+        # Upstream v19 terminal surface (with that repair index).
+        _V19_SURFACE_SHA256,
     }
 )
+
+# Persisted schema_version values this build knows how to expand in place.
+# Anything else means "a different hermes build owns this database" and still
+# raises rather than writing into an unknown shape.
+_UPGRADEABLE_FROM_SCHEMA_VERSIONS = frozenset({19})
 
 # state_meta keys used by the Pg backend's persisted markers.
 _META_SURFACE_KEY = "pg_backend_schema_surface_sha256"
@@ -137,7 +159,7 @@ def _normalize_dsn(dsn: str) -> str:
     return dsn.replace("sslmode=no-verify", "sslmode=require")
 
 
-# ── Postgres DDL (mirrors hermes_state.SCHEMA_SQL @ v19) ───────────────────
+# ── Postgres DDL (mirrors hermes_state.SCHEMA_SQL @ v22) ───────────────────
 # Type mapping: TEXT→TEXT, REAL→DOUBLE PRECISION, INTEGER→BIGINT,
 # AUTOINCREMENT→IDENTITY (BY DEFAULT, so the migration script can insert
 # explicit ids). FKs are DEFERRABLE so the one-time migration can bulk-copy
@@ -197,6 +219,8 @@ PG_SCHEMA_SQL: List[str] = [
         handoff_error TEXT,
         compression_failure_cooldown_until DOUBLE PRECISION,
         compression_failure_error TEXT,
+        compression_fallback_streak BIGINT NOT NULL DEFAULT 0,
+        profile_name TEXT,
         rewind_count BIGINT NOT NULL DEFAULT 0,
         archived BIGINT NOT NULL DEFAULT 0,
         FOREIGN KEY (parent_session_id) REFERENCES {_SCHEMA}.sessions(id)
@@ -211,6 +235,7 @@ PG_SCHEMA_SQL: List[str] = [
         tool_call_id TEXT,
         tool_calls TEXT,
         tool_name TEXT,
+        effect_disposition TEXT,
         timestamp DOUBLE PRECISION NOT NULL,
         token_count BIGINT,
         finish_reason TEXT,
@@ -222,7 +247,68 @@ PG_SCHEMA_SQL: List[str] = [
         platform_message_id TEXT,
         observed BIGINT DEFAULT 0,
         active BIGINT NOT NULL DEFAULT 1,
-        compacted BIGINT NOT NULL DEFAULT 0
+        compacted BIGINT NOT NULL DEFAULT 0,
+        api_content TEXT
+    )""",
+    # v20/v22 (upstream cb7f6bbb2 + eb6aa0360): per-model, per-task usage
+    # attribution. Created at the terminal v22 shape — ``task`` is part of the
+    # PRIMARY KEY, which is what ``_record_model_usage``'s
+    # ``ON CONFLICT (session_id, model, billing_provider, billing_base_url,
+    # billing_mode, task) DO UPDATE`` arbitrates on. SQLite needed a
+    # rename/rebuild dance for that PK change; Postgres never had a v20/v21
+    # shape to rebuild (the store was cut over at v19, before this table
+    # existed), so the terminal shape is created directly.
+    f"""CREATE TABLE IF NOT EXISTS {_SCHEMA}.session_model_usage (
+        session_id TEXT NOT NULL REFERENCES {_SCHEMA}.sessions(id)
+            ON DELETE CASCADE DEFERRABLE INITIALLY IMMEDIATE,
+        model TEXT NOT NULL,
+        billing_provider TEXT NOT NULL DEFAULT '',
+        billing_base_url TEXT NOT NULL DEFAULT '',
+        billing_mode TEXT NOT NULL DEFAULT '',
+        task TEXT NOT NULL DEFAULT '',
+        api_call_count BIGINT NOT NULL DEFAULT 0,
+        input_tokens BIGINT NOT NULL DEFAULT 0,
+        output_tokens BIGINT NOT NULL DEFAULT 0,
+        cache_read_tokens BIGINT NOT NULL DEFAULT 0,
+        cache_write_tokens BIGINT NOT NULL DEFAULT 0,
+        reasoning_tokens BIGINT NOT NULL DEFAULT 0,
+        estimated_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
+        actual_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
+        cost_status TEXT,
+        cost_source TEXT,
+        first_seen DOUBLE PRECISION,
+        last_seen DOUBLE PRECISION,
+        PRIMARY KEY (session_id, model, billing_provider, billing_base_url,
+                     billing_mode, task)
+    )""",
+    # v21 (upstream d0e9a42ce). Mirrored for schema-surface parity only:
+    # ``tools/async_delegation.py`` opens its OWN sqlite3 connection to
+    # ``get_hermes_home()/state.db`` and never goes through SessionDB, and its
+    # rows are node-local by construction (owner_pid / owner_started_at name a
+    # process on one host). Nothing writes this table on Postgres today; it
+    # exists so a future upstream change that routes delegations through
+    # SessionDB finds the table already present. See docs/hermes/state-db-repair.md
+    # in idearoom-agents for why the EFS state.db is therefore not fully
+    # residual after the Postgres cutover.
+    f"""CREATE TABLE IF NOT EXISTS {_SCHEMA}.async_delegations (
+        delegation_id TEXT PRIMARY KEY,
+        origin_session TEXT NOT NULL,
+        origin_ui_session_id TEXT NOT NULL DEFAULT '',
+        parent_session_id TEXT,
+        state TEXT NOT NULL,
+        dispatched_at DOUBLE PRECISION NOT NULL,
+        completed_at DOUBLE PRECISION,
+        updated_at DOUBLE PRECISION NOT NULL,
+        event_json TEXT,
+        result_json TEXT,
+        delivery_state TEXT NOT NULL DEFAULT 'pending',
+        delivery_attempts BIGINT NOT NULL DEFAULT 0,
+        delivered_at DOUBLE PRECISION,
+        owner_pid BIGINT,
+        owner_started_at BIGINT,
+        task_json TEXT,
+        delivery_claim TEXT,
+        delivery_claimed_at DOUBLE PRECISION
     )""",
     f"""CREATE TABLE IF NOT EXISTS {_SCHEMA}.state_meta (
         key TEXT PRIMARY KEY,
@@ -277,6 +363,12 @@ PG_SCHEMA_SQL: List[str] = [
     f"CREATE INDEX IF NOT EXISTS idx_sessions_started ON {_SCHEMA}.sessions(started_at DESC)",
     f"CREATE INDEX IF NOT EXISTS idx_messages_session ON {_SCHEMA}.messages(session_id, timestamp)",
     f"CREATE INDEX IF NOT EXISTS idx_compression_locks_expires ON {_SCHEMA}.compression_locks(expires_at)",
+    f"CREATE INDEX IF NOT EXISTS idx_session_model_usage_session "
+    f"ON {_SCHEMA}.session_model_usage(session_id)",
+    f"CREATE INDEX IF NOT EXISTS idx_session_model_usage_model "
+    f"ON {_SCHEMA}.session_model_usage(model)",
+    f"CREATE INDEX IF NOT EXISTS idx_async_delegations_delivery "
+    f"ON {_SCHEMA}.async_delegations(delivery_state, completed_at)",
     f"CREATE INDEX IF NOT EXISTS idx_messages_session_active "
     f"ON {_SCHEMA}.messages(session_id, active, timestamp)",
     # Mirrors upstream's legacy-SQLite repair index. Postgres declares active
@@ -301,6 +393,59 @@ PG_SCHEMA_SQL: List[str] = [
     f"USING GIN (to_tsvector('simple', {_SEARCH_TEXT_SQL.format(a='')}))",
 ]
 
+# ── Expand migration (ADR 0177 coexistence) ────────────────────────────────
+# ``CREATE TABLE IF NOT EXISTS`` never adds columns to a table that already
+# exists, so the v19→v22 column additions need explicit ALTERs. All of them are
+# additive and either nullable or defaulted, which is what makes them
+# coexistence-safe: a still-draining v19 gateway task keeps working against the
+# widened tables because its SQL never names the new columns, and Postgres 11+
+# adds a defaulted column via catalog metadata rather than a table rewrite, so
+# there is no long exclusive lock on ``messages``. Runs inside the bootstrap
+# advisory lock, after PG_SCHEMA_SQL, on every boot (idempotent).
+PG_EXPAND_SQL: List[str] = [
+    f"ALTER TABLE {_SCHEMA}.sessions ADD COLUMN IF NOT EXISTS "
+    "compression_fallback_streak BIGINT NOT NULL DEFAULT 0",
+    f"ALTER TABLE {_SCHEMA}.sessions ADD COLUMN IF NOT EXISTS profile_name TEXT",
+    f"ALTER TABLE {_SCHEMA}.messages ADD COLUMN IF NOT EXISTS effect_disposition TEXT",
+    f"ALTER TABLE {_SCHEMA}.messages ADD COLUMN IF NOT EXISTS api_content TEXT",
+]
+
+# Data migration for the v19→v20 step (upstream cb7f6bbb2): seed one
+# session_model_usage row per historical session from the aggregate counters
+# already on the sessions row, so insights/analytics read uniformly from the
+# new table instead of showing nothing for pre-v20 sessions. Postgres port of
+# the SQLite ``INSERT OR IGNORE ... SELECT`` in hermes_state._init_schema.
+# ``ON CONFLICT DO NOTHING`` keeps it idempotent — a row already written by the
+# live accounting path always wins over the stale aggregate.
+PG_V20_USAGE_BACKFILL_SQL = f"""
+    INSERT INTO {_SCHEMA}.session_model_usage (
+        session_id, model, billing_provider, billing_base_url, billing_mode,
+        task, api_call_count, input_tokens, output_tokens, cache_read_tokens,
+        cache_write_tokens, reasoning_tokens, estimated_cost_usd,
+        actual_cost_usd, cost_status, cost_source, first_seen, last_seen
+    )
+    SELECT id, COALESCE(model, 'unknown'),
+           COALESCE(billing_provider, ''),
+           COALESCE(billing_base_url, ''),
+           COALESCE(billing_mode, ''),
+           '',
+           COALESCE(api_call_count, 0),
+           COALESCE(input_tokens, 0),
+           COALESCE(output_tokens, 0),
+           COALESCE(cache_read_tokens, 0),
+           COALESCE(cache_write_tokens, 0),
+           COALESCE(reasoning_tokens, 0),
+           COALESCE(estimated_cost_usd, 0),
+           COALESCE(actual_cost_usd, 0),
+           cost_status, cost_source,
+           started_at, COALESCE(ended_at, started_at)
+    FROM {_SCHEMA}.sessions
+    WHERE COALESCE(input_tokens, 0) + COALESCE(output_tokens, 0)
+          + COALESCE(cache_read_tokens, 0) + COALESCE(cache_write_tokens, 0)
+          + COALESCE(reasoning_tokens, 0) > 0
+    ON CONFLICT DO NOTHING
+"""
+
 # Best-effort statements: run after PG_SCHEMA_SQL, failures downgrade
 # gracefully (pg_trgm may be unavailable / unprivileged on some hosts; the
 # ILIKE CJK path still works without the index, just unaccelerated).
@@ -324,6 +469,74 @@ _JSON_EXTRACT_PLAIN_RE = re.compile(
 _INSERT_OR_IGNORE_RE = re.compile(r"^(\s*)INSERT\s+OR\s+IGNORE\s+INTO\b", re.IGNORECASE)
 _LIKE_RE = re.compile(r"\bLIKE\b")
 _INSERT_MESSAGES_RE = re.compile(r"^\s*INSERT\s+INTO\s+messages\s*\(", re.IGNORECASE)
+
+# ── Whole-statement overrides ──────────────────────────────────────────────
+# A handful of inherited statements are not mechanically translatable because
+# SQLite and Postgres disagree on *scoping*, not syntax. Rewriting those by
+# pattern would mean parsing SQL in the hot path; instead each one is replaced
+# wholesale, keyed by its whitespace-normalized upstream text. If an upstream
+# rebase edits the original by so much as a column, the key stops matching —
+# ``tests/gateway/test_session_store_pg_unit.py`` asserts every key is still
+# present in ``hermes_state.py``, so that drift fails a unit test instead of
+# surfacing as a runtime error in production.
+
+
+def _normalize_statement(sql: str) -> str:
+    return " ".join(sql.split())
+
+
+# update_token_counts / record_auxiliary_usage (upstream v20 cb7f6bbb2 +
+# v22 eb6aa0360). Inside ``DO UPDATE SET`` both the target table and
+# ``excluded`` are in scope on Postgres, so SQLite's bare self-reference
+# ("api_call_count = api_call_count + excluded.api_call_count", meaning the
+# row already stored) raises `column reference "..." is ambiguous`. The
+# rewrite only qualifies those reads with the target table; the accumulate
+# semantics are identical.
+_USAGE_UPSERT_SQLITE = """INSERT INTO session_model_usage (
+                   session_id, model, billing_provider, billing_base_url, billing_mode,
+                   task, api_call_count, input_tokens, output_tokens,
+                   cache_read_tokens, cache_write_tokens, reasoning_tokens,
+                   estimated_cost_usd, actual_cost_usd, cost_status, cost_source,
+                   first_seen, last_seen
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(session_id, model, billing_provider, billing_base_url, billing_mode, task)
+               DO UPDATE SET
+                   api_call_count = api_call_count + excluded.api_call_count,
+                   input_tokens = input_tokens + excluded.input_tokens,
+                   output_tokens = output_tokens + excluded.output_tokens,
+                   cache_read_tokens = cache_read_tokens + excluded.cache_read_tokens,
+                   cache_write_tokens = cache_write_tokens + excluded.cache_write_tokens,
+                   reasoning_tokens = reasoning_tokens + excluded.reasoning_tokens,
+                   estimated_cost_usd = estimated_cost_usd + excluded.estimated_cost_usd,
+                   actual_cost_usd = actual_cost_usd + excluded.actual_cost_usd,
+                   cost_status = COALESCE(excluded.cost_status, cost_status),
+                   cost_source = COALESCE(excluded.cost_source, cost_source),
+                   last_seen = excluded.last_seen"""
+
+_USAGE_UPSERT_PG = """INSERT INTO session_model_usage (
+                   session_id, model, billing_provider, billing_base_url, billing_mode,
+                   task, api_call_count, input_tokens, output_tokens,
+                   cache_read_tokens, cache_write_tokens, reasoning_tokens,
+                   estimated_cost_usd, actual_cost_usd, cost_status, cost_source,
+                   first_seen, last_seen
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(session_id, model, billing_provider, billing_base_url, billing_mode, task)
+               DO UPDATE SET
+                   api_call_count = session_model_usage.api_call_count + excluded.api_call_count,
+                   input_tokens = session_model_usage.input_tokens + excluded.input_tokens,
+                   output_tokens = session_model_usage.output_tokens + excluded.output_tokens,
+                   cache_read_tokens = session_model_usage.cache_read_tokens + excluded.cache_read_tokens,
+                   cache_write_tokens = session_model_usage.cache_write_tokens + excluded.cache_write_tokens,
+                   reasoning_tokens = session_model_usage.reasoning_tokens + excluded.reasoning_tokens,
+                   estimated_cost_usd = session_model_usage.estimated_cost_usd + excluded.estimated_cost_usd,
+                   actual_cost_usd = session_model_usage.actual_cost_usd + excluded.actual_cost_usd,
+                   cost_status = COALESCE(excluded.cost_status, session_model_usage.cost_status),
+                   cost_source = COALESCE(excluded.cost_source, session_model_usage.cost_source),
+                   last_seen = excluded.last_seen"""
+
+STATEMENT_OVERRIDES: Dict[str, str] = {
+    _normalize_statement(_USAGE_UPSERT_SQLITE): _USAGE_UPSERT_PG,
+}
 
 
 def _split_literals(sql: str) -> List[tuple]:
@@ -362,6 +575,7 @@ def _translate_sql(sql: str, *, with_params: bool) -> str:
     ``INSERT OR IGNORE`` rewrites run on the raw statement first because
     their patterns intentionally span literals.
     """
+    sql = STATEMENT_OVERRIDES.get(_normalize_statement(sql), sql)
     ignore = _INSERT_OR_IGNORE_RE.match(sql)
     if ignore:
         sql = _INSERT_OR_IGNORE_RE.sub(r"\1INSERT INTO", sql, count=1)
@@ -733,6 +947,10 @@ class PgSessionDB(SessionDB):
             try:
                 for stmt in PG_SCHEMA_SQL:
                     conn.execute(stmt)
+                # Additive column migration for databases created by an
+                # earlier audited schema (see PG_EXPAND_SQL).
+                for stmt in PG_EXPAND_SQL:
+                    conn.execute(stmt)
                 for stmt in PG_TRGM_SQL:
                     try:
                         conn.execute(stmt)
@@ -758,12 +976,18 @@ class PgSessionDB(SessionDB):
                     )
 
     def _assert_persisted_schema_markers(self, conn) -> None:
-        """Record/verify the schema version + surface hash inside Postgres.
+        """Record/verify/advance the schema version + surface hash in Postgres.
 
         Guards the other half of the drift matrix: this *database* was
         initialized by a build pinned to a specific upstream schema. A build
         pinned to a different one must not write into it silently — schema
         moves need a deliberate expand/contract migration (ADR 0177).
+
+        When the persisted markers name an explicitly audited, purely additive
+        predecessor (v19 → v22, AE-182), the expand DDL has already been
+        applied by ``_init_pg_schema`` above and this method finishes the
+        migration: it runs the version-gated data backfills and advances the
+        markers. Every other value still fails closed.
         """
         row = conn.execute(
             f"SELECT version FROM {_SCHEMA}.schema_version LIMIT 1"
@@ -773,14 +997,28 @@ class PgSessionDB(SessionDB):
                 f"INSERT INTO {_SCHEMA}.schema_version (version) VALUES (%s)",
                 (EXPECTED_SCHEMA_VERSION,),
             )
-        elif int(row[0]) != EXPECTED_SCHEMA_VERSION:
-            raise RuntimeError(
-                f"Postgres session store schema_version is {row[0]}, but "
-                f"this build expects {EXPECTED_SCHEMA_VERSION}. A different "
-                "hermes build initialized this database — ship an explicit "
-                "migration (ADR 0177 expand/contract) before pointing this "
-                "build at it."
-            )
+        else:
+            db_version = int(row[0])
+            if db_version != EXPECTED_SCHEMA_VERSION:
+                if db_version not in _UPGRADEABLE_FROM_SCHEMA_VERSIONS:
+                    raise RuntimeError(
+                        f"Postgres session store schema_version is {db_version}, "
+                        f"but this build expects {EXPECTED_SCHEMA_VERSION}. A "
+                        "different hermes build initialized this database — ship "
+                        "an explicit migration (ADR 0177 expand/contract) before "
+                        "pointing this build at it."
+                    )
+                self._apply_version_data_migrations(conn, db_version)
+                conn.execute(
+                    f"UPDATE {_SCHEMA}.schema_version SET version = %s",
+                    (EXPECTED_SCHEMA_VERSION,),
+                )
+                logger.warning(
+                    "Postgres session store expanded from schema v%s to v%s "
+                    "(additive columns/tables applied; AE-182)",
+                    db_version,
+                    EXPECTED_SCHEMA_VERSION,
+                )
         row = conn.execute(
             f"SELECT value FROM {_SCHEMA}.state_meta WHERE key = %s",
             (_META_SURFACE_KEY,),
@@ -789,23 +1027,27 @@ class PgSessionDB(SessionDB):
             conn.execute(
                 f"INSERT INTO {_SCHEMA}.state_meta (key, value) VALUES (%s, %s) "
                 "ON CONFLICT (key) DO NOTHING",
-                (
-                    _META_SURFACE_KEY,
-                    _ROLLBACK_COMPATIBLE_SCHEMA_SURFACE_SHA256,
-                ),
+                (_META_SURFACE_KEY, EXPECTED_SCHEMA_SURFACE_SHA256),
             )
         elif row[0] != EXPECTED_SCHEMA_SURFACE_SHA256:
             if row[0] in _COMPATIBLE_PREVIOUS_SCHEMA_SURFACE_SHA256:
-                # _init_pg_schema applies all additive DDL before reaching
-                # this marker check, and the enclosing advisory lock
-                # serializes blue/green bootstraps. Keep this explicitly
-                # audited predecessor persisted so the prior runtime can boot
-                # after a rollback; the new additive index is still present.
-                logger.info(
-                    "retaining rollback-compatible Postgres session-store "
-                    "schema surface marker %s while build expects %s",
+                # _init_pg_schema applies all additive DDL before reaching this
+                # marker check, and the enclosing advisory lock serializes
+                # blue/green bootstraps, so advancing here is safe. Rollback
+                # note: no build between this one and the audited v19
+                # predecessor can use the Postgres store at all (they trip
+                # assert_schema_compat and fall back to local SQLite), so
+                # holding the marker back would protect nothing and would hide
+                # genuine future drift.
+                logger.warning(
+                    "advancing Postgres session-store schema surface marker "
+                    "%s -> %s after applying the audited additive DDL",
                     row[0],
                     EXPECTED_SCHEMA_SURFACE_SHA256,
+                )
+                conn.execute(
+                    f"UPDATE {_SCHEMA}.state_meta SET value = %s WHERE key = %s",
+                    (EXPECTED_SCHEMA_SURFACE_SHA256, _META_SURFACE_KEY),
                 )
             else:
                 raise RuntimeError(
@@ -814,6 +1056,33 @@ class PgSessionDB(SessionDB):
                     f"build={EXPECTED_SCHEMA_SURFACE_SHA256}). Rebase drift — "
                     "re-audit hermes_state_pg.py and migrate deliberately."
                 )
+
+    def _apply_version_data_migrations(self, conn, db_version: int) -> None:
+        """Row backfills for the version-gated steps this build can expand.
+
+        Mirrors the ``if current_version < N`` chain in
+        ``hermes_state.SessionDB._init_schema``, restricted to the steps whose
+        data actually lives in the Postgres store. Best-effort by design (same
+        as upstream): a failed analytics backfill must never keep the session
+        store from booting, because the alternative is another silent fallback
+        to the local SQLite file.
+        """
+        if db_version < 20:
+            try:
+                conn.execute(PG_V20_USAGE_BACKFILL_SQL)
+            except Exception:
+                logger.warning(
+                    "v20 session_model_usage backfill skipped on the Postgres "
+                    "session store; historical per-model analytics may be "
+                    "incomplete",
+                    exc_info=True,
+                )
+        # v21 (async_delegations) has no Postgres-resident data: the durable
+        # delegation rows are written by tools/async_delegation.py straight to
+        # the node-local SQLite state.db and are process-scoped anyway.
+        # v22 (session_model_usage.task in the PRIMARY KEY) needs no rebuild
+        # here: Postgres never held a v20/v21 shape of that table — it is
+        # created at the terminal v22 shape by PG_SCHEMA_SQL.
 
     def _init_schema(self) -> None:  # pragma: no cover - safety net
         self._init_pg_schema()

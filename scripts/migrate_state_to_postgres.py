@@ -2,9 +2,10 @@
 """One-time migration: copy a SQLite ``state.db`` into the Postgres session store.
 
 IdeaRoom D6b (AE-115). Companion to ``hermes_state_pg.PgSessionDB`` — copies
-every session-store table (sessions, messages incl. ``active``/``compacted``
-soft-archive flags, state_meta, gateway_routing, compression_locks, and the
-telegram topic tables when present) into the dedicated ``hermes_state``
+every session-store table (sessions, session_model_usage, messages incl.
+``active``/``compacted`` soft-archive flags, state_meta, gateway_routing,
+compression_locks, and the telegram topic tables when present) into the
+dedicated ``hermes_state``
 Postgres schema. Cutover (pointing the gateway at the DSN, retiring the EFS
 file) is a separate issue; this script only moves data.
 
@@ -42,6 +43,12 @@ from hermes_state_pg import _SCHEMA, PgSessionDB, _normalize_dsn  # noqa: E402
 # leases but copied anyway so an in-flight lease survives a cutover.
 _TABLES = [
     "sessions",
+    # FK → sessions(id), so it must follow "sessions". Added with the v19→v22
+    # audit (AE-182): per-model/per-task usage rows written by
+    # update_token_counts / record_auxiliary_usage. ``async_delegations`` is
+    # deliberately NOT copied — tools/async_delegation.py owns that table on
+    # the node-local SQLite file and its rows are process-scoped (owner_pid).
+    "session_model_usage",
     "messages",
     "state_meta",
     "gateway_routing",

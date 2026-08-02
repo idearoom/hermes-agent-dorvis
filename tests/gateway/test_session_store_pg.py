@@ -37,6 +37,7 @@ if not _DSN:
 
 import hermes_state
 from hermes_state import AsyncSessionDB, SessionDB
+import hermes_state_pg
 from hermes_state_pg import _SCHEMA, EXPECTED_SCHEMA_VERSION, PgSessionDB
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -374,6 +375,118 @@ def test_boot_fails_on_persisted_surface_mismatch(pg_db):
         )
     with pytest.raises(RuntimeError, match="Rebase drift"):
         PgSessionDB(dsn=_DSN)
+
+
+# ── v19 → v22 in-place expand (AE-182) ─────────────────────────────────────
+
+
+def _rewind_store_to_v19(conn):
+    """Make a live store look like the v19 database production actually has.
+
+    Drops the tables and columns the v19→v22 upstream steps added and restores
+    the v19 persisted markers, so the next boot exercises the real expand path
+    instead of a fresh CREATE.
+    """
+    conn.execute(f"DROP TABLE IF EXISTS {_SCHEMA}.session_model_usage")
+    conn.execute(f"DROP TABLE IF EXISTS {_SCHEMA}.async_delegations")
+    for table, column in (
+        ("sessions", "compression_fallback_streak"),
+        ("sessions", "profile_name"),
+        ("messages", "effect_disposition"),
+        ("messages", "api_content"),
+    ):
+        conn.execute(f"ALTER TABLE {_SCHEMA}.{table} DROP COLUMN IF EXISTS {column}")
+    conn.execute(f"UPDATE {_SCHEMA}.schema_version SET version = 19")
+    conn.execute(
+        f"UPDATE {_SCHEMA}.state_meta SET value = %s "
+        "WHERE key = 'pg_backend_schema_surface_sha256'",
+        (hermes_state_pg._V19_SURFACE_SHA256,),
+    )
+
+
+def test_v19_store_expands_in_place_and_keeps_its_rows(pg_db):
+    """The production case: an existing v19 store must widen, not be recreated."""
+    sid = pg_db.create_session("sess-v19", "webui", model="m1")
+    pg_db.append_message(sid, "user", "written before the expand")
+    pg_db.update_token_counts(sid, input_tokens=10, output_tokens=5)
+    pg_db.close()
+
+    with psycopg.connect(_DSN, autocommit=True) as conn:
+        _rewind_store_to_v19(conn)
+
+    db = PgSessionDB(dsn=_DSN)
+    try:
+        # Pre-existing rows survive.
+        assert db.get_messages(sid)[0]["content"] == "written before the expand"
+        # New surfaces exist and are writable.
+        db.append_message(sid, "assistant", "after", api_content="raw-bytes")
+        db.record_auxiliary_usage(
+            sid, "vision", model="gemini", input_tokens=7, output_tokens=3
+        )
+        with psycopg.connect(_DSN, autocommit=True) as conn:
+            assert (
+                conn.execute(
+                    f"SELECT version FROM {_SCHEMA}.schema_version"
+                ).fetchone()[0]
+                == EXPECTED_SCHEMA_VERSION
+            )
+            assert (
+                conn.execute(
+                    f"SELECT value FROM {_SCHEMA}.state_meta "
+                    "WHERE key = 'pg_backend_schema_surface_sha256'"
+                ).fetchone()[0]
+                == hermes_state_pg.EXPECTED_SCHEMA_SURFACE_SHA256
+            )
+            # v20 backfill seeded the historical session's aggregate row.
+            rows = conn.execute(
+                f"SELECT task, input_tokens, output_tokens FROM "
+                f"{_SCHEMA}.session_model_usage WHERE session_id = %s "
+                "ORDER BY task",
+                (sid,),
+            ).fetchall()
+        by_task = {r[0]: (r[1], r[2]) for r in rows}
+        assert by_task[""][0] >= 10  # main-loop aggregate, backfilled
+        assert by_task["vision"] == (7, 3)  # aux call recorded post-expand
+    finally:
+        db.close()
+
+
+def test_expand_is_idempotent_across_reboots(pg_db):
+    pg_db.close()
+    with psycopg.connect(_DSN, autocommit=True) as conn:
+        _rewind_store_to_v19(conn)
+    first = PgSessionDB(dsn=_DSN)
+    first.close()
+    second = PgSessionDB(dsn=_DSN)  # already at v22 — must not raise
+    second.close()
+
+
+def test_per_model_usage_accumulates_across_calls(pg_db):
+    """Covers the DO UPDATE SET statement override (bare self-references)."""
+    sid = pg_db.create_session("sess-usage", "webui", model="m1")
+    for _ in range(3):
+        pg_db.record_auxiliary_usage(
+            sid, "compression", model="m-aux", input_tokens=100, output_tokens=20
+        )
+    with psycopg.connect(_DSN, autocommit=True) as conn:
+        row = conn.execute(
+            f"SELECT api_call_count, input_tokens, output_tokens FROM "
+            f"{_SCHEMA}.session_model_usage "
+            "WHERE session_id = %s AND task = 'compression'",
+            (sid,),
+        ).fetchone()
+    assert row == (3, 300, 60)
+
+
+def test_api_content_and_effect_disposition_round_trip(pg_db):
+    sid = pg_db.create_session("sess-cols", "webui")
+    pg_db.append_message(
+        sid, "tool", "result", tool_name="t", effect_disposition="none",
+        api_content="exact-bytes-sent",
+    )
+    msg = pg_db.get_messages(sid)[0]
+    assert msg.get("api_content") == "exact-bytes-sent"
+    assert msg.get("effect_disposition") == "none"
 
 
 # ── Env-var dispatch, end to end ───────────────────────────────────────────

@@ -1896,7 +1896,14 @@ class APIServerAdapter(BasePlatformAdapter):
         — that stays reserved for an explicit test/manual override, so the first
         profile served can't pin every later request to its DB.
         """
-        from hermes_state import SessionDB
+        # IdeaRoom AE-182: MUST NOT be ``SessionDB(db_path=home / "state.db")``.
+        # An explicit db_path bypasses the HERMES_STATE_STORE_DSN dispatch in
+        # SessionDB.__new__, so on the default profile that call sent every
+        # chat-session write to the local (EFS) SQLite file instead of the
+        # shared Postgres store. open_session_db_for_home keeps the per-profile
+        # routing this cache exists for while letting the default home resolve
+        # through the dispatch.
+        from hermes_state import open_session_db_for_home
 
         key = str(home)
         cache = getattr(self, "_session_dbs", None)
@@ -1905,7 +1912,7 @@ class APIServerAdapter(BasePlatformAdapter):
             self._session_dbs = cache
         db = cache.get(key)
         if db is None:
-            db = SessionDB(db_path=home / "state.db")
+            db = open_session_db_for_home(home)
             cache[key] = db
         return db
 
