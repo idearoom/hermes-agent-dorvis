@@ -398,6 +398,63 @@ class TestConfig:
         assert cfg["banks"]["hermes"]["bankId"] == "env-bank"
         assert cfg["banks"]["hermes"]["budget"] == "high"
 
+    def test_config_env_fallback_warns_once_per_process(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """The silent env fallback is the AE-182 failure mode — make it loud."""
+        import pathlib
+
+        missing_home = tmp_path / "nonexistent"
+        monkeypatch.setattr(
+            "plugins.memory.hindsight.get_hermes_home", lambda: missing_home
+        )
+        monkeypatch.setattr(pathlib.Path, "home", classmethod(lambda cls: tmp_path))
+        monkeypatch.setattr(
+            "plugins.memory.hindsight._CONFIG_FALLBACK_WARNED", False
+        )
+
+        with caplog.at_level("WARNING", logger="plugins.memory.hindsight"):
+            _load_config()
+            _load_config()
+
+        warnings = [
+            r for r in caplog.records
+            if r.levelname == "WARNING" and "environment defaults" in r.getMessage()
+        ]
+        assert len(warnings) == 1
+        message = warnings[0].getMessage()
+        assert str(missing_home / "hindsight" / "config.json") in message
+
+    def test_config_parse_failure_warns_with_exception_name(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        import pathlib
+
+        config_path = tmp_path / "hindsight" / "config.json"
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text("{not json", encoding="utf-8")
+        monkeypatch.setattr(
+            "plugins.memory.hindsight.get_hermes_home", lambda: tmp_path
+        )
+        monkeypatch.setattr(
+            pathlib.Path, "home", classmethod(lambda cls: tmp_path / "home")
+        )
+        monkeypatch.setattr(
+            "plugins.memory.hindsight._CONFIG_FALLBACK_WARNED", False
+        )
+
+        with caplog.at_level("WARNING", logger="plugins.memory.hindsight"):
+            cfg = _load_config()
+
+        assert cfg["banks"]["hermes"]["bankId"] == "hermes"  # env defaults
+        parse_warnings = [
+            r.getMessage() for r in caplog.records
+            if "could not be parsed" in r.getMessage()
+        ]
+        assert len(parse_warnings) == 1
+        assert "JSONDecodeError" in parse_warnings[0]
+        assert str(config_path) in parse_warnings[0]
+
     def test_embedded_profile_env_includes_idle_timeout_from_config(self):
         env = _build_embedded_profile_env({
             "llm_provider": "openai",

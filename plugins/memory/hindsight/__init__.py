@@ -64,6 +64,9 @@ _DEFAULT_IDLE_TIMEOUT = 300  # seconds — Hindsight embedded daemon default
 # unique document_id fallback for older APIs.
 _MIN_VERSION_FOR_UPDATE_MODE_APPEND = "0.5.0"
 _VALID_BUDGETS = {"low", "mid", "high"}
+# One-shot guard so the environment-defaults warning below is emitted once
+# per process instead of once per _load_config() call.
+_CONFIG_FALLBACK_WARNED = False
 _PROVIDER_DEFAULT_MODELS = {
     "openai": "gpt-4o-mini",
     "anthropic": "claude-haiku-4-5",
@@ -370,24 +373,51 @@ def _load_config() -> dict:
       1. $HERMES_HOME/hindsight/config.json  (profile-scoped)
       2. ~/.hindsight/config.json             (legacy, shared)
       3. Environment variables
+
+    The env fallback is silent-by-default failure territory: a missing or
+    unparseable profile file still yields a usable-looking config whose bank
+    and recall settings come from process env, which is how a mis-pathed
+    config file can leave auto-recall pointed at a bank nobody intended
+    (AE-182 posture). Both the parse failures and the fallback itself are
+    logged at WARNING; the fallback line is emitted once per process.
     """
     from pathlib import Path
+
+    global _CONFIG_FALLBACK_WARNED
 
     # Profile-scoped path (preferred)
     profile_path = get_hermes_home() / "hindsight" / "config.json"
     if profile_path.exists():
         try:
             return json.loads(profile_path.read_text(encoding="utf-8"))
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning(
+                "Hindsight config at %s could not be parsed (%s: %s); "
+                "falling through to the legacy path / environment defaults",
+                profile_path, type(exc).__name__, exc,
+            )
 
     # Legacy shared path (backward compat)
     legacy_path = Path.home() / ".hindsight" / "config.json"
     if legacy_path.exists():
         try:
             return json.loads(legacy_path.read_text(encoding="utf-8"))
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning(
+                "Legacy Hindsight config at %s could not be parsed (%s: %s); "
+                "falling through to environment defaults",
+                legacy_path, type(exc).__name__, exc,
+            )
+
+    if not _CONFIG_FALLBACK_WARNED:
+        _CONFIG_FALLBACK_WARNED = True
+        logger.warning(
+            "Hindsight config resolved from environment defaults: no usable "
+            "config file at %s (profile-scoped) or %s (legacy). Bank id, "
+            "budget, and retention settings come from HINDSIGHT_* env vars — "
+            "verify the intended bank is in use.",
+            profile_path, legacy_path,
+        )
 
     return {
         "mode": os.environ.get("HINDSIGHT_MODE", "cloud"),
