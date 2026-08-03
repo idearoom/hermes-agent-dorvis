@@ -42,7 +42,7 @@ import sys
 import threading
 
 from datetime import datetime, timezone
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from agent.memory_provider import MemoryProvider
 from hermes_constants import get_hermes_home
@@ -64,6 +64,18 @@ _DEFAULT_IDLE_TIMEOUT = 300  # seconds — Hindsight embedded daemon default
 # unique document_id fallback for older APIs.
 _MIN_VERSION_FOR_UPDATE_MODE_APPEND = "0.5.0"
 _VALID_BUDGETS = {"low", "mid", "high"}
+# Per-memory traceability (AE-194). Recall results are carried alongside the
+# injected text so observers can name the exact memories a turn saw. The text
+# is truncated for the structured copy only — the injected block keeps the
+# full text it always had.
+_RECALL_SNIPPET_MAX_CHARS = 280
+_MAX_STRUCTURED_RECALL_RECORDS = 25
+# Candidate per-result score attributes. hindsight-client 0.6.1's
+# ``RecallResult`` exposes no score field (id/text/type/entities/context/
+# occurred_start/occurred_end/mentioned_at/document_id/metadata/chunk_id/
+# tags/source_fact_ids), so ``score`` stays None today; these names let a
+# later client that does surface one populate it without a code change.
+_RECALL_SCORE_ATTRS = ("score", "relevance", "relevance_score", "similarity")
 # One-shot guard so the environment-defaults warning below is emitted once
 # per process instead of once per _load_config() call.
 _CONFIG_FALLBACK_WARNED = False
@@ -708,6 +720,12 @@ class HindsightMemoryProvider(MemoryProvider):
         self._timeout = _DEFAULT_TIMEOUT
         self._idle_timeout = _DEFAULT_IDLE_TIMEOUT
         self._prefetch_result = ""
+        # Structured per-result recall rows paired with _prefetch_result
+        # (warmed by queue_prefetch), then handed to _last_prefetch_memories
+        # when prefetch() actually returns context. Both are guarded by
+        # _prefetch_lock. Observational only — see AE-194.
+        self._prefetch_memories: List[Dict[str, Any]] = []
+        self._last_prefetch_memories: List[Dict[str, Any]] = []
         self._prefetch_lock = threading.Lock()
         self._prefetch_thread = None
         # Single-writer model for retain. sync_turn() enqueues; the writer
@@ -1570,11 +1588,65 @@ class HindsightMemoryProvider(MemoryProvider):
         platform = (self._platform or "").strip()
         return platform in self._same_turn_recall_platforms
 
-    def _recall_context_text(self, query: str) -> str:
+    @staticmethod
+    def _recall_record(result: Any) -> Dict[str, Any]:
+        """Structure one recall result for traceability (AE-194).
+
+        Field names come from ``hindsight_client_api.models.RecallResult``:
+        ``id`` and ``text`` are required; ``type``, ``document_id`` and
+        ``chunk_id`` are optional. No score is exposed by the 0.6.1 client,
+        so ``score`` is None unless a later client surfaces one.
+        """
+        text = getattr(result, "text", "") or ""
+        if len(text) > _RECALL_SNIPPET_MAX_CHARS:
+            text = text[:_RECALL_SNIPPET_MAX_CHARS] + "…"
+
+        score: Optional[float] = None
+        for attr in _RECALL_SCORE_ATTRS:
+            raw = getattr(result, attr, None)
+            if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+                score = float(raw)
+                break
+
+        def _str_or_none(value: Any) -> Optional[str]:
+            return value if isinstance(value, str) and value else None
+
+        record: Dict[str, Any] = {
+            "id": _str_or_none(getattr(result, "id", None))
+            or _str_or_none(getattr(result, "document_id", None))
+            or _str_or_none(getattr(result, "chunk_id", None))
+            or "",
+            "text": text,
+            "score": score,
+            "type": _str_or_none(getattr(result, "type", None)),
+        }
+        document_id = _str_or_none(getattr(result, "document_id", None))
+        if document_id and document_id != record["id"]:
+            record["document_id"] = document_id
+        return record
+
+    def _recall_records(self, results: Any) -> List[Dict[str, Any]]:
+        records: List[Dict[str, Any]] = []
+        for result in list(results or [])[:_MAX_STRUCTURED_RECALL_RECORDS]:
+            try:
+                record = self._recall_record(result)
+            except Exception:  # pragma: no cover - defensive: never break recall
+                continue
+            if record["text"]:
+                records.append(record)
+        return records
+
+    def _recall_context(self, query: str) -> tuple[str, List[Dict[str, Any]]]:
+        """Return the injectable recall text plus its per-result structure.
+
+        The text half is byte-identical to what this method always produced;
+        the structured half is observational and never affects injection.
+        """
         if self._prefetch_method == "reflect":
             logger.debug("Prefetch: calling reflect (bank=%s, query_len=%d)", self._bank_id, len(query))
             resp = self._run_hindsight_operation(lambda client: client.areflect(bank_id=self._bank_id, query=query, budget=self._budget))
-            return resp.text or ""
+            # reflect() synthesizes one answer; there are no per-memory rows.
+            return resp.text or "", []
 
         recall_kwargs: dict = {
             "bank_id": self._bank_id, "query": query,
@@ -1590,7 +1662,25 @@ class HindsightMemoryProvider(MemoryProvider):
         resp = self._run_hindsight_operation(lambda client: client.arecall(**recall_kwargs))
         num_results = len(resp.results) if resp.results else 0
         logger.debug("Prefetch: recall returned %d results", num_results)
-        return "\n".join(f"- {r.text}" for r in resp.results if r.text) if resp.results else ""
+        if not resp.results:
+            return "", []
+        text = "\n".join(f"- {r.text}" for r in resp.results if r.text)
+        return text, self._recall_records(resp.results)
+
+    def _recall_context_text(self, query: str) -> str:
+        """Text-only view of :meth:`_recall_context` (kept for callers/tests)."""
+        return self._recall_context(query)[0]
+
+    def consume_prefetch_memories(self) -> List[Dict[str, Any]]:
+        """Return and clear the structured memories behind the last prefetch.
+
+        Consumed once per turn by the memory manager (AE-194). Empty whenever
+        the last :meth:`prefetch` injected nothing.
+        """
+        with self._prefetch_lock:
+            records = self._last_prefetch_memories
+            self._last_prefetch_memories = []
+        return records
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
         if self._prefetch_thread and self._prefetch_thread.is_alive():
@@ -1598,18 +1688,25 @@ class HindsightMemoryProvider(MemoryProvider):
             self._prefetch_thread.join(timeout=3.0)
         with self._prefetch_lock:
             result = self._prefetch_result
+            records = self._prefetch_memories
             self._prefetch_result = ""
+            self._prefetch_memories = []
+            self._last_prefetch_memories = []
         if not result:
+            records = []
             if self._same_turn_recall_allowed():
                 try:
                     logger.debug("Prefetch: no warmed result; running same-turn recall")
-                    result = self._recall_context_text(self._auto_recall_query(query))
+                    result, records = self._recall_context(self._auto_recall_query(query))
                 except Exception as e:
                     logger.debug("Hindsight same-turn prefetch failed: %s", e, exc_info=True)
                     result = ""
+                    records = []
             if not result:
                 logger.debug("Prefetch: no results available")
                 return ""
+        with self._prefetch_lock:
+            self._last_prefetch_memories = records
         logger.debug("Prefetch: returning %d chars of context", len(result))
         header = self._recall_prompt_preamble or (
             "# Hindsight Memory (persistent cross-session context)\n"
@@ -1632,10 +1729,11 @@ class HindsightMemoryProvider(MemoryProvider):
 
         def _run():
             try:
-                text = self._recall_context_text(query)
+                text, records = self._recall_context(query)
                 if text:
                     with self._prefetch_lock:
                         self._prefetch_result = text
+                        self._prefetch_memories = records
             except Exception as e:
                 logger.debug("Hindsight prefetch failed: %s", e, exc_info=True)
 
@@ -2164,6 +2262,8 @@ class HindsightMemoryProvider(MemoryProvider):
             self._prefetch_thread.join(timeout=3.0)
         with self._prefetch_lock:
             self._prefetch_result = ""
+            self._prefetch_memories = []
+            self._last_prefetch_memories = []
 
         # 3. Now rotate to the new session.
         if parent_session_id:

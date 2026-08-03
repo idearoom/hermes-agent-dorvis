@@ -218,6 +218,23 @@ human, auxiliary-model, sandbox, configuration, and yolo decision sources.
 Sensitive command/code fields are forcibly sanitized before the event; a
 sanitization failure skips telemetry without changing the decision.
 
+### Memory Recall Injection
+
+`memory_context_injected` fires once per turn with the model-visible recall
+block. Alongside the existing `provider`, `source`, `query`, `injected_block`,
+`status`, char/token counts, and `reused_for_all_iterations` fields it carries
+`memories`: one dict per injected memory, in injection order, with `id`,
+`text` (a snippet — the full text is in `injected_block`), `score` (`None`
+when the backend exposes no relevance score) and `type`. It is `[]` whenever
+nothing was injected, including the `empty` and `error` statuses.
+
+When memories were injected, the same rows are also returned to API callers on
+the terminal result as `response_metadata.dorvis_memory_recall`
+(`{provider, status, count, memories, query_char_count, injected_char_count}`).
+The key is omitted entirely when nothing was injected. This is the sanctioned
+structured channel: the `<memory-context>` block itself stays scrubbed out of
+streamed assistant text.
+
 ### Memory Mutation Lifecycle
 
 `memory_write` reports only a write that crossed a real mutation boundary:

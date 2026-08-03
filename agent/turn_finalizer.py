@@ -100,6 +100,47 @@ def _response_metadata_from_hook_results(hook_results) -> dict:
     return collected
 
 
+_MEMORY_RECALL_MAX_BYTES = 16 * 1024
+
+
+def _bounded_memory_recall_metadata(payload):
+    """Validate/bound the per-turn memory-recall metadata (AE-194).
+
+    Returns ``None`` when nothing was injected or the payload is unusable, so
+    ``dorvis_memory_recall`` is omitted rather than emitted empty. Oversized
+    payloads shed memories from the tail (``count`` keeps reporting what was
+    actually injected) so one huge recall can never crowd out the trace
+    manifest sharing the same 64 KiB terminal-metadata budget.
+    """
+    if not isinstance(payload, dict):
+        return None
+    memories = payload.get("memories")
+    if not isinstance(memories, list) or not memories:
+        return None
+
+    bounded = dict(payload)
+    bounded["memories"] = [m for m in memories if isinstance(m, dict)]
+    if not bounded["memories"]:
+        return None
+
+    while bounded["memories"]:
+        try:
+            encoded = json.dumps(
+                bounded,
+                ensure_ascii=False,
+                allow_nan=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+        except (TypeError, ValueError):
+            return None
+        if len(encoded) <= _MEMORY_RECALL_MAX_BYTES:
+            return bounded
+        bounded["memories"] = bounded["memories"][:-1]
+        bounded["truncated"] = True
+    return None
+
+
 def _drop_verification_continuation_scaffolding(messages) -> None:
     """Remove verification-continuation nudge messages from *messages* in place.
 
@@ -130,6 +171,7 @@ def finalize_turn(
     _turn_exit_reason,
     _pending_verification_response=None,
     _pending_verification_response_previewed=False,
+    memory_recall_metadata=None,
 ):
     """Run the post-loop finalization and return the turn ``result`` dict.
 
@@ -674,6 +716,16 @@ def finalize_turn(
         _response_metadata = _response_metadata_from_hook_results(
             _session_end_results
         )
+        # Memory recall travels the same terminal-metadata channel as the
+        # observability plugin's trace manifest (AE-194). It is sourced from
+        # this turn's own injection, not from a hook, because the injected
+        # <memory-context> block is scrubbed out of the streamed text — this
+        # is the sanctioned structured channel for "what memories did this
+        # answer see". A plugin that already claimed the key wins, matching
+        # the first-writer-wins rule above.
+        _memory_metadata = _bounded_memory_recall_metadata(memory_recall_metadata)
+        if _memory_metadata is not None:
+            _response_metadata.setdefault("dorvis_memory_recall", _memory_metadata)
         if _response_metadata:
             result["response_metadata"] = _response_metadata
     except Exception as exc:

@@ -863,6 +863,78 @@ class TestPrefetch:
         assert result.startswith("Custom header:")
         assert "- memory line" in result
 
+    def test_prefetch_exposes_structured_memories(self, provider):
+        """Per-memory identity survives the recall → prefetch handoff (AE-194)."""
+        provider._client.arecall = AsyncMock(
+            return_value=SimpleNamespace(
+                results=[
+                    SimpleNamespace(
+                        id="fact-1",
+                        text="Dalton prefers staging evidence first",
+                        type="world",
+                        document_id="doc-1",
+                    ),
+                    SimpleNamespace(id="fact-2", text="Second memory", type=None),
+                ]
+            )
+        )
+        provider.queue_prefetch("what do you remember?")
+        provider._prefetch_thread.join(timeout=5.0)
+
+        injected = provider.prefetch("what do you remember?")
+        assert "Dalton prefers staging evidence first" in injected
+
+        memories = provider.consume_prefetch_memories()
+        assert [m["id"] for m in memories] == ["fact-1", "fact-2"]
+        assert memories[0]["text"] == "Dalton prefers staging evidence first"
+        assert memories[0]["type"] == "world"
+        # hindsight-client 0.6.1 exposes no per-result score.
+        assert memories[0]["score"] is None
+        assert memories[0]["document_id"] == "doc-1"
+        assert memories[1]["type"] is None
+        # Consumed exactly once — a later turn must not re-report these.
+        assert provider.consume_prefetch_memories() == []
+
+    def test_prefetch_memory_snippet_is_capped(self, provider):
+        long_text = "x" * 900
+        provider._client.arecall = AsyncMock(
+            return_value=SimpleNamespace(
+                results=[SimpleNamespace(id="fact-1", text=long_text, type="world")]
+            )
+        )
+        provider.queue_prefetch("q")
+        provider._prefetch_thread.join(timeout=5.0)
+
+        injected = provider.prefetch("q")
+        # The injected block keeps the full text; only the structured copy is cut.
+        assert long_text in injected
+        snippet = provider.consume_prefetch_memories()[0]["text"]
+        assert len(snippet) < len(long_text)
+        assert snippet.startswith("x" * 280)
+
+    def test_consume_prefetch_memories_empty_when_nothing_injected(self, provider):
+        assert provider.prefetch("test") == ""
+        assert provider.consume_prefetch_memories() == []
+
+    def test_reflect_prefetch_reports_no_per_memory_rows(self, provider_with_config):
+        p = provider_with_config(prefetch_method="reflect")
+        p._client.areflect = AsyncMock(
+            return_value=SimpleNamespace(text="Synthesized answer")
+        )
+        p.queue_prefetch("q")
+        if p._prefetch_thread:
+            p._prefetch_thread.join(timeout=5.0)
+
+        assert "Synthesized answer" in p.prefetch("q")
+        assert p.consume_prefetch_memories() == []
+
+    def test_structured_memories_cleared_on_session_switch(self, provider):
+        provider._prefetch_result = "- some memory"
+        provider._prefetch_memories = [{"id": "fact-1", "text": "m", "score": None, "type": None}]
+        provider.on_session_switch("new-session", reset=True)
+        assert provider._prefetch_memories == []
+        assert provider.consume_prefetch_memories() == []
+
     def test_queue_prefetch_skipped_in_tools_mode(self, provider_with_config):
         p = provider_with_config(memory_mode="tools")
         p.queue_prefetch("test")

@@ -27,7 +27,7 @@ from __future__ import annotations
 import logging
 import threading
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Mapping, Optional
 
 from agent.conversation_compression import conversation_history_after_compression
@@ -267,6 +267,10 @@ class TurnContext:
     memory_prefetch_query: str = ""
     memory_provider_name: str = "memory"
     memory_prefetch_error: str = ""
+    # Per-memory structure behind ``ext_prefetch_cache`` (AE-194). One dict per
+    # injected memory ({id, text snippet, score, type}); empty when the turn
+    # injected nothing. Observational — the model still only sees the text.
+    memory_records: List[Dict[str, Any]] = field(default_factory=list)
 
 
 def build_turn_context(
@@ -807,6 +811,7 @@ def build_turn_context(
     memory_prefetch_query = original_user_message if isinstance(original_user_message, str) else ""
     memory_provider_name = "memory"
     memory_prefetch_error = ""
+    memory_records: List[Dict[str, Any]] = []
     if agent._memory_manager:
         try:
             _providers = [
@@ -823,6 +828,17 @@ def build_turn_context(
             ext_prefetch_cache = agent._memory_manager.prefetch_all(memory_prefetch_query) or ""
         except Exception as exc:
             memory_prefetch_error = str(exc)
+
+        # Per-memory traceability for the memory_context_injected hook and the
+        # terminal response metadata (AE-194). Never fatal: a manager without
+        # the accessor, or one returning something odd, just means no records.
+        if ext_prefetch_cache:
+            try:
+                _records = agent._memory_manager.last_prefetch_memories()
+                if isinstance(_records, list):
+                    memory_records = [r for r in _records if isinstance(r, dict)]
+            except Exception:
+                logger.debug("memory prefetch records unavailable", exc_info=True)
 
     # ── api_content sidecar: persist what you send ──
     # The prefetch/plugin context above is injected into the API copy of this
@@ -925,4 +941,5 @@ def build_turn_context(
         memory_prefetch_query=memory_prefetch_query,
         memory_provider_name=memory_provider_name,
         memory_prefetch_error=memory_prefetch_error,
+        memory_records=memory_records,
     )

@@ -674,10 +674,15 @@ def run_conversation(
     _memory_prefetch_query = _ctx.memory_prefetch_query
     _memory_provider_name = _ctx.memory_provider_name
     _memory_prefetch_error = _ctx.memory_prefetch_error
+    _memory_records = _ctx.memory_records
     _memory_context_observed = False
+    # Terminal-response payload for the injected memories of THIS turn
+    # (AE-194). Filled only when a block was actually injected; stays None
+    # otherwise so the response metadata omits the key entirely.
+    _memory_recall_metadata = None
 
     def _emit_memory_context_observation(status: str, injected_block: str = "") -> None:
-        nonlocal _memory_context_observed
+        nonlocal _memory_context_observed, _memory_recall_metadata
         if _memory_context_observed or not agent._memory_manager:
             return
         _memory_context_observed = True
@@ -692,6 +697,10 @@ def run_conversation(
                     ])
                 except Exception:
                     _estimated_tokens = 0
+            # Per-memory identity of what was injected (AE-194). Only
+            # meaningful when a block actually went in — an empty/error turn
+            # reports [] rather than last turn's memories.
+            _memories = list(_memory_records) if injected_block else []
             _payload = {
                 "session_id": agent.session_id or "",
                 "task_id": effective_task_id,
@@ -705,10 +714,23 @@ def run_conversation(
                 "injected_char_count": len(injected_block),
                 "estimated_injected_tokens": _estimated_tokens,
                 "reused_for_all_iterations": True,
+                "memories": _memories,
                 "request_metadata": getattr(agent, "_request_metadata", None) or {},
             }
             if _memory_prefetch_error:
                 _payload["error"] = _memory_prefetch_error
+            if _memories:
+                # Structured channel for API callers. The injected block stays
+                # scrubbed from streamed text; this metadata is where the web
+                # app reads which memories the answer saw.
+                _memory_recall_metadata = {
+                    "provider": _payload["provider"],
+                    "status": status,
+                    "count": len(_memories),
+                    "memories": _memories,
+                    "query_char_count": _payload["query_char_count"],
+                    "injected_char_count": _payload["injected_char_count"],
+                }
             _invoke_hook("memory_context_injected", **_payload)
         except Exception as exc:
             logger.debug("memory_context_injected hook failed: %s", exc)
@@ -5900,6 +5922,7 @@ def run_conversation(
         _turn_exit_reason=_turn_exit_reason,
         _pending_verification_response=_pending_verification_response,
         _pending_verification_response_previewed=_pending_verification_response_previewed,
+        memory_recall_metadata=_memory_recall_metadata,
     )
 
 
