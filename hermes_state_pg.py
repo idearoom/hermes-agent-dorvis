@@ -281,15 +281,21 @@ PG_SCHEMA_SQL: List[str] = [
         PRIMARY KEY (session_id, model, billing_provider, billing_base_url,
                      billing_mode, task)
     )""",
-    # v21 (upstream d0e9a42ce). Mirrored for schema-surface parity only:
-    # ``tools/async_delegation.py`` opens its OWN sqlite3 connection to
-    # ``get_hermes_home()/state.db`` and never goes through SessionDB, and its
-    # rows are node-local by construction (owner_pid / owner_started_at name a
-    # process on one host). Nothing writes this table on Postgres today; it
-    # exists so a future upstream change that routes delegations through
-    # SessionDB finds the table already present. See docs/hermes/state-db-repair.md
-    # in idearoom-agents for why the EFS state.db is therefore not fully
-    # residual after the Postgres cutover.
+    # v21 (upstream d0e9a42ce). LIVE on Postgres since AE-183:
+    # ``tools/async_delegation.py`` now persists through the same SessionDB
+    # dispatch as everything else instead of opening its own sqlite3
+    # connection to the EFS ``state.db``, which made it a second raw writer on
+    # a file two Fargate tasks share during a blue/green drain.
+    #
+    # ``owner_instance`` is IdeaRoom-owned and deliberately absent from
+    # upstream's ``hermes_state.SCHEMA_SQL`` — adding it there would move the
+    # hashed schema surface and put every future rebase through the
+    # re-audit guard for a column upstream does not have. The sqlite side
+    # reconciles it in ``async_delegation._connect()``; here it is created
+    # eagerly below and expanded onto existing databases by PG_EXPAND_SQL.
+    # It scopes the recovery pass's pid-liveness test to the owner's own PID
+    # namespace: without it, the incoming task resolves the outgoing task's
+    # pids against ITS namespace and buries live delegations as ``unknown``.
     f"""CREATE TABLE IF NOT EXISTS {_SCHEMA}.async_delegations (
         delegation_id TEXT PRIMARY KEY,
         origin_session TEXT NOT NULL,
@@ -308,7 +314,8 @@ PG_SCHEMA_SQL: List[str] = [
         owner_started_at BIGINT,
         task_json TEXT,
         delivery_claim TEXT,
-        delivery_claimed_at DOUBLE PRECISION
+        delivery_claimed_at DOUBLE PRECISION,
+        owner_instance TEXT
     )""",
     f"""CREATE TABLE IF NOT EXISTS {_SCHEMA}.state_meta (
         key TEXT PRIMARY KEY,
@@ -408,6 +415,12 @@ PG_EXPAND_SQL: List[str] = [
     f"ALTER TABLE {_SCHEMA}.sessions ADD COLUMN IF NOT EXISTS profile_name TEXT",
     f"ALTER TABLE {_SCHEMA}.messages ADD COLUMN IF NOT EXISTS effect_disposition TEXT",
     f"ALTER TABLE {_SCHEMA}.messages ADD COLUMN IF NOT EXISTS api_content TEXT",
+    # AE-183 owner identity (see the async_delegations DDL above). Additive and
+    # nullable, so a still-draining task that predates it keeps working: its
+    # rows land with owner_instance NULL, which the recovery pass reads as
+    # "legacy, same host" — exactly the behavior that task expects.
+    f"ALTER TABLE {_SCHEMA}.async_delegations ADD COLUMN IF NOT EXISTS "
+    "owner_instance TEXT",
 ]
 
 # Data migration for the v19→v20 step (upstream cb7f6bbb2): seed one
@@ -1077,9 +1090,11 @@ class PgSessionDB(SessionDB):
                     "incomplete",
                     exc_info=True,
                 )
-        # v21 (async_delegations) has no Postgres-resident data: the durable
-        # delegation rows are written by tools/async_delegation.py straight to
-        # the node-local SQLite state.db and are process-scoped anyway.
+        # v21 (async_delegations) needs no backfill: AE-183 moved the durable
+        # delegation rows onto this store going forward, and the rows a
+        # pre-AE-183 build left in the node-local SQLite state.db are terminal
+        # or abandoned by the time that node is gone — migrating them would
+        # re-deliver stale completions into live chats.
         # v22 (session_model_usage.task in the PRIMARY KEY) needs no rebuild
         # here: Postgres never held a v20/v21 shape of that table — it is
         # created at the terminal v22 shape by PG_SCHEMA_SQL.

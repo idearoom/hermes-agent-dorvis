@@ -79,8 +79,9 @@ jobs:
       HERMES_STATE_TEST_DSN: postgresql://postgres:postgres@127.0.0.1:5432/hermes_state_ci
       JUNIT_XML: pg-state-junit.xml
       # These modules are the contract surface: the integration suite needs the
-      # live DSN, the unit suite pins the schema-drift guard itself.
-      PG_TEST_FILES: tests/gateway/test_session_store_pg.py tests/gateway/test_session_store_pg_unit.py
+      # live DSN, the unit suite pins the schema-drift guard itself, and the
+      # delegation suite covers the second writer AE-183 moved onto this store.
+      PG_TEST_FILES: tests/gateway/test_session_store_pg.py tests/gateway/test_session_store_pg_unit.py tests/gateway/test_async_delegation_pg.py
 
     steps:
       - name: Checkout code

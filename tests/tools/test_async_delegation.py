@@ -397,6 +397,69 @@ def test_recover_marks_abandoned_running_record_unknown(tmp_path, monkeypatch):
     assert restored.get_nowait()["status"] == "unknown"
 
 
+def test_dispatch_stamps_the_owner_instance(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    ad._persist_dispatch({
+        "delegation_id": "deleg_owner", "session_key": "owner",
+        "origin_ui_session_id": "", "parent_session_id": None,
+        "dispatched_at": 1.0,
+    })
+    with ad._DB_LOCK, ad._connect() as conn:
+        stamped = conn.execute(
+            "SELECT owner_instance FROM async_delegations WHERE delegation_id=?",
+            ("deleg_owner",),
+        ).fetchone()[0]
+    assert stamped == ad._OWNER_INSTANCE
+
+
+def _plant_running_row(delegation_id, *, instance, updated_at):
+    ad._persist_dispatch({
+        "delegation_id": delegation_id, "session_key": "owner",
+        "origin_ui_session_id": "", "parent_session_id": None,
+        "dispatched_at": 1.0,
+    })
+    with ad._DB_LOCK, ad._connect() as conn:
+        conn.execute(
+            """UPDATE async_delegations SET owner_instance=?, owner_pid=?,
+               owner_started_at=NULL, updated_at=? WHERE delegation_id=?""",
+            (instance, 99999999, updated_at, delegation_id),
+        )
+
+
+def test_recover_spares_a_fresh_row_owned_by_another_instance(tmp_path, monkeypatch):
+    """owner_pid is only readable in the owner's PID namespace (AE-183).
+
+    On the shared Postgres store this row belongs to the other Fargate task
+    mid-drain; resolving its pid here would bury live work as `unknown`.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _plant_running_row("deleg_foreign", instance="other-task", updated_at=time.time())
+
+    assert ad.recover_abandoned_delegations() == 0
+    assert ad.get_durable_delegation("deleg_foreign")["state"] == "running"
+
+
+def test_recover_reclaims_another_instance_past_the_staleness_ttl(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _plant_running_row(
+        "deleg_foreign_stale", instance="other-task",
+        updated_at=time.time() - ad._FOREIGN_OWNER_STALE_SECONDS - 60,
+    )
+
+    assert ad.recover_abandoned_delegations() == 1
+    assert ad.get_durable_delegation("deleg_foreign_stale")["state"] == "unknown"
+
+
+def test_recover_still_reclaims_this_instance_immediately(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _plant_running_row(
+        "deleg_own_dead", instance=ad._OWNER_INSTANCE, updated_at=time.time()
+    )
+
+    assert ad.recover_abandoned_delegations() == 1
+    assert ad.get_durable_delegation("deleg_own_dead")["state"] == "unknown"
+
+
 def test_durable_delivery_claim_is_exclusive_and_retryable(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     record = {

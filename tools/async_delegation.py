@@ -38,18 +38,22 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import socket
 import sqlite3
 import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, TypeVar
 
 from hermes_constants import get_hermes_home
 from tools.daemon_pool import DaemonThreadPoolExecutor
 from tools.thread_context import propagate_context_to_thread
 
 logger = logging.getLogger(__name__)
+
+T = TypeVar("T")
 
 # Back-compat alias — the daemon executor now lives in tools.daemon_pool so
 # other subsystems (tool_executor, memory_manager, delegate_tool, skills_hub)
@@ -78,6 +82,43 @@ _MAX_RETAINED_COMPLETED = 50
 _DURABLE_RETENTION_SECONDS = 7 * 24 * 60 * 60
 _MAX_DURABLE_PENDING = 1000
 _DB_LOCK = threading.Lock()
+
+# ---------------------------------------------------------------------------
+# Durable store dispatch (IdeaRoom AE-183)
+# ---------------------------------------------------------------------------
+# Delegation state has to outlive the process that created it —
+# restore_undelivered_completions() replays results recorded by a PREVIOUS
+# process after a restart or deploy — so it is persisted, never task-local.
+# WHERE it is persisted follows the session store's dispatch: Postgres when
+# HERMES_STATE_STORE_DSN is set, the local state.db otherwise (AE-182,
+# idearoom-agents ADR 0177). Opening state.db directly from here would put a
+# second raw sqlite writer on an EFS file that two Fargate tasks share during
+# a blue/green drain — the double-writer shape that corrupted it in the
+# 2026-07-27 incident.
+_STORE_DSN_ENV = "HERMES_STATE_STORE_DSN"
+
+_shared_store: Optional[Any] = None
+_shared_store_dsn = ""
+_shared_store_lock = threading.Lock()
+
+# Scopes the pid-liveness check in recover_abandoned_delegations() to the rows
+# this process can reason about. Host-scoped, NOT process-scoped: a restarted
+# gateway on the same host shares the PID namespace and must keep reclaiming
+# its predecessor's dead-pid rows immediately, which is the entire point of
+# the recovery pass. Each Fargate
+# task has its own container hostname, so blue and green never collide. The
+# random fallback fails SAFE (foreign => staleness-only reclaim) in the exotic
+# case where the host has no resolvable name.
+_OWNER_INSTANCE = socket.gethostname() or f"unresolved-host-{uuid.uuid4().hex[:12]}"
+
+# Rows owned by a DIFFERENT instance can only be reclaimed on staleness —
+# nothing observable from here proves a foreign owner died. The window is
+# deliberately generous: child agents have no default wall-clock cap
+# (delegate_tool.DEFAULT_CHILD_TIMEOUT is None) and updated_at does not move
+# while one runs, so a tighter TTL would bury a live fan-out as `unknown` and
+# then deliver its real result minutes later. A gracefully drained task
+# finalizes its own rows on shutdown; only a hard-killed one waits this out.
+_FOREIGN_OWNER_STALE_SECONDS = 6 * 60 * 60
 
 
 def _db_path():
@@ -108,7 +149,8 @@ def _connect() -> sqlite3.Connection:
             owner_started_at INTEGER,
             task_json TEXT,
             delivery_claim TEXT,
-            delivery_claimed_at REAL
+            delivery_claimed_at REAL,
+            owner_instance TEXT
         )"""
     )
     columns = {row[1] for row in conn.execute("PRAGMA table_info(async_delegations)")}
@@ -118,17 +160,67 @@ def _connect() -> sqlite3.Connection:
         ("task_json", "TEXT"),
         ("delivery_claim", "TEXT"),
         ("delivery_claimed_at", "REAL"),
+        ("owner_instance", "TEXT"),
     ):
         if name not in columns:
             conn.execute(f"ALTER TABLE async_delegations ADD COLUMN {name} {sql_type}")
     return conn
 
 
+def _dispatched_store():
+    """The shared Postgres store, or None when this process is SQLite-local."""
+    dsn = os.environ.get(_STORE_DSN_ENV, "").strip()
+    if not dsn:
+        return None
+    global _shared_store, _shared_store_dsn
+    with _shared_store_lock:
+        if _shared_store is None or _shared_store_dsn != dsn:
+            _close_shared_store_locked()
+            from hermes_state import SessionDB
+
+            # Bare SessionDB() so this resolves through the ONE dispatch seam
+            # every other gateway component goes through; an explicit db_path
+            # would silently pin us back to the local file.
+            _shared_store = SessionDB()
+            _shared_store_dsn = dsn
+        return _shared_store
+
+
+def _close_shared_store_locked() -> None:
+    """Drop the cached store. Caller must hold ``_shared_store_lock``."""
+    global _shared_store, _shared_store_dsn
+    if _shared_store is not None:
+        try:
+            _shared_store.close()
+        except Exception:
+            logger.debug("closing the delegation store failed", exc_info=True)
+    _shared_store = None
+    _shared_store_dsn = ""
+
+
+def _durable(fn: Callable[[Any], T]) -> T:
+    """Run *fn(conn)* as ONE transaction against the dispatched store.
+
+    ``conn`` is either a sqlite3 connection or PgSessionDB's translating
+    transaction handle; both expose the ``execute(sql, params)`` /
+    ``fetchone`` / ``rowcount`` surface the statements below use, so the SQL
+    stays single-dialect. ``_DB_LOCK`` serializes this process only —
+    cross-process safety comes from the CAS-style WHERE guards each UPDATE
+    carries, which hold identically under Postgres MVCC.
+    """
+    store = _dispatched_store()
+    if store is None:
+        with _DB_LOCK, _connect() as conn:
+            return fn(conn)
+    with _DB_LOCK:
+        return store._execute_write(fn)
+
+
 def _persist_dispatch(record: Dict[str, Any]) -> None:
     now = time.time()
     try:
         from gateway.status import get_process_start_time
-        owner_started_at = get_process_start_time(__import__("os").getpid())
+        owner_started_at = get_process_start_time(os.getpid())
     except Exception:
         owner_started_at = None
     task_payload = {
@@ -136,32 +228,44 @@ def _persist_dispatch(record: Dict[str, Any]) -> None:
         for key in ("goal", "goals", "context", "toolsets", "role", "model", "is_batch")
         if key in record
     }
-    with _DB_LOCK, _connect() as conn:
+
+    def _write(conn) -> None:
+        # DELETE + INSERT rather than INSERT OR REPLACE: REPLACE has no
+        # Postgres spelling that also resets the terminal columns, and the
+        # pair is identical in both dialects inside one transaction.
         conn.execute(
-            """INSERT OR REPLACE INTO async_delegations
+            "DELETE FROM async_delegations WHERE delegation_id=?",
+            (record["delegation_id"],),
+        )
+        conn.execute(
+            """INSERT INTO async_delegations
                (delegation_id, origin_session, origin_ui_session_id,
                 parent_session_id, state, dispatched_at, updated_at,
                 delivery_state, delivery_attempts, owner_pid,
-                owner_started_at, task_json)
-               VALUES (?, ?, ?, ?, 'running', ?, ?, 'pending', 0, ?, ?, ?)""",
+                owner_started_at, owner_instance, task_json)
+               VALUES (?, ?, ?, ?, 'running', ?, ?, 'pending', 0, ?, ?, ?, ?)""",
             (record["delegation_id"], record.get("session_key", ""),
              record.get("origin_ui_session_id", ""), record.get("parent_session_id"),
-             record["dispatched_at"], now, __import__("os").getpid(),
-             owner_started_at, json.dumps(task_payload)),
+             record["dispatched_at"], now, os.getpid(),
+             owner_started_at, _OWNER_INSTANCE, json.dumps(task_payload)),
         )
+
+    _durable(_write)
     _prune_durable_records()
 
 
 def _delete_durable_delegation(delegation_id: str) -> None:
-    with _DB_LOCK, _connect() as conn:
-        conn.execute("DELETE FROM async_delegations WHERE delegation_id=?", (delegation_id,))
+    _durable(lambda conn: conn.execute(
+        "DELETE FROM async_delegations WHERE delegation_id=?", (delegation_id,)
+    ))
 
 
 def _prune_durable_records() -> None:
     """Bound terminal history, preferring delivered records for deletion."""
     now = time.time()
     cutoff = now - _DURABLE_RETENTION_SECONDS
-    with _DB_LOCK, _connect() as conn:
+
+    def _write(conn) -> None:
         conn.execute(
             "DELETE FROM async_delegations WHERE delivery_state='delivered' AND updated_at < ?",
             (cutoff,),
@@ -195,51 +299,66 @@ def _prune_durable_records() -> None:
                 (overflow,),
             )
 
+    _durable(_write)
+
 
 def _persist_completion(event: Dict[str, Any], result: Dict[str, Any]) -> None:
     now = time.time()
-    with _DB_LOCK, _connect() as conn:
-        conn.execute(
-            """UPDATE async_delegations SET state=?, completed_at=?, updated_at=?,
-               event_json=?, result_json=?, delivery_state='pending'
-               WHERE delegation_id=?""",
-            (event.get("status", "completed"), event.get("completed_at", now), now,
-             json.dumps(event), json.dumps(result), event["delegation_id"]),
-        )
+    _durable(lambda conn: conn.execute(
+        """UPDATE async_delegations SET state=?, completed_at=?, updated_at=?,
+           event_json=?, result_json=?, delivery_state='pending'
+           WHERE delegation_id=?""",
+        (event.get("status", "completed"), event.get("completed_at", now), now,
+         json.dumps(event), json.dumps(result), event["delegation_id"]),
+    ))
 
 
 def _note_delivery_attempt(delegation_id: str) -> None:
-    with _DB_LOCK, _connect() as conn:
-        conn.execute(
-            "UPDATE async_delegations SET delivery_attempts=delivery_attempts+1, updated_at=? WHERE delegation_id=?",
-            (time.time(), delegation_id),
-        )
+    _durable(lambda conn: conn.execute(
+        "UPDATE async_delegations SET delivery_attempts=delivery_attempts+1, updated_at=? WHERE delegation_id=?",
+        (time.time(), delegation_id),
+    ))
 
 
 def recover_abandoned_delegations() -> int:
-    """Classify records whose owning process disappeared as outcome unknown."""
+    """Classify records whose owning process disappeared as outcome unknown.
+
+    The pid-liveness test below is only meaningful inside the OWNER's PID
+    namespace. On the shared Postgres store two gateway tasks see each
+    other's rows during a blue/green overlap (ADR 0177), and resolving a
+    foreign pid in this namespace would bury live delegations as ``unknown``
+    — then deliver the real completion minutes later. ``owner_instance``
+    scopes the pid test to rows this process can actually reason about;
+    everything else waits out ``_FOREIGN_OWNER_STALE_SECONDS``.
+    """
     try:
         from gateway.status import _pid_exists, get_process_start_time
     except Exception:
         return 0
     now = time.time()
-    recovered = 0
-    with _DB_LOCK, _connect() as conn:
+
+    def _write(conn) -> int:
+        recovered = 0
         rows = conn.execute(
             """SELECT delegation_id, origin_session, origin_ui_session_id,
                       parent_session_id, dispatched_at, owner_pid,
-                      owner_started_at, task_json
+                      owner_started_at, task_json, owner_instance, updated_at
                FROM async_delegations WHERE state IN ('running','finalizing')"""
         ).fetchall()
         for row in rows:
-            delegation_id, session_key, origin_ui, parent_id, dispatched_at, pid, started, task_json = row
-            live = False
-            if pid:
+            (delegation_id, session_key, origin_ui, parent_id, dispatched_at,
+             pid, started, task_json, owner_instance, updated_at) = row
+            # A NULL/empty identity predates this column: same-host legacy row,
+            # so it keeps the pre-AE-183 behavior.
+            if owner_instance and owner_instance != _OWNER_INSTANCE:
+                if (updated_at or 0.0) >= now - _FOREIGN_OWNER_STALE_SECONDS:
+                    continue
+            elif pid:
                 live = _pid_exists(int(pid))
                 if live and started is not None:
                     live = get_process_start_time(int(pid)) == int(started)
-            if live:
-                continue
+                if live:
+                    continue
             task = json.loads(task_json or "{}")
             event = {
                 "type": "async_delegation", "delegation_id": delegation_id,
@@ -260,7 +379,9 @@ def recover_abandoned_delegations() -> int:
                 (now, now, json.dumps(event), json.dumps(result), delegation_id),
             )
             recovered += 1
-    return recovered
+        return recovered
+
+    return _durable(_write)
 
 
 def restore_undelivered_completions(target_queue) -> int:
@@ -276,36 +397,38 @@ def restore_undelivered_completions(target_queue) -> int:
     results seconds after boot (#64484).
     """
     recover_abandoned_delegations()
-    with _DB_LOCK, _connect() as conn:
-        rows = conn.execute(
+
+    def _read(conn) -> List[Any]:
+        return conn.execute(
             """SELECT delegation_id, event_json FROM async_delegations
                WHERE state != 'running' AND delivery_state='pending' AND event_json IS NOT NULL
                ORDER BY completed_at, delegation_id"""
         ).fetchall()
-        for _delegation_id, payload in rows:
-            evt = json.loads(payload)
-            if isinstance(evt, dict):
-                evt["restored"] = True
-            target_queue.put(evt)
+
+    rows = _durable(_read)
+    for _delegation_id, payload in rows:
+        evt = json.loads(payload)
+        if isinstance(evt, dict):
+            evt["restored"] = True
+        target_queue.put(evt)
     return len(rows)
 
 
 def mark_completion_delivered(delegation_id: str) -> bool:
     """Atomically acknowledge successful injection of a durable completion."""
     now = time.time()
-    with _DB_LOCK, _connect() as conn:
-        cur = conn.execute(
-            """UPDATE async_delegations SET delivery_state='delivered', delivered_at=?, updated_at=?
-               WHERE delegation_id=? AND delivery_state!='delivered'""",
-            (now, now, delegation_id),
-        )
-        return cur.rowcount == 1
+    return _durable(lambda conn: conn.execute(
+        """UPDATE async_delegations SET delivery_state='delivered', delivered_at=?, updated_at=?
+           WHERE delegation_id=? AND delivery_state!='delivered'""",
+        (now, now, delegation_id),
+    ).rowcount == 1)
 
 
 def claim_completion_delivery(delegation_id: str, claim_id: str) -> bool:
     """Claim one pending completion across competing consumers/processes."""
     now = time.time()
-    with _DB_LOCK, _connect() as conn:
+
+    def _write(conn) -> bool:
         row = conn.execute(
             "SELECT delivery_state FROM async_delegations WHERE delegation_id=?",
             (delegation_id,),
@@ -321,6 +444,8 @@ def claim_completion_delivery(delegation_id: str, claim_id: str) -> bool:
         )
         return cur.rowcount == 1
 
+    return _durable(_write)
+
 
 def claim_event_delivery(evt: Dict[str, Any], consumer: str) -> Optional[str]:
     """Claim a durable delegation event; non-durable events need no token."""
@@ -329,36 +454,32 @@ def claim_event_delivery(evt: Dict[str, Any], consumer: str) -> Optional[str]:
     delegation_id = str(evt.get("delegation_id") or "")
     if not delegation_id:
         return ""
-    claim_id = f"{consumer}:{__import__('os').getpid()}:{uuid.uuid4().hex}"
+    claim_id = f"{consumer}:{os.getpid()}:{uuid.uuid4().hex}"
     return claim_id if claim_completion_delivery(delegation_id, claim_id) else None
 
 
 def release_completion_delivery(delegation_id: str, claim_id: str) -> bool:
     """Release a failed delivery claim so another consumer may retry."""
-    with _DB_LOCK, _connect() as conn:
-        cur = conn.execute(
-            """UPDATE async_delegations SET delivery_claim=NULL,
-                      delivery_claimed_at=NULL, updated_at=?
-               WHERE delegation_id=? AND delivery_state='pending'
-                 AND delivery_claim=?""",
-            (time.time(), delegation_id, claim_id),
-        )
-        return cur.rowcount == 1
+    return _durable(lambda conn: conn.execute(
+        """UPDATE async_delegations SET delivery_claim=NULL,
+                  delivery_claimed_at=NULL, updated_at=?
+           WHERE delegation_id=? AND delivery_state='pending'
+             AND delivery_claim=?""",
+        (time.time(), delegation_id, claim_id),
+    ).rowcount == 1)
 
 
 def complete_completion_delivery(delegation_id: str, claim_id: str) -> bool:
     """Acknowledge acceptance for the consumer holding this claim."""
     now = time.time()
-    with _DB_LOCK, _connect() as conn:
-        cur = conn.execute(
-            """UPDATE async_delegations SET delivery_state='delivered',
-                      delivered_at=?, updated_at=?, delivery_claim=NULL,
-                      delivery_claimed_at=NULL
-               WHERE delegation_id=? AND delivery_state='pending'
-                 AND delivery_claim=?""",
-            (now, now, delegation_id, claim_id),
-        )
-        return cur.rowcount == 1
+    return _durable(lambda conn: conn.execute(
+        """UPDATE async_delegations SET delivery_state='delivered',
+                  delivered_at=?, updated_at=?, delivery_claim=NULL,
+                  delivery_claimed_at=NULL
+           WHERE delegation_id=? AND delivery_state='pending'
+             AND delivery_claim=?""",
+        (now, now, delegation_id, claim_id),
+    ).rowcount == 1)
 
 
 def complete_event_delivery(evt: Dict[str, Any], claim_id: str) -> None:
@@ -372,12 +493,11 @@ def release_event_delivery(evt: Dict[str, Any], claim_id: str) -> None:
 
 
 def get_durable_delegation(delegation_id: str) -> Optional[Dict[str, Any]]:
-    with _DB_LOCK, _connect() as conn:
-        row = conn.execute(
-            """SELECT origin_session, state, dispatched_at, completed_at,
-                      result_json, delivery_state, delivery_attempts
-               FROM async_delegations WHERE delegation_id=?""", (delegation_id,),
-        ).fetchone()
+    row = _durable(lambda conn: conn.execute(
+        """SELECT origin_session, state, dispatched_at, completed_at,
+                  result_json, delivery_state, delivery_attempts
+           FROM async_delegations WHERE delegation_id=?""", (delegation_id,),
+    ).fetchone())
     if row is None:
         return None
     return {
@@ -938,3 +1058,5 @@ def _reset_for_tests() -> None:
         _executor_max_workers = 0
     with _records_lock:
         _records.clear()
+    with _shared_store_lock:
+        _close_shared_store_locked()
