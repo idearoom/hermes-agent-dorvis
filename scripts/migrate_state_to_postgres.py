@@ -46,8 +46,10 @@ _TABLES = [
     # FK → sessions(id), so it must follow "sessions". Added with the v19→v22
     # audit (AE-182): per-model/per-task usage rows written by
     # update_token_counts / record_auxiliary_usage. ``async_delegations`` is
-    # deliberately NOT copied — tools/async_delegation.py owns that table on
-    # the node-local SQLite file and its rows are process-scoped (owner_pid).
+    # deliberately NOT copied even though AE-183 moved it onto this store:
+    # its live rows name a process on the node being migrated away from, and
+    # replaying their completions into Postgres would re-deliver stale
+    # results into chats on the new one.
     "session_model_usage",
     "messages",
     "state_meta",
