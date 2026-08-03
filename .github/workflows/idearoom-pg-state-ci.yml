@@ -1,0 +1,198 @@
+name: IdeaRoom Pg State CI
+
+# Run the Postgres session-store contract suite against a REAL Postgres on
+# every dorvis/runtime change, and fail when that suite does not actually run.
+#
+# Why (idearoom Linear AE-186, from the AE-177/AE-182 production incident):
+# hermes_state_pg shadows the SQLite session schema and refuses to attach when
+# the two drift (EXPECTED_SCHEMA_VERSION / EXPECTED_SCHEMA_SURFACE_SHA256). An
+# upstream rebase moved the SQLite schema to version 22 while the adapter still
+# expected 19. The guard tripped exactly as designed, the gateway fell back to
+# EFS SQLite, and ten days of production session writes landed on a filesystem
+# that then corrupted them. tests/gateway/test_session_store_pg.py asserts that
+# contract and would have failed the day the rebase landed -- except it is
+# `pytest.skip(allow_module_level=True)` when HERMES_STATE_TEST_DSN is unset,
+# and no workflow ever set it. Fork CI was green while the entire Pg suite was
+# a silent no-op.
+#
+# So this job does two things, and the second matters more than the first: it
+# supplies a Postgres, and it FAILS when the suite skips or under-collects. A
+# broken service container, a missing driver, or a re-added module-level skip
+# has to look like a broken build -- never like a pass. That inversion is the
+# whole point of the file; do not soften it into `continue-on-error` or a
+# warning.
+#
+# ADDITIVE and IdeaRoom-named, same convention as idearoom-ghcr-publish.yml:
+# upstream (NousResearch/hermes-agent) owns nothing here, so rebases and
+# upstream merges never touch this file, and the repository guard on the job
+# makes it a no-op anywhere but the fork.
+
+on:
+  push:
+    # No path filter on purpose. The failure mode this guards is an upstream
+    # rebase, which touches effectively everything and is precisely when a
+    # path-filtered job would be skipped. The suite is ~70 tests / ~10s, so
+    # running it unconditionally costs less than reasoning about which paths
+    # can move a schema contract.
+    branches: [dorvis/runtime, main]
+  pull_request:
+    branches: [dorvis/runtime, main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: idearoom-pg-state-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pg-state:
+    name: Pg session-store contract
+    # Only the IdeaRoom fork has a Postgres session store; a no-op elsewhere
+    # (including NousResearch, were this file ever to reach it via a merge).
+    if: github.repository == 'idearoom/hermes-agent-dorvis'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    services:
+      postgres:
+        # Matches the RDS engine the Hermes state store runs on in AWS
+        # (idearoom-agents infra/database.ts pins engineVersion 17.10) and the
+        # local parity stack (docker-compose.dev.yml). Testing the schema
+        # contract against a different major version would weaken the signal.
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: hermes_state_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      # The suite drops and recreates the `hermes_state` schema per test, so it
+      # needs a throwaway database -- which is what the service container is.
+      HERMES_STATE_TEST_DSN: postgresql://postgres:postgres@127.0.0.1:5432/hermes_state_ci
+      JUNIT_XML: pg-state-junit.xml
+      # These modules are the contract surface: the integration suite needs the
+      # live DSN, the unit suite pins the schema-drift guard itself.
+      PG_TEST_FILES: tests/gateway/test_session_store_pg.py tests/gateway/test_session_store_pg_unit.py
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # 8.2.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: |
+            pyproject.toml
+            uv.lock
+
+      - name: Set up Python 3.11
+        run: uv python install 3.11
+
+      - name: Install dependencies
+        # `--extra dev` only: this suite imports hermes_state / hermes_state_pg
+        # and nothing from the optional provider extras, so the heavy
+        # `--extra all` install tests.yml needs buys nothing here.
+        uses: ./.github/actions/retry
+        with:
+          command: uv sync --locked --python 3.11 --extra dev
+
+      - name: Install the Postgres driver at the production pin
+        # psycopg is deliberately not a hermes-agent dependency -- it is layered
+        # on by the idearoom-agents runtime image
+        # (docker/idearoom-skill-runtime-requirements.in, the canonical pin).
+        # Mirroring that pin here means CI exercises the same driver the
+        # gateway actually attaches with. Without this the modules
+        # `importorskip` psycopg and the suite silently vanishes; the guard
+        # below turns that into a failure rather than a pass, but pinning is
+        # what keeps the run meaningful.
+        run: |
+          set -euo pipefail
+          source .venv/bin/activate
+          uv pip install "psycopg[binary]==3.2.13" "psycopg-pool==3.2.8"
+
+      - name: Run the Pg session-store suite
+        env:
+          # Same as tests.yml: never let a test reach a real provider.
+          OPENROUTER_API_KEY: ""
+          OPENAI_API_KEY: ""
+          NOUS_API_KEY: ""
+        run: |
+          set -euo pipefail
+          source .venv/bin/activate
+          python -m pytest $PG_TEST_FILES -v --tb=short -rs --junitxml="$JUNIT_XML"
+
+      - name: Assert the suite actually ran
+        # The inversion. pytest exits 0 on a module-level skip, so a green
+        # pytest step proves nothing on its own; this step is what makes the
+        # AE-182 failure mode (suite present, suite never executed) red.
+        #
+        # Runs even when pytest failed so the log always states what was
+        # collected -- a real assertion failure and an empty collection look
+        # very different here, and the distinction is the first thing a
+        # rebase author needs.
+        if: always()
+        env:
+          # Floor, not an exact count: 68 tests collect today, so a normal
+          # test addition sails through while a wholesale disappearance (the
+          # integration module alone is 27 of them) trips it. Raise this when
+          # the suite grows a lot; never lower it to make a red run green.
+          MIN_TESTS: "60"
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os
+          import sys
+          import xml.etree.ElementTree as ET
+
+          path = os.environ["JUNIT_XML"]
+          minimum = int(os.environ["MIN_TESTS"])
+
+          if not os.path.exists(path):
+              sys.exit(
+                  f"::error::{path} was never written -- pytest did not reach the "
+                  "reporting stage. The Pg session-store contract is UNVERIFIED."
+              )
+
+          suites = ET.parse(path).getroot().iter("testsuite")
+          total = passed = skipped = failed = errored = 0
+          for suite in suites:
+              total += int(suite.get("tests", 0))
+              skipped += int(suite.get("skipped", 0))
+              failed += int(suite.get("failures", 0))
+              errored += int(suite.get("errors", 0))
+          passed = total - skipped - failed - errored
+
+          print(
+              f"collected={total} passed={passed} skipped={skipped} "
+              f"failures={failed} errors={errored} (floor {minimum})"
+          )
+
+          problems = []
+          if skipped:
+              problems.append(
+                  f"{skipped} test(s) skipped -- the Pg suite must never skip in "
+                  "CI. A module-level skip means HERMES_STATE_TEST_DSN did not "
+                  "reach pytest or psycopg is missing; either way the schema "
+                  "contract went unchecked, which is exactly how AE-182 shipped."
+              )
+          if passed < minimum:
+              problems.append(
+                  f"only {passed} test(s) passed, floor is {minimum} -- the suite "
+                  "under-collected. Treat this as 'the guard is gone', not as a "
+                  "threshold to lower."
+              )
+
+          for problem in problems:
+              print(f"::error::{problem}")
+          if problems:
+              sys.exit(1)
+          PY
