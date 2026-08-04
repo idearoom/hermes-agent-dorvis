@@ -187,6 +187,54 @@ def reanchor_current_turn_user_idx(messages: List[Any], user_message: Any) -> in
     return fallback
 
 
+def reanchor_current_turn_user_idx_after_repair(
+    messages: List[Any],
+    turn_user_msg: Any,
+    user_message: Any,
+    current_idx: int,
+) -> tuple[int, bool]:
+    """Re-find this turn's user message after alternation repair compacted it.
+
+    ``repair_message_sequence`` merges/drops rows in place and rewrites
+    ``messages`` shorter, so a pre-repair index is meaningless afterwards. On
+    api_server (web) follow-up turns this fires on EVERY turn — the restored
+    history carries one duplicated user row per prior turn, each of which the
+    consecutive-user pass merges away — leaving the loop's index pointing past
+    the new end. The current-turn branch of the ``api_messages`` build then
+    never matched, so the ``memory_context_injected`` hook was never emitted
+    (no ``memory.retrieve``/``memory.inject`` observations, no
+    ``dorvis_memory_recall`` response metadata, no web recall block) even
+    though the memories still reached the model through the replayed
+    ``api_content`` sidecar. See AE-196.
+
+    Unlike compression, repair PRESERVES OBJECT IDENTITY for every surviving
+    message — the same property ``repair_message_sequence_with_cursor`` relies
+    on to recompute the flush cursor — so identity is the exact anchor here and
+    cannot be confused by a historical row carrying the same text.
+
+    Falls back to the content-based :func:`reanchor_current_turn_user_idx` when
+    identity is gone: the consecutive-user pass merged this turn's message into
+    the preceding user row (and dropped that row's now-stale ``api_content``),
+    so the merged row IS the live current-turn user message and the loop
+    re-composes the injection onto it — the memories still go on the wire, so
+    reporting them as injected stays truthful. Leaves ``current_idx`` untouched
+    when the list has no user row at all.
+
+    Returns ``(index, identity_preserved)``. Callers use the flag to decide
+    whether trackers other than the injection anchor may follow: after a merge,
+    the row is no longer the dict the prologue anchored, so a persist override
+    keyed to it would rewrite another user turn's text.
+    """
+    if isinstance(turn_user_msg, dict):
+        for i, msg in enumerate(messages):
+            if msg is turn_user_msg:
+                return i, True
+    fallback = reanchor_current_turn_user_idx(messages, user_message)
+    if fallback >= 0:
+        return fallback, False
+    return current_idx, False
+
+
 def _compression_made_progress(
     orig_len: int, new_len: int, orig_tokens: int, new_tokens: int
 ) -> bool:

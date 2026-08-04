@@ -896,7 +896,7 @@ class TestPrefetch:
         assert provider.consume_prefetch_memories() == []
 
     def test_prefetch_memory_snippet_is_capped(self, provider):
-        long_text = "x" * 900
+        long_text = "x" * 4000
         provider._client.arecall = AsyncMock(
             return_value=SimpleNamespace(
                 results=[SimpleNamespace(id="fact-1", text=long_text, type="world")]
@@ -908,9 +908,30 @@ class TestPrefetch:
         injected = provider.prefetch("q")
         # The injected block keeps the full text; only the structured copy is cut.
         assert long_text in injected
-        snippet = provider.consume_prefetch_memories()[0]["text"]
+        record = provider.consume_prefetch_memories()[0]
+        snippet = record["text"]
         assert len(snippet) < len(long_text)
-        assert snippet.startswith("x" * 280)
+        assert snippet.startswith("x" * 2000)
+        # AE-196: a clipped record says so, so the UI can offer the full text
+        # from the deletion/inspection runbook instead of implying completeness.
+        assert record["text_truncated"] is True
+
+    def test_prefetch_memory_text_under_the_cap_is_not_flagged(self, provider):
+        """The flag is present only when text was really cut — its absence is
+        the "this is the whole memory" signal (AE-196)."""
+        text = "y" * 1999
+        provider._client.arecall = AsyncMock(
+            return_value=SimpleNamespace(
+                results=[SimpleNamespace(id="fact-1", text=text, type="world")]
+            )
+        )
+        provider.queue_prefetch("q")
+        provider._prefetch_thread.join(timeout=5.0)
+        provider.prefetch("q")
+
+        record = provider.consume_prefetch_memories()[0]
+        assert record["text"] == text
+        assert "text_truncated" not in record
 
     def test_consume_prefetch_memories_empty_when_nothing_injected(self, provider):
         assert provider.prefetch("test") == ""

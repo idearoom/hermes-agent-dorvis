@@ -224,16 +224,26 @@ sanitization failure skips telemetry without changing the decision.
 block. Alongside the existing `provider`, `source`, `query`, `injected_block`,
 `status`, char/token counts, and `reused_for_all_iterations` fields it carries
 `memories`: one dict per injected memory, in injection order, with `id`,
-`text` (a snippet — the full text is in `injected_block`), `score` (`None`
-when the backend exposes no relevance score) and `type`. It is `[]` whenever
-nothing was injected, including the `empty` and `error` statuses.
+`text` (bounded at 2000 chars — the untruncated text is in `injected_block`),
+optional `text_truncated: true` when that bound actually cut the text, `score`
+(`None` when the backend exposes no relevance score) and `type`. It is `[]`
+whenever nothing was injected, including the `empty` and `error` statuses.
+
+The hook fires once per turn for every platform, including follow-up turns
+whose history needed role-alternation repair before the request — repair
+compacts the message list, and the loop re-anchors this turn's user message
+afterwards so the current-turn branch (injection *and* this observation) still
+matches.
 
 When memories were injected, the same rows are also returned to API callers on
 the terminal result as `response_metadata.dorvis_memory_recall`
 (`{provider, status, count, memories, query_char_count, injected_char_count}`).
-The key is omitted entirely when nothing was injected. This is the sanctioned
-structured channel: the `<memory-context>` block itself stays scrubbed out of
-streamed assistant text.
+The whole entry is bounded at 48 KiB of the 64 KiB terminal-metadata budget; an
+oversized recall sheds whole records from the tail and sets
+`memories_truncated: true` (plus the original `truncated` alias) while `count`
+keeps reporting what the turn actually injected. The key is omitted entirely
+when nothing was injected. This is the sanctioned structured channel: the
+`<memory-context>` block itself stays scrubbed out of streamed assistant text.
 
 ### Memory Mutation Lifecycle
 

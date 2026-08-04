@@ -68,7 +68,15 @@ _VALID_BUDGETS = {"low", "mid", "high"}
 # injected text so observers can name the exact memories a turn saw. The text
 # is truncated for the structured copy only — the injected block keeps the
 # full text it always had.
-_RECALL_SNIPPET_MAX_CHARS = 280
+#
+# The cap is 2000 chars because the traceability channel now feeds a UI that
+# shows the memory a turn actually saw (AE-196), not just a one-line snippet:
+# a 280-char teaser made every non-trivial memory unreadable. Records that hit
+# the cap are flagged ``text_truncated`` so the reader can tell a complete
+# memory from a clipped one. The terminal-metadata envelope bounded in
+# ``agent/turn_finalizer.py`` carries a full 25-record recall of this size and
+# sheds only the tail of an all-records-at-the-ceiling worst case.
+_RECALL_SNIPPET_MAX_CHARS = 2000
 _MAX_STRUCTURED_RECALL_RECORDS = 25
 # Candidate per-result score attributes. hindsight-client 0.6.1's
 # ``RecallResult`` exposes no score field (id/text/type/entities/context/
@@ -1598,7 +1606,8 @@ class HindsightMemoryProvider(MemoryProvider):
         so ``score`` is None unless a later client surfaces one.
         """
         text = getattr(result, "text", "") or ""
-        if len(text) > _RECALL_SNIPPET_MAX_CHARS:
+        text_truncated = len(text) > _RECALL_SNIPPET_MAX_CHARS
+        if text_truncated:
             text = text[:_RECALL_SNIPPET_MAX_CHARS] + "…"
 
         score: Optional[float] = None
@@ -1620,6 +1629,10 @@ class HindsightMemoryProvider(MemoryProvider):
             "score": score,
             "type": _str_or_none(getattr(result, "type", None)),
         }
+        if text_truncated:
+            # Present only when the text really was clipped, so a consumer can
+            # treat the key's absence as "this is the whole memory".
+            record["text_truncated"] = True
         document_id = _str_or_none(getattr(result, "document_id", None))
         if document_id and document_id != record["id"]:
             record["document_id"] = document_id

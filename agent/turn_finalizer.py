@@ -100,7 +100,13 @@ def _response_metadata_from_hook_results(hook_results) -> dict:
     return collected
 
 
-_MEMORY_RECALL_MAX_BYTES = 16 * 1024
+# 48 KiB of the 64 KiB terminal-metadata budget. The recall channel now carries
+# the memory text a UI renders (AE-196), not one-line snippets, so 16 KiB shed
+# most of a normal 25-record recall. 48 KiB carries a realistic full recall
+# intact and still leaves room for the small, fixed-shape trace manifest sharing
+# the budget; only a recall where every record sits at the provider's 2000-char
+# ceiling (~51 KiB encoded) still sheds its tail.
+_MEMORY_RECALL_MAX_BYTES = 48 * 1024
 
 
 def _bounded_memory_recall_metadata(payload):
@@ -110,7 +116,9 @@ def _bounded_memory_recall_metadata(payload):
     ``dorvis_memory_recall`` is omitted rather than emitted empty. Oversized
     payloads shed memories from the tail (``count`` keeps reporting what was
     actually injected) so one huge recall can never crowd out the trace
-    manifest sharing the same 64 KiB terminal-metadata budget.
+    manifest sharing the same 64 KiB terminal-metadata budget. A payload that
+    had to shed is flagged ``memories_truncated`` so a reader can tell "these
+    are all the memories" from "these are the first N".
     """
     if not isinstance(payload, dict):
         return None
@@ -137,7 +145,11 @@ def _bounded_memory_recall_metadata(payload):
         if len(encoded) <= _MEMORY_RECALL_MAX_BYTES:
             return bounded
         bounded["memories"] = bounded["memories"][:-1]
+        # ``truncated`` is the original key and stays for existing readers;
+        # ``memories_truncated`` is the explicit name the web contract reads
+        # (it says WHAT was truncated — records, not text).
         bounded["truncated"] = True
+        bounded["memories_truncated"] = True
     return None
 
 

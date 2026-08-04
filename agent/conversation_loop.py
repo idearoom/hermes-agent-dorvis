@@ -37,6 +37,7 @@ from agent.turn_context import (
     build_turn_context,
     compose_user_api_content,
     reanchor_current_turn_user_idx,
+    reanchor_current_turn_user_idx_after_repair,
 )
 from agent.turn_retry_state import TurnRetryState
 from agent.message_sanitization import (
@@ -927,6 +928,18 @@ def run_conversation(
         # flush cursor (_last_flushed_db_idx) when repair compacts the list,
         # so the turn-end flush doesn't skip the assistant/tool chain (#44837).
         from agent.agent_runtime_helpers import repair_message_sequence_with_cursor
+        # Identity anchor for THIS turn's user message, captured before repair
+        # can compact the list. Repair preserves object identity for surviving
+        # messages, so this is the exact way to re-find the row afterwards
+        # (see the reanchor below).
+        _pre_repair_turn_user_msg = None
+        if 0 <= current_turn_user_idx < len(messages):
+            _idx_candidate = messages[current_turn_user_idx]
+            if (
+                isinstance(_idx_candidate, dict)
+                and _idx_candidate.get("role") == "user"
+            ):
+                _pre_repair_turn_user_msg = _idx_candidate
         repaired_seq = repair_message_sequence_with_cursor(agent, messages)
         if repaired_seq > 0:
             request_logger.info(
@@ -934,6 +947,40 @@ def run_conversation(
                 repaired_seq,
                 agent.session_id or "-",
             )
+            # Repair shrank the list, so the prologue's current-turn index is
+            # stale — on api_server follow-up turns it lands past the new end.
+            # A stale index silently skips the whole current-turn branch below:
+            # the memory block still reaches the model (the historical-replay
+            # branch substitutes the stamped api_content sidecar), but the
+            # memory_context_injected hook never fires, so the turn produces no
+            # memory.retrieve/memory.inject observations, no
+            # dorvis_memory_recall response metadata, and no web recall block.
+            # Re-anchor by identity. AE-196.
+            _reanchored_idx, _identity_kept = (
+                reanchor_current_turn_user_idx_after_repair(
+                    messages,
+                    _pre_repair_turn_user_msg,
+                    user_message,
+                    current_turn_user_idx,
+                )
+            )
+            if _reanchored_idx != current_turn_user_idx:
+                request_logger.debug(
+                    "Re-anchored current-turn user index %s -> %s after repair "
+                    "(identity_preserved=%s, session=%s)",
+                    current_turn_user_idx,
+                    _reanchored_idx,
+                    _identity_kept,
+                    agent.session_id or "-",
+                )
+            current_turn_user_idx = _reanchored_idx
+            if _identity_kept:
+                # Same dict the prologue anchored, so the persist-override
+                # tracker can follow it safely. When repair MERGED this turn's
+                # message into an earlier user row instead, the override text no
+                # longer describes that row's content — leave the tracker where
+                # it was rather than let it overwrite another user turn.
+                agent._persist_user_message_idx = current_turn_user_idx
 
         api_messages = []
         for idx, msg in enumerate(messages):
