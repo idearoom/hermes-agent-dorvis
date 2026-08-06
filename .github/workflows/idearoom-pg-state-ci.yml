@@ -37,6 +37,12 @@ on:
     branches: [dorvis/runtime, main]
   pull_request:
     branches: [dorvis/runtime, main]
+  # Manual re-arm (AE-200): a dorvis/runtime push event once produced no
+  # workflow run at all (GitHub dropped the trigger), which starves the
+  # idearoom-agents hermes-fork-pin-gate — it requires a successful run of
+  # this workflow at the exact pinned sha. Dispatching on the branch creates
+  # a run at its HEAD sha, which is what the gate queries for.
+  workflow_dispatch:
 
 permissions:
   contents: read
