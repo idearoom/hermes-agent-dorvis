@@ -481,6 +481,14 @@ _JSON_EXTRACT_PLAIN_RE = re.compile(
 )
 _INSERT_OR_IGNORE_RE = re.compile(r"^(\s*)INSERT\s+OR\s+IGNORE\s+INTO\b", re.IGNORECASE)
 _LIKE_RE = re.compile(r"\bLIKE\b")
+# SQLite's null-safe comparison against a bind parameter — ``col IS ?`` /
+# ``col IS NOT ?`` — has no direct Postgres spelling: after the generic
+# ``?``→``%s`` pass it would render ``col IS %s``, a Postgres syntax error
+# (this silently broke the api_content backfill in
+# ``SessionDB.set_latest_user_api_content``). Rewrite to Postgres's
+# null-safe forms ``IS NOT DISTINCT FROM`` / ``IS DISTINCT FROM``.
+# ``IS NULL`` / ``IS NOT NULL`` never match (no ``?`` follows).
+_IS_PARAM_RE = re.compile(r"\bIS\s+(NOT\s+)?\?", re.IGNORECASE)
 _INSERT_MESSAGES_RE = re.compile(r"^\s*INSERT\s+INTO\s+messages\s*\(", re.IGNORECASE)
 
 # ── Whole-statement overrides ──────────────────────────────────────────────
@@ -583,8 +591,9 @@ def _translate_sql(sql: str, *, with_params: bool) -> str:
     """Rewrite a SessionDB SQLite statement into its Postgres equivalent.
 
     Literal-aware: ``?``→``%s``, ``LIKE``→``ILIKE`` (SQLite LIKE is
-    ASCII-case-insensitive) and ``%``→``%%`` escaping only apply outside
-    single-quoted string literals; ``json_extract``/hex-literal/
+    ASCII-case-insensitive), null-safe ``IS ?``/``IS NOT ?`` →
+    ``IS [NOT] DISTINCT FROM %s`` and ``%``→``%%`` escaping only apply
+    outside single-quoted string literals; ``json_extract``/hex-literal/
     ``INSERT OR IGNORE`` rewrites run on the raw statement first because
     their patterns intentionally span literals.
     """
@@ -612,7 +621,17 @@ def _translate_sql(sql: str, *, with_params: bool) -> str:
             continue
         seg = _LIKE_RE.sub("ILIKE", seg)
         if with_params:
-            seg = seg.replace("%", "%%").replace("?", "%s")
+            # ``%%`` escaping first: the IS-rewrite emits a literal ``%s``
+            # placeholder that must NOT be re-escaped. The null-safe rewrite
+            # then consumes its ``?`` before the generic ``?``→``%s`` pass.
+            seg = seg.replace("%", "%%")
+            seg = _IS_PARAM_RE.sub(
+                lambda m: "IS DISTINCT FROM %s"
+                if m.group(1)
+                else "IS NOT DISTINCT FROM %s",
+                seg,
+            )
+            seg = seg.replace("?", "%s")
         out.append(seg)
     sql = "".join(out)
     if ignore:
