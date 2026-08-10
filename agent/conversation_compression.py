@@ -33,6 +33,7 @@ import inspect
 import logging
 import os
 import tempfile
+import time
 import uuid
 import threading
 from datetime import datetime
@@ -170,6 +171,300 @@ def _session_was_rotated_by_compression(session_db: Any, session_id: str) -> boo
         and session.get("ended_at") is not None
         and session.get("end_reason") == "compression"
     )
+
+
+# ── Concurrent-compaction convergence (AE-204) ──────────────────────────────
+# When two paths race on one session the loser used to return its (still
+# uncompacted) message list verbatim. That preserved session lineage but left
+# two divergent views of the same conversation alive: the winner's compacted
+# transcript in the session store, and the loser's full pre-compaction copy in
+# memory. Downstream transcript merges (the Responses store's
+# ``_build_response_conversation_history``, the gateway's ``history_offset``
+# re-baselining, and the identity-diffed session flush) then concatenate the
+# conversation with itself — the production doubling signature in AE-204.
+#
+# The loser now waits a BOUNDED time for the holder to finish and adopts the
+# winner's compacted live transcript, so both paths converge on one view. The
+# wait is the only place compression blocks on another path, so it must never
+# outlive a crashed holder: on timeout we fall back to the historical
+# unchanged-messages behaviour under a distinct log tag.
+COMPRESSION_LOCK_WAIT_SECONDS_DEFAULT = 60.0
+COMPRESSION_LOCK_WAIT_POLL_SECONDS = 0.25
+COMPRESSION_LOCK_WAIT_ENV = "HERMES_COMPRESSION_LOCK_WAIT_SECONDS"
+
+
+def _compression_lock_wait_budget(agent: Any, lock_ttl: float) -> float:
+    """Seconds the losing path may wait for the holder before giving up.
+
+    Precedence: per-agent attribute (tests / callers) → environment override
+    (ops tuning without a redeploy) → module default. Always clamped to the
+    lock TTL: past the lease the holder's row is reclaimable anyway, so a
+    longer wait can only stall a turn behind a dead process.
+    """
+    budget: Optional[float] = None
+    raw = getattr(agent, "_compression_lock_wait_seconds", None)
+    if raw is None:
+        raw = os.environ.get(COMPRESSION_LOCK_WAIT_ENV)
+    if raw is not None:
+        try:
+            budget = float(raw)
+        except (TypeError, ValueError):
+            budget = None
+    if budget is None:
+        budget = COMPRESSION_LOCK_WAIT_SECONDS_DEFAULT
+    if budget < 0:
+        budget = 0.0
+    try:
+        ttl = float(lock_ttl)
+    except (TypeError, ValueError):
+        ttl = 0.0
+    if ttl > 0:
+        budget = min(budget, ttl)
+    return budget
+
+
+def _wait_for_compression_holder(
+    agent: Any,
+    lock_db: Any,
+    session_id: str,
+    holder: Optional[str],
+    budget_seconds: float,
+    poll_seconds: float = COMPRESSION_LOCK_WAIT_POLL_SECONDS,
+) -> Tuple[bool, float]:
+    """Block until ``holder`` releases the session lock, or the budget expires.
+
+    Returns ``(released, waited_seconds)``. ``released`` is True when the lock
+    row is gone (or owned by somebody else, meaning our holder finished and a
+    third path took over) before the budget ran out.
+
+    This is a BOUNDED POLL, not a notification: the holder row lives in
+    state.db / Postgres and nothing signals this waiter when it clears, so the
+    loop re-reads the row every ``poll_seconds`` (0.25s by default) until the
+    budget expires. Polling a durable row is exactly what lets the two paths
+    converge across processes and across gateway tasks during a drain, which
+    an in-memory lock could not do. The :class:`threading.Event` below is used
+    only as an interruptible sleep and is never set by anyone — abort on
+    interrupt therefore comes from re-reading ``_interrupt_requested`` at the
+    top of each iteration, which bounds abort latency to one poll interval,
+    not from waking the event. Only ever entered from a worker thread (every
+    ``compress_context`` caller runs off the event loop — the gateway
+    dispatches through ``run_in_executor``).
+    """
+    if budget_seconds <= 0 or not session_id:
+        return False, 0.0
+    getter = getattr(lock_db, "get_compression_lock_holder", None)
+    if not callable(getter):
+        return False, 0.0
+    # Never set: an interruptible sleep between polls, not a wake-up channel.
+    sleeper = threading.Event()
+    deadline = time.monotonic() + budget_seconds
+    started = time.monotonic()
+    poll = max(0.01, float(poll_seconds))
+    while True:
+        if getattr(agent, "_interrupt_requested", False):
+            return False, time.monotonic() - started
+        try:
+            current = getter(session_id)
+        except Exception as exc:
+            # The lock table is unreadable — we cannot prove the holder
+            # finished, so stop waiting and take the bounded fallback.
+            logger.debug(
+                "compression lock holder poll failed for session=%s: %s",
+                session_id, exc,
+            )
+            return False, time.monotonic() - started
+        if not current or (holder and current != holder):
+            return True, time.monotonic() - started
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False, time.monotonic() - started
+        sleeper.wait(min(poll, remaining))
+
+
+def _compaction_identity(message: Any) -> Tuple[Any, ...]:
+    """Stable identity for comparing an in-memory turn against a stored row.
+
+    The stored row is a fresh dict rebuilt by the session store, so object
+    identity is useless and full equality is too strict (rows carry
+    persistence metadata the live dict does not). Role + rendered text +
+    tool-call wiring is enough to recognise a message this path already
+    flushed before the winner compacted around it.
+    """
+    if not isinstance(message, dict):
+        return ("", "", "", ())
+    tool_calls = message.get("tool_calls") or []
+    call_ids: Tuple[Any, ...] = ()
+    if isinstance(tool_calls, list):
+        call_ids = tuple(
+            str(call.get("id") or call.get("call_id") or "")
+            for call in tool_calls
+            if isinstance(call, dict)
+        )
+    return (
+        str(message.get("role") or ""),
+        _message_text(message).strip(),
+        str(message.get("tool_call_id") or ""),
+        call_ids,
+    )
+
+
+def _tail_overlap_length(live: list, tail: list) -> int:
+    """Length of the ``tail`` prefix already present at the end of ``live``.
+
+    A turn that ran several tool iterations before losing the compression
+    race has already flushed part of its tail; when the winner compacts
+    afterwards those rows survive as active rows in the compacted set.
+    Appending the in-memory tail wholesale would duplicate exactly that
+    overlap, so it is trimmed. Zero in the common case.
+    """
+    limit = min(len(live), len(tail))
+    for size in range(limit, 0, -1):
+        live_ids = [_compaction_identity(msg) for msg in live[-size:]]
+        tail_ids = [_compaction_identity(msg) for msg in tail[:size]]
+        if live_ids == tail_ids:
+            return size
+    return 0
+
+
+def _live_set_carries_compaction_summary(live: list) -> bool:
+    """True when the stored live transcript contains a compaction summary.
+
+    This is the POSITIVE PROOF that a compaction actually happened. The size
+    guards in :func:`_adopt_concurrent_compaction` are necessary but not
+    sufficient on their own: the durable active set can be shorter than this
+    path's in-memory history with no compaction anywhere in sight — a
+    best-effort flush that failed is swallowed, ``rewind_to_message``
+    soft-archives rows out of the active set, and alternation repair merges
+    rows. If the holder then ABORTS (an aux-model failure mid-summary is a
+    real production outcome) and releases having written nothing, that
+    pre-existing deficit alone would satisfy every size check and the loser
+    would "adopt" a transcript that was never compacted: it would log
+    ``compression adopted``, claim ``_last_compaction_in_place``, park token
+    accounting, and hand downstream a list with no summary in it — which
+    ``_messages_include_compaction_summary`` reads as "not a compacted
+    transcript", so the Responses store re-concatenates the history in front
+    of it. That is the exact doubling this whole path exists to prevent,
+    relabelled as a success.
+
+    The check delegates to the compressor's own predicates so the prefix list
+    keeps exactly one owner: ``_is_context_summary_content`` covers the
+    current ``SUMMARY_PREFIX``, ``LEGACY_SUMMARY_PREFIX``, every entry in
+    ``_HISTORICAL_SUMMARY_PREFIXES`` (a summary written by an older release
+    and inherited into this lineage still counts), and summaries merged into
+    a tail message behind ``_MERGED_SUMMARY_DELIMITER``. The in-process
+    metadata flag is accepted too, for stores that round-trip it.
+
+    Refuses (returns False) when the predicate cannot be imported: no proof
+    means no adoption, and the caller's unchanged-messages fallback is the
+    historical, safe behaviour.
+    """
+    try:
+        from agent.context_compressor import ContextCompressor
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("compression adopt: summary predicate unavailable: %s", exc)
+        return False
+    for message in live:
+        if not isinstance(message, dict):
+            continue
+        try:
+            if ContextCompressor._has_compressed_summary_metadata(message):
+                return True
+            if ContextCompressor._is_context_summary_content(message.get("content")):
+                return True
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug("compression adopt: summary check failed: %s", exc)
+            continue
+    return False
+
+
+def _adopt_concurrent_compaction(agent: Any, messages: list) -> Optional[list]:
+    """Return the winner's compacted transcript re-based with our live turn.
+
+    ``None`` means there is nothing safe to adopt (no session store, the
+    winner rotated instead of compacting in place, the stored transcript
+    carries no compaction summary so nothing proves it was compacted, the
+    live transcript is no smaller than the history we hold, or the result
+    would not shrink) — the caller then takes the unchanged-messages
+    fallback.
+    """
+    session_db = getattr(agent, "_session_db", None)
+    session_id = getattr(agent, "session_id", None) or ""
+    if session_db is None or not session_id:
+        return None
+    try:
+        if _session_was_rotated_by_compression(session_db, session_id):
+            # The winner minted a continuation child; its compacted transcript
+            # lives under a different id. Adopting it would mean rotating this
+            # agent onto a session the caller never bound — out of scope for
+            # the convergence fix, and the existing post-acquire guard already
+            # covers the rotation case.
+            return None
+    except Exception as exc:
+        logger.debug(
+            "compression adopt: rotation lookup failed for session=%s: %s",
+            session_id, exc,
+        )
+        return None
+    loader = getattr(session_db, "get_messages_as_conversation", None)
+    if not callable(loader):
+        return None
+    try:
+        live = loader(session_id)
+    except Exception as exc:
+        logger.debug(
+            "compression adopt: live transcript load failed for session=%s: %s",
+            session_id, exc,
+        )
+        return None
+    if not isinstance(live, list) or not live:
+        return None
+    if not _live_set_carries_compaction_summary(live):
+        # Nothing in the stored transcript proves a compaction happened, so a
+        # shorter active set here is some other effect (aborted holder, failed
+        # flush, rewind, repair merge). Adopting on size alone would launder an
+        # UNCOMPACTED transcript as a compaction — see the docstring.
+        return None
+
+    # Everything before the current turn's user message is history this path
+    # shares with the winner; everything after is our own in-flight turn.
+    turn_start = getattr(agent, "_persist_user_message_idx", None)
+    if turn_start is None:
+        # Pre-turn callers (gateway session hygiene) hold history only.
+        turn_start = len(messages)
+    elif not isinstance(turn_start, int) or not (0 <= turn_start <= len(messages)):
+        return None
+    elif turn_start < len(messages) and (
+        not isinstance(messages[turn_start], dict)
+        or messages[turn_start].get("role") != "user"
+    ):
+        # The anchor no longer points at a user turn, so the boundary between
+        # shared history and this path's live turn is not trustworthy. Refuse
+        # to adopt rather than risk splitting the list in the wrong place.
+        return None
+    history = messages[:turn_start]
+    tail = messages[turn_start:]
+    if len(live) >= len(history):
+        # No evidence the winner actually compacted this session (it may have
+        # aborted, or be mid-summary with nothing written yet).
+        return None
+
+    adopted = list(live) + tail[_tail_overlap_length(live, tail):]
+    if len(adopted) >= len(messages):
+        return None
+
+    # The adopted rows are already durable under this session id. Stamp them
+    # so the identity-diffed flush cannot re-append them — the same guarantee
+    # ``conversation_history_after_compression`` gives the in-place path, but
+    # independent of what the caller does with its flush baseline.
+    try:
+        from agent.context_compressor import _DB_PERSISTED_MARKER
+
+        for message in live:
+            if isinstance(message, dict):
+                message[_DB_PERSISTED_MARKER] = True
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("compression adopt: persistence stamp failed: %s", exc)
+    return adopted
 
 
 def _compression_lock_holder(agent: Any) -> str:
@@ -964,12 +1259,113 @@ def compress_context(
                 existing = _lock_db.get_compression_lock_holder(_lock_sid)
             except Exception:
                 existing = None
-            logger.warning(
-                "compression skipped: another path is compressing session=%s "
-                "(holder=%s) — returning messages unchanged to avoid session fork",
-                _lock_sid, existing,
-            )
             _lock_holder = None  # don't release a lock we don't own
+            # AE-204: do NOT return the uncompacted list straight away. Wait a
+            # bounded time for the holder and adopt its compacted transcript so
+            # both paths converge on ONE view of the conversation; a divergent
+            # uncompacted copy is what downstream transcript merges concatenate
+            # into a doubled context.
+            #
+            # Automatic callers only. Manual /compress passes force=True and,
+            # in ``here N`` / ``--keep N`` mode, hands us the HEAD SLICE of the
+            # transcript and re-appends the verbatim tail afterwards
+            # (gateway/slash_commands.py, cli.py). The session-wide live
+            # transcript is not a valid substitute for that slice — adopting it
+            # there would duplicate the tail. Those callers keep the historical
+            # immediate skip.
+            _holder_released = False
+            _waited = 0.0
+            _adopted = None
+            if not force:
+                _wait_budget = _compression_lock_wait_budget(agent, _lock_ttl)
+                logger.info(
+                    "compression deferred: another path is compressing "
+                    "session=%s (holder=%s) - waiting up to %.1fs to adopt its "
+                    "compacted result",
+                    _lock_sid, existing, _wait_budget,
+                )
+                _holder_released, _waited = _wait_for_compression_holder(
+                    agent, _lock_db, _lock_sid, existing, _wait_budget,
+                )
+                _adopted = _adopt_concurrent_compaction(agent, messages)
+            _existing_sp = getattr(agent, "_cached_system_prompt", None)
+            if not _existing_sp:
+                _existing_sp = agent._build_system_prompt(system_message)
+            if _adopted is not None:
+                # The live transcript for this session id IS the compacted one
+                # now. Flag it exactly like a first-party in-place compaction:
+                # the gateway re-baselines transcript handling (history_offset=0
+                # / no rewrite) and the loop re-bases its flush cursor onto the
+                # adopted rows instead of re-appending them.
+                agent._last_compaction_in_place = True
+                # Mirror the in-place write path's cursor reset so the next
+                # flush re-diffs against the adopted transcript by identity.
+                agent._flushed_db_message_ids = set()
+                agent._last_flushed_db_idx = 0
+                _adopted_est = estimate_request_tokens_rough(
+                    _adopted,
+                    system_prompt=_existing_sp or "",
+                    tools=agent.tools or None,
+                )
+                # Park the token accounting exactly like a completed
+                # compaction: the stale pre-compaction prompt count must not
+                # re-trigger compression against the transcript we just
+                # adopted. The effectiveness verdict is deliberately NOT armed
+                # — this path never ran the compressor, so it has nothing to
+                # grade.
+                _compressor = getattr(agent, "context_compressor", None)
+                if _compressor is not None:
+                    _compressor.last_compression_rough_tokens = _adopted_est
+                    _compressor.last_prompt_tokens = -1
+                    _compressor.last_completion_tokens = 0
+                    _compressor.awaiting_real_usage_after_compression = True
+                logger.info(
+                    "compression adopted: session=%s reused the concurrent "
+                    "compaction (holder=%s) after %.1fs — messages=%d->%d "
+                    "rough_tokens=~%s",
+                    _lock_sid, existing, _waited,
+                    _pre_msg_count, len(_adopted), f"{_adopted_est:,}",
+                )
+                _emit_compression_hook(
+                    agent,
+                    "context_compression_adopted",
+                    pre_message_count=_pre_msg_count,
+                    post_message_count=len(_adopted),
+                    pre_tokens=approx_tokens,
+                    post_tokens=_adopted_est,
+                    model=getattr(agent, "model", None),
+                    holder=existing,
+                    waited_seconds=round(_waited, 3),
+                    **_compression_diagnostics(agent),
+                )
+                return _adopted, _existing_sp
+            if force:
+                # Manual compression: no wait, no adoption (see above).
+                logger.warning(
+                    "compression skipped: another path is compressing "
+                    "session=%s (holder=%s) — returning messages unchanged to "
+                    "avoid session fork",
+                    _lock_sid, existing,
+                )
+            elif not _holder_released:
+                # Distinct tag: the holder never let go inside the budget
+                # (crashed, hung, or genuinely slower than the wait). This is
+                # the only path that still returns an uncompacted transcript
+                # while another compaction may still be in flight.
+                logger.warning(
+                    "compression skipped: holder timeout on session=%s "
+                    "(holder=%s) after %.1fs — returning messages unchanged "
+                    "to avoid session fork",
+                    _lock_sid, existing, _waited,
+                )
+            else:
+                logger.warning(
+                    "compression skipped: another path is compressing "
+                    "session=%s (holder=%s) — returning messages unchanged to "
+                    "avoid session fork (holder released after %.1fs with no "
+                    "compacted state to adopt)",
+                    _lock_sid, existing, _waited,
+                )
             # Surface to the user once — quiet for downstream auto-compress loops
             if getattr(agent, "_last_compression_lock_warning_sid", None) != _lock_sid:
                 agent._last_compression_lock_warning_sid = _lock_sid
@@ -981,9 +1377,6 @@ def compress_context(
                     )
                 except Exception:
                     pass
-            _existing_sp = getattr(agent, "_cached_system_prompt", None)
-            if not _existing_sp:
-                _existing_sp = agent._build_system_prompt(system_message)
             return messages, _existing_sp
     _lock_released = False
 
