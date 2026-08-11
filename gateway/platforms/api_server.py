@@ -205,10 +205,21 @@ def _session_usage_snapshot(agent: Any) -> Dict[str, Any]:
     input_tokens = _coerce_token_count(attributed.get("input_tokens"), 0) or 0
     output_tokens = _coerce_token_count(attributed.get("output_tokens"), 0) or 0
     total_tokens = _coerce_token_count(attributed.get("total_tokens"), 0) or 0
+    # Prompt-cache split. The aggregate ``input_tokens`` above is
+    # prompt-inclusive (uncached input + cache reads + cache writes), so a
+    # consumer that wants fresh input has to subtract the cached buckets. The
+    # cache counters are parent-scope only — the auxiliary and delegated
+    # buckets folded into the aggregate do not track cache — so subtracting
+    # these slightly overstates fresh input. That is the conservative
+    # direction and is preferable to publishing no split at all.
+    cache_read_tokens = _agent_token_count(agent, "session_cache_read_tokens", 0) or 0
+    cache_write_tokens = _agent_token_count(agent, "session_cache_write_tokens", 0) or 0
     usage: Dict[str, Any] = {
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
         "total_tokens": total_tokens,
+        "cache_read_tokens": cache_read_tokens,
+        "cache_write_tokens": cache_write_tokens,
         "scope": "run_aggregate",
         "completeness": attributed.get("completeness", "partial"),
         "warnings": attributed.get("warnings", []),
@@ -220,13 +231,21 @@ def _session_usage_snapshot(agent: Any) -> Dict[str, Any]:
     except Exception:
         comp = None
     if comp is not None:
+        # ``last_prompt_tokens`` is the engine's only measured context reading.
+        # It is 0 before the first provider response and the -1 sentinel while
+        # a just-completed compaction awaits real usage; both mean "not
+        # measured", not "empty context". Never substitute a run-cumulative
+        # counter for it — ``session_total_tokens`` is tokens processed across
+        # the whole run, not a context size, and clamping that to 100% falsely
+        # pins a consumer's context bar and fakes a "compaction imminent"
+        # signal. Publish the context trio only when a real reading exists,
+        # and omit ``context_max`` with it so consumers can render "not
+        # reported" instead of a misleading 0%.
         ctx_used = _coerce_token_count(getattr(comp, "last_prompt_tokens", None), None)
+        if not ctx_used:
+            ctx_used = None
         ctx_max = _coerce_token_count(getattr(comp, "context_length", None), None)
-        if ctx_max:
-            if ctx_used is None:
-                # Context is a property of the parent conversation, not the
-                # separate auxiliary/child sessions included in run totals.
-                ctx_used = _agent_token_count(agent, "session_total_tokens", 0) or 0
+        if ctx_max and ctx_used is not None:
             usage["context_used"] = ctx_used
             usage["context_max"] = ctx_max
             usage["context_percent"] = max(0, min(100, round(ctx_used / ctx_max * 100)))
@@ -247,8 +266,8 @@ def _session_usage_snapshot(agent: Any) -> Dict[str, Any]:
                 CanonicalUsage(
                     input_tokens=_agent_token_count(agent, "session_input_tokens", input_tokens) or input_tokens,
                     output_tokens=_agent_token_count(agent, "session_output_tokens", output_tokens) or output_tokens,
-                    cache_read_tokens=_agent_token_count(agent, "session_cache_read_tokens", 0) or 0,
-                    cache_write_tokens=_agent_token_count(agent, "session_cache_write_tokens", 0) or 0,
+                    cache_read_tokens=cache_read_tokens,
+                    cache_write_tokens=cache_write_tokens,
                 ),
                 provider=getattr(agent, "provider", None),
                 base_url=getattr(agent, "base_url", None),
@@ -263,6 +282,8 @@ def _session_usage_snapshot(agent: Any) -> Dict[str, Any]:
 
 
 _RESPONSES_USAGE_EXTRA_KEYS = (
+    "cache_read_tokens",
+    "cache_write_tokens",
     "scope",
     "completeness",
     "warnings",

@@ -34,6 +34,8 @@ from gateway.platforms.api_server import (
     _append_request_identity_prompt,
     _derive_chat_session_id,
     _redact_api_error_text,
+    _responses_usage_payload,
+    _session_usage_snapshot,
     check_api_server_requirements,
     cors_middleware,
     security_headers_middleware,
@@ -876,6 +878,8 @@ class TestAgentExecution:
         assert usage["compressions"] == 2
         assert usage["cost_status"] == "estimated"
         assert usage["cost_usd"] == 0.0123
+        assert usage["cache_read_tokens"] == 3
+        assert usage["cache_write_tokens"] == 2
         assert mock_cost.call_count == 1
 
     @pytest.mark.asyncio
@@ -961,6 +965,181 @@ class TestAgentExecution:
         mock_agent.shutdown_memory_provider.assert_called_once_with(mock_agent._session_messages)
         assert agent_ref[0] is None
         mock_agent.close.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# _session_usage_snapshot — prompt-cache split and honest context reporting.
+#
+# The envelope's aggregate ``input_tokens`` is prompt-inclusive, so consumers
+# that want "fresh input" need the cached buckets published alongside it. The
+# context trio must never be fabricated: a run-cumulative counter is not a
+# context size, and reporting one clamps a consumer's context bar to 100% and
+# fakes a "compaction imminent" warning.
+# ---------------------------------------------------------------------------
+
+
+class _UsageSnapshotAgent:
+    """Minimal agent-shaped object for _session_usage_snapshot unit tests."""
+
+    def __init__(self, **attrs):
+        self.session_prompt_tokens = 100
+        self.session_completion_tokens = 20
+        self.session_total_tokens = 120
+        for name, value in attrs.items():
+            setattr(self, name, value)
+
+
+class _StubCompressor:
+    def __init__(self, last_prompt_tokens, context_length=8192, compression_count=2):
+        self.last_prompt_tokens = last_prompt_tokens
+        self.context_length = context_length
+        self.compression_count = compression_count
+
+
+class TestSessionUsageSnapshotCacheSplit:
+    def test_publishes_parent_scope_cache_split(self):
+        agent = _UsageSnapshotAgent(
+            session_cache_read_tokens=70,
+            session_cache_write_tokens=5,
+        )
+
+        usage = _session_usage_snapshot(agent)
+
+        assert usage["input_tokens"] == 100
+        assert usage["output_tokens"] == 20
+        assert usage["total_tokens"] == 120
+        assert usage["cache_read_tokens"] == 70
+        assert usage["cache_write_tokens"] == 5
+        # Existing keys are untouched by the additive split.
+        assert usage["scope"] == "run_aggregate"
+        assert usage["completeness"] == "complete"
+        assert usage["warnings"] == []
+        assert usage["breakdown"]["parent"] == {
+            "input_tokens": 100,
+            "output_tokens": 20,
+            "total_tokens": 120,
+        }
+
+    def test_cache_split_reports_zero_when_counters_absent(self):
+        usage = _session_usage_snapshot(_UsageSnapshotAgent())
+
+        assert usage["cache_read_tokens"] == 0
+        assert usage["cache_write_tokens"] == 0
+
+    def test_cache_split_ignores_malformed_counters(self):
+        agent = _UsageSnapshotAgent(
+            session_cache_read_tokens="lots",
+            session_cache_write_tokens=None,
+        )
+
+        usage = _session_usage_snapshot(agent)
+
+        assert usage["cache_read_tokens"] == 0
+        assert usage["cache_write_tokens"] == 0
+
+    def test_responses_payload_passes_cache_split_through(self):
+        payload = _responses_usage_payload(
+            {
+                "input_tokens": 100,
+                "output_tokens": 20,
+                "total_tokens": 120,
+                "cache_read_tokens": 70,
+                "cache_write_tokens": 5,
+            }
+        )
+
+        assert payload["cache_read_tokens"] == 70
+        assert payload["cache_write_tokens"] == 5
+
+
+class TestSessionUsageSnapshotContext:
+    def test_reports_context_trio_from_a_real_reading(self):
+        agent = _UsageSnapshotAgent(
+            context_compressor=_StubCompressor(4096),
+        )
+
+        usage = _session_usage_snapshot(agent)
+
+        assert usage["context_used"] == 4096
+        assert usage["context_max"] == 8192
+        assert usage["context_percent"] == 50
+        assert usage["compressions"] == 2
+
+    def test_omits_context_trio_before_any_provider_reading(self):
+        """A 0 reading means "not measured yet", not "empty context"."""
+        agent = _UsageSnapshotAgent(
+            context_compressor=_StubCompressor(0),
+        )
+
+        usage = _session_usage_snapshot(agent)
+
+        assert "context_used" not in usage
+        assert "context_max" not in usage
+        assert "context_percent" not in usage
+        # Compaction reporting is independent of the context reading.
+        assert usage["compressions"] == 2
+
+    def test_omits_context_trio_for_post_compaction_sentinel(self):
+        """The -1 sentinel parks the reading until real usage arrives."""
+        agent = _UsageSnapshotAgent(
+            context_compressor=_StubCompressor(-1),
+        )
+
+        usage = _session_usage_snapshot(agent)
+
+        assert "context_used" not in usage
+        assert "context_max" not in usage
+        assert "context_percent" not in usage
+        assert usage["compressions"] == 2
+
+    def test_omits_context_trio_when_engine_does_not_track_the_reading(self):
+        class _NoReadingEngine:
+            context_length = 8192
+            compression_count = 0
+
+        agent = _UsageSnapshotAgent(context_compressor=_NoReadingEngine())
+
+        usage = _session_usage_snapshot(agent)
+
+        assert "context_used" not in usage
+        assert "context_max" not in usage
+        assert "context_percent" not in usage
+        assert usage["compressions"] == 0
+
+    def test_never_substitutes_run_cumulative_totals_for_context_used(self):
+        """session_total_tokens is tokens processed, not a context size.
+
+        Substituting it pinned the reported context at 100% for any run whose
+        cumulative processing exceeded the window, even with a nearly empty
+        conversation.
+        """
+        agent = _UsageSnapshotAgent(
+            session_prompt_tokens=900_000,
+            session_completion_tokens=100_000,
+            session_total_tokens=1_000_000,
+            context_compressor=_StubCompressor(0),
+        )
+
+        usage = _session_usage_snapshot(agent)
+
+        assert usage["total_tokens"] == 1_000_000
+        assert "context_used" not in usage
+        assert "context_percent" not in usage
+
+    def test_responses_payload_omits_absent_context_keys(self):
+        payload = _responses_usage_payload(
+            {
+                "input_tokens": 100,
+                "output_tokens": 20,
+                "total_tokens": 120,
+                "compressions": 3,
+            }
+        )
+
+        assert payload["compressions"] == 3
+        assert "context_used" not in payload
+        assert "context_max" not in payload
+        assert "context_percent" not in payload
 
 
 # ---------------------------------------------------------------------------
