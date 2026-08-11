@@ -3678,6 +3678,9 @@ class APIServerAdapter(BasePlatformAdapter):
           response object with all output items + usage (same payload
           shape as the non-streaming path for parity)
         - ``response.failed`` — terminal event on agent error
+        - ``response.context_compression.{started,completed,aborted,adopted}``
+          — Hermes extension: compaction lifecycle mid-turn so clients can
+          show a live "compacting" indicator (see ``_emit_compression_event``)
 
         If the client disconnects mid-stream, ``agent.interrupt()`` is
         called so the agent stops issuing upstream LLM calls, then the
@@ -3958,6 +3961,36 @@ class APIServerAdapter(BasePlatformAdapter):
                     "item": output_item,
                 })
 
+            async def _emit_compression_event(payload: Dict[str, Any]) -> None:
+                """Emit ``response.context_compression.<phase>`` (Hermes extension).
+
+                Custom event types on the Responses stream: spec-conformant
+                clients that switch on known event names skip them, and Hermes
+                Web renders a compaction indicator from them. The payload is
+                whitelisted to phase plus non-sensitive counters — free-text
+                fields from the hook (abort reasons carry raw provider error
+                text) must never reach the client stream.
+                """
+                phase = payload.get("phase")
+                if phase not in ("started", "completed", "aborted", "adopted"):
+                    return
+                src = payload.get("payload") or {}
+                event_type = f"response.context_compression.{phase}"
+                data: Dict[str, Any] = {"type": event_type}
+                for key in (
+                    "pre_message_count",
+                    "post_message_count",
+                    "pre_tokens",
+                    "post_tokens",
+                    "waited_seconds",
+                ):
+                    value = src.get(key)
+                    if isinstance(value, (int, float)) and not isinstance(value, bool):
+                        data[key] = value
+                if isinstance(src.get("quality_gate_passed"), bool):
+                    data["quality_gate_passed"] = src["quality_gate_passed"]
+                await _write_event(event_type, data)
+
             # Main drain loop — thread-safe queue fed by agent callbacks.
             async def _dispatch(it) -> None:
                 """Route a queue item to the correct SSE emitter.
@@ -3978,6 +4011,8 @@ class APIServerAdapter(BasePlatformAdapter):
                         await _emit_tool_started(payload)
                     elif tag == "__tool_completed__":
                         await _emit_tool_completed(payload)
+                    elif tag == "__compression__":
+                        await _emit_compression_event(payload)
                 elif isinstance(it, str):
                     # Batch text deltas — append to buffer, flush on timer
                     _batch_buf.append(it)
@@ -4400,6 +4435,19 @@ class APIServerAdapter(BasePlatformAdapter):
                     "result": function_result,
                 }))
 
+            def _on_compression_event(hook_name, payload):
+                """Queue a compaction lifecycle event for live streaming.
+
+                Hook names arrive as ``context_compression_<phase>``; the SSE
+                writer whitelists the payload before anything reaches the
+                client (see ``_emit_compression_event``).
+                """
+                phase = str(hook_name).rsplit("_", 1)[-1]
+                _stream_q.put(("__compression__", {
+                    "phase": phase,
+                    "payload": payload if isinstance(payload, dict) else {},
+                }))
+
             agent_ref = [None]
             agent_task = asyncio.ensure_future(self._run_agent(
                 user_message=user_message,
@@ -4410,6 +4458,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 tool_progress_callback=_on_tool_progress,
                 tool_start_callback=_on_tool_start,
                 tool_complete_callback=_on_tool_complete,
+                compression_event_callback=_on_compression_event,
                 agent_ref=agent_ref,
                 request_metadata=request_metadata,
                 gateway_session_key=gateway_session_key,
@@ -5290,6 +5339,7 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_progress_callback=None,
         tool_start_callback=None,
         tool_complete_callback=None,
+        compression_event_callback=None,
         agent_ref: Optional[list] = None,
         request_metadata: Optional[Dict[str, Any]] = None,
         gateway_session_key: Optional[str] = None,
@@ -5344,6 +5394,11 @@ class APIServerAdapter(BasePlatformAdapter):
                         gateway_session_key=gateway_session_key,
                         route=route,
                     )
+                    if compression_event_callback is not None:
+                        # Attribute, not a constructor kwarg: the compression
+                        # wrapper reads it via getattr, so agent builds that
+                        # predate the callback stay compatible.
+                        agent._compression_event_callback = compression_event_callback
                     if agent_ref is not None:
                         agent_ref[0] = agent
                     # Track executor-backed agents for drain-cap interruption.

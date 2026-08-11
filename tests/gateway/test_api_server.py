@@ -3102,6 +3102,105 @@ class TestResponsesStreaming:
             assert stored["usage"] == usage
 
     @pytest.mark.asyncio
+    async def test_stream_emits_compression_lifecycle_events(self, adapter):
+        """Compaction hooks surface as response.context_compression.* SSE events."""
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            async def _mock_run_agent(**kwargs):
+                compression_cb = kwargs.get("compression_event_callback")
+                delta_cb = kwargs.get("stream_delta_callback")
+                assert compression_cb is not None
+                compression_cb("context_compression_started", {
+                    "session_id": "sess-1",
+                    "pre_message_count": 42,
+                    "pre_tokens": 180000,
+                    "model": "gpt-5.6-sol",
+                    "focus_topic": None,
+                })
+                compression_cb("context_compression_completed", {
+                    "session_id": "sess-1",
+                    "pre_message_count": 42,
+                    "post_message_count": 11,
+                    "pre_tokens": 180000,
+                    "post_tokens": 60000,
+                    "quality_gate_passed": True,
+                })
+                if delta_cb:
+                    delta_cb("Continuing after compaction")
+                return (
+                    {"final_response": "Continuing after compaction", "messages": [], "api_calls": 1},
+                    {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
+                )
+
+            with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent):
+                resp = await cli.post(
+                    "/v1/responses",
+                    json={"model": "hermes-agent", "input": "hi", "stream": True},
+                )
+                assert resp.status == 200
+                body = await resp.text()
+
+            assert "event: response.context_compression.started" in body
+            assert "event: response.context_compression.completed" in body
+            events = _parse_sse_events(body)
+            started = next(
+                e for e in events
+                if e.get("type") == "response.context_compression.started"
+            )
+            assert started["pre_message_count"] == 42
+            assert started["pre_tokens"] == 180000
+            assert "sequence_number" in started
+            # Free-text hook fields never reach the client stream.
+            assert "model" not in started
+            assert "focus_topic" not in started
+            completed = next(
+                e for e in events
+                if e.get("type") == "response.context_compression.completed"
+            )
+            assert completed["post_message_count"] == 11
+            assert completed["post_tokens"] == 60000
+            assert completed["quality_gate_passed"] is True
+
+    @pytest.mark.asyncio
+    async def test_stream_compression_event_whitelist_and_unknown_phase(self, adapter):
+        """Aborted events drop raw error text; unknown phases are not emitted."""
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            async def _mock_run_agent(**kwargs):
+                compression_cb = kwargs.get("compression_event_callback")
+                compression_cb("context_compression_aborted", {
+                    "session_id": "sess-1",
+                    "pre_message_count": 40,
+                    "abort_reason": "provider exploded: secret-detail",
+                    "quality_gate_passed": False,
+                })
+                compression_cb("context_compression_bogus", {"pre_message_count": 1})
+                return (
+                    {"final_response": "ok", "messages": [], "api_calls": 1},
+                    {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                )
+
+            with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent):
+                resp = await cli.post(
+                    "/v1/responses",
+                    json={"model": "hermes-agent", "input": "hi", "stream": True},
+                )
+                assert resp.status == 200
+                body = await resp.text()
+
+            assert "event: response.context_compression.aborted" in body
+            assert "secret-detail" not in body
+            assert "context_compression.bogus" not in body
+            assert "context_compression_bogus" not in body
+            aborted = next(
+                e for e in _parse_sse_events(body)
+                if e.get("type") == "response.context_compression.aborted"
+            )
+            assert aborted["pre_message_count"] == 40
+            assert aborted["quality_gate_passed"] is False
+            assert "abort_reason" not in aborted
+
+    @pytest.mark.asyncio
     async def test_stream_failed_preserves_usage_and_structured_error(self, adapter):
         app = _create_app(adapter)
         usage = {

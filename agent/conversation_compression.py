@@ -643,6 +643,19 @@ def _emit_compression_hook(agent: Any, hook_name: str, **payload: Any) -> None:
         )
     except Exception as exc:
         logger.debug("%s hook failed: %s", hook_name, exc)
+    # Per-run gateway callback (set as an attribute by the API server's
+    # streaming path) so the compaction lifecycle can reach the client's SSE
+    # stream. Isolated from the plugin hook above: an observer failure must
+    # not suppress the client signal, and vice versa.
+    callback = getattr(agent, "_compression_event_callback", None)
+    if callback is not None:
+        try:
+            callback(
+                hook_name,
+                dict(payload, session_id=getattr(agent, "session_id", "") or ""),
+            )
+        except Exception as exc:
+            logger.debug("%s compression event callback failed: %s", hook_name, exc)
 
 
 def check_compression_model_feasibility(agent: Any) -> None:
