@@ -2653,6 +2653,529 @@ class TestResponsesEndpoint:
                 if message["role"] == "user"
             ] == [user["content"], second_user["content"]]
 
+    # ------------------------------------------------------------------
+    # Staging history doubling (AE-204 family / staging 2026-08-11)
+    #
+    # On staging, Hindsight prefetch stamps an ``api_content`` sidecar on
+    # the current turn's user row (agent/turn_context.py). The sidecar is
+    # not underscore-prefixed, so ``_response_prefix_projection`` kept it
+    # and the expected-prefix match failed on the very first turn — the
+    # fallthrough then stored ``prior + user + result["messages"]``, i.e.
+    # the current user row twice, adjacent. Every later turn,
+    # ``repair_message_sequence`` merged those adjacent user rows in the
+    # agent's transcript, so BOTH prefix checks failed and the fallthrough
+    # re-embedded the whole prior history: h(n+1) = 2*h(n) + 2.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _simulate_staging_agent_turn(conversation_history, user_message, reply):
+        """Mimic run_conversation's transcript shape on staging.
+
+        Two real perturbations are reproduced:
+        - ``repair_message_sequence`` pass 2 (agent/agent_runtime_helpers.py)
+          merges consecutive user rows with a blank-line separator and drops
+          their stale ``api_content`` sidecar.
+        - Hindsight memory prefetch stamps the ``api_content`` sidecar and
+          the ``_db_persisted`` marker on this turn's user row
+          (agent/turn_context.py).
+        """
+        messages = []
+        for msg in conversation_history:
+            if (
+                messages
+                and isinstance(msg, dict)
+                and msg.get("role") == "user"
+                and isinstance(messages[-1], dict)
+                and messages[-1].get("role") == "user"
+                and isinstance(messages[-1].get("content"), str)
+                and isinstance(msg.get("content"), str)
+            ):
+                merged = dict(messages[-1])
+                merged["content"] = merged["content"] + "\n\n" + msg["content"]
+                merged.pop("api_content", None)
+                messages[-1] = merged
+                continue
+            messages.append(msg)
+        messages.append({
+            "role": "user",
+            "content": user_message,
+            "api_content": (
+                "<recalled_memories>staging recall block</recalled_memories>"
+                "\n\n" + str(user_message)
+            ),
+            "_db_persisted": True,
+        })
+        messages.append({
+            "role": "assistant",
+            "content": reply,
+            "_db_persisted": True,
+        })
+        return messages
+
+    @pytest.mark.asyncio
+    async def test_memory_sidecar_chained_turns_store_each_message_once(self, adapter):
+        """Reproduces the staging 2n+2 doubling across chained turns.
+
+        Before the fix, stored history lengths grew 3 -> 8 -> 18 (each turn
+        re-embedding the whole prior history); the staging Langfuse evidence
+        continued 18 -> 35 -> 67. After the fix each real message is stored
+        exactly once per turn: 2 -> 4 -> 6.
+        """
+        turns = [
+            ("staging turn one", "answer one"),
+            ("staging turn two", "answer two"),
+            ("staging turn three", "answer three"),
+        ]
+
+        def _make_mock(reply):
+            async def _mock_run_agent(**kwargs):
+                return (
+                    {
+                        "final_response": reply,
+                        "messages": self._simulate_staging_agent_turn(
+                            kwargs["conversation_history"],
+                            kwargs["user_message"],
+                            reply,
+                        ),
+                        "api_calls": 1,
+                    },
+                    {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+                )
+            return _mock_run_agent
+
+        app = _create_app(adapter)
+        prev_id = None
+        stored_histories = []
+        async with TestClient(TestServer(app)) as cli:
+            for user_text, reply in turns:
+                payload = {"model": "hermes-agent", "input": user_text}
+                if prev_id:
+                    payload["previous_response_id"] = prev_id
+                with patch.object(
+                    adapter, "_run_agent", side_effect=_make_mock(reply)
+                ):
+                    resp = await cli.post("/v1/responses", json=payload)
+                assert resp.status == 200
+                data = await resp.json()
+                prev_id = data["id"]
+                stored_histories.append(
+                    adapter._response_store.get(prev_id)["conversation_history"]
+                )
+
+        for turn_number, history in enumerate(stored_histories, start=1):
+            for user_text, reply in turns[:turn_number]:
+                user_rows = [
+                    m for m in history
+                    if m.get("role") == "user" and user_text in str(m.get("content"))
+                ]
+                assert len(user_rows) == 1, (
+                    f"after turn {turn_number}, user text {user_text!r} is stored "
+                    f"{len(user_rows)} times (history len {len(history)})"
+                )
+                assistant_rows = [
+                    m for m in history
+                    if m.get("role") == "assistant" and reply in str(m.get("content"))
+                ]
+                assert len(assistant_rows) == 1, (
+                    f"after turn {turn_number}, reply {reply!r} is stored "
+                    f"{len(assistant_rows)} times"
+                )
+        assert [len(h) for h in stored_histories] == [2, 4, 6]
+
+    @pytest.mark.asyncio
+    async def test_memory_sidecar_on_first_turn_stores_user_once(self, adapter):
+        """The api_content sidecar must not defeat first-turn prefix detection."""
+        user_text = "hello with recall"
+        agent_messages = [
+            {
+                "role": "user",
+                "content": user_text,
+                "api_content": "<recalled_memories>x</recalled_memories>\n\n" + user_text,
+                "_db_persisted": True,
+            },
+            {"role": "assistant", "content": "hi", "_db_persisted": True},
+        ]
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (
+                    {
+                        "final_response": "hi",
+                        "messages": list(agent_messages),
+                        "api_calls": 1,
+                    },
+                    {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+                )
+                resp = await cli.post(
+                    "/v1/responses",
+                    json={"model": "hermes-agent", "input": user_text},
+                )
+
+            assert resp.status == 200
+            data = await resp.json()
+            stored = adapter._response_store.get(data["id"])["conversation_history"]
+            assert stored == agent_messages
+            assert [m["role"] for m in stored] == ["user", "assistant"]
+
+    @pytest.mark.asyncio
+    async def test_perturbed_prior_history_never_reembeds_prior(self, adapter):
+        """Repair-merged prior rows must not trigger prior re-embedding.
+
+        When alternation repair rewrote the prior rows inside the agent's
+        transcript (so neither prefix check can match), the transcript is
+        still authoritative — the stored history must be adopted from it,
+        never concatenated after the prior history again.
+        """
+        prior_history = [
+            {"role": "user", "content": "first question"},
+            {"role": "user", "content": "second question"},
+            {"role": "assistant", "content": "combined answer"},
+        ]
+        adapter._response_store.put(
+            "resp_prev",
+            {
+                "response": {"id": "resp_prev", "status": "completed"},
+                "conversation_history": list(prior_history),
+                "session_id": "api-test-session",
+            },
+        )
+        # repair merged the adjacent prior user rows, then the turn ran.
+        agent_messages = [
+            {"role": "user", "content": "first question\n\nsecond question"},
+            {"role": "assistant", "content": "combined answer"},
+            {"role": "user", "content": "third question", "_db_persisted": True},
+            {"role": "assistant", "content": "third answer", "_db_persisted": True},
+        ]
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (
+                    {
+                        "final_response": "third answer",
+                        "messages": list(agent_messages),
+                        "api_calls": 1,
+                    },
+                    {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+                )
+                resp = await cli.post(
+                    "/v1/responses",
+                    json={
+                        "model": "hermes-agent",
+                        "input": "third question",
+                        "previous_response_id": "resp_prev",
+                    },
+                )
+
+            assert resp.status == 200
+            data = await resp.json()
+            stored = adapter._response_store.get(data["id"])["conversation_history"]
+            assert stored == agent_messages
+            for needle in ("first question", "second question", "third question"):
+                rows = [
+                    m for m in stored
+                    if m.get("role") == "user" and needle in str(m.get("content"))
+                ]
+                assert len(rows) == 1, f"{needle!r} stored {len(rows)} times"
+
+    @pytest.mark.asyncio
+    async def test_tool_bearing_perturbed_turn_keeps_tool_rows_once(self, adapter):
+        """Perturbed transcripts with tool calls keep every tool row exactly once."""
+        prior_history = [
+            {"role": "user", "content": "look something up"},
+            {"role": "user", "content": "please"},
+            {"role": "assistant", "content": "done"},
+        ]
+        adapter._response_store.put(
+            "resp_prev",
+            {
+                "response": {"id": "resp_prev", "status": "completed"},
+                "conversation_history": list(prior_history),
+                "session_id": "api-test-session",
+            },
+        )
+        agent_messages = [
+            {"role": "user", "content": "look something up\n\nplease"},
+            {"role": "assistant", "content": "done"},
+            {
+                "role": "user",
+                "content": "read the file",
+                "api_content": "<recalled_memories>y</recalled_memories>\n\nread the file",
+            },
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "function": {"name": "read_file", "arguments": '{"path":"a.txt"}'},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": '{"content":"data"}'},
+            {"role": "assistant", "content": "file says data"},
+        ]
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (
+                    {
+                        "final_response": "file says data",
+                        "messages": list(agent_messages),
+                        "api_calls": 1,
+                    },
+                    {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+                )
+                resp = await cli.post(
+                    "/v1/responses",
+                    json={
+                        "model": "hermes-agent",
+                        "input": "read the file",
+                        "previous_response_id": "resp_prev",
+                    },
+                )
+
+            assert resp.status == 200
+            data = await resp.json()
+            stored = adapter._response_store.get(data["id"])["conversation_history"]
+            assert stored == agent_messages
+            tool_rows = [m for m in stored if m.get("role") == "tool"]
+            assert len(tool_rows) == 1
+            # Output items replay only the current turn's tool artifacts:
+            # one function_call and one function_call_output for call_1.
+            output_types = [item["type"] for item in data["output"]]
+            assert output_types.count("function_call") == 1
+            assert output_types.count("function_call_output") == 1
+            assert "call_1" in json.dumps(data["output"])
+
+    @pytest.mark.asyncio
+    async def test_suffix_only_result_messages_still_concatenate(self, adapter):
+        """Assistant/tool-only suffix results keep the concatenation semantics."""
+        prior_history = [
+            {"role": "user", "content": "What is 1+1?"},
+            {"role": "assistant", "content": "2"},
+        ]
+        adapter._response_store.put(
+            "resp_prev",
+            {
+                "response": {"id": "resp_prev", "status": "completed"},
+                "conversation_history": list(prior_history),
+                "session_id": "api-test-session",
+            },
+        )
+        suffix_messages = [
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {"id": "call_add", "function": {"name": "add", "arguments": '{"a":2,"b":1}'}}
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_add", "content": "3"},
+            {"role": "assistant", "content": "3"},
+        ]
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (
+                    {
+                        "final_response": "3",
+                        "messages": list(suffix_messages),
+                        "api_calls": 1,
+                    },
+                    {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+                )
+                resp = await cli.post(
+                    "/v1/responses",
+                    json={
+                        "model": "hermes-agent",
+                        "input": "Now add 1 more",
+                        "previous_response_id": "resp_prev",
+                    },
+                )
+
+            assert resp.status == 200
+            data = await resp.json()
+            stored = adapter._response_store.get(data["id"])["conversation_history"]
+            assert stored == prior_history + [
+                {"role": "user", "content": "Now add 1 more"}
+            ] + suffix_messages
+
+    @pytest.mark.asyncio
+    async def test_suffix_starting_at_current_user_row_prepends_prior_once(self, adapter):
+        """A suffix that already includes this turn's user row must not duplicate it."""
+        prior_history = [
+            {"role": "user", "content": "What is 1+1?"},
+            {"role": "assistant", "content": "2"},
+        ]
+        adapter._response_store.put(
+            "resp_prev",
+            {
+                "response": {"id": "resp_prev", "status": "completed"},
+                "conversation_history": list(prior_history),
+                "session_id": "api-test-session",
+            },
+        )
+        suffix_messages = [
+            {"role": "user", "content": "Now add 1 more"},
+            {"role": "assistant", "content": "3"},
+        ]
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (
+                    {
+                        "final_response": "3",
+                        "messages": list(suffix_messages),
+                        "api_calls": 1,
+                    },
+                    {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+                )
+                resp = await cli.post(
+                    "/v1/responses",
+                    json={
+                        "model": "hermes-agent",
+                        "input": "Now add 1 more",
+                        "previous_response_id": "resp_prev",
+                    },
+                )
+
+            assert resp.status == 200
+            data = await resp.json()
+            stored = adapter._response_store.get(data["id"])["conversation_history"]
+            assert stored == prior_history + suffix_messages
+            user_rows = [
+                m for m in stored
+                if m.get("role") == "user" and m.get("content") == "Now add 1 more"
+            ]
+            assert len(user_rows) == 1
+
+    @pytest.mark.asyncio
+    async def test_turn_after_incomplete_snapshot_stores_each_message_once(self, adapter):
+        """Chaining off an incomplete snapshot (trailing user row) must not double.
+
+        An aborted stream persists ``prior + user`` with no assistant reply.
+        On the next turn the agent's alternation repair merges that trailing
+        user row with the new user message, so no exact current-user row
+        exists in the transcript — the store must still keep each real
+        message exactly once.
+        """
+        incomplete_history = [
+            {"role": "user", "content": "first message"},
+        ]
+        adapter._response_store.put(
+            "resp_prev",
+            {
+                "response": {"id": "resp_prev", "status": "incomplete"},
+                "conversation_history": list(incomplete_history),
+                "session_id": "api-test-session",
+            },
+        )
+        # repair merged the orphaned user row into this turn's user message.
+        agent_messages = [
+            {"role": "user", "content": "first message\n\nsecond message"},
+            {"role": "assistant", "content": "answer", "_db_persisted": True},
+        ]
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (
+                    {
+                        "final_response": "answer",
+                        "messages": list(agent_messages),
+                        "api_calls": 1,
+                    },
+                    {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+                )
+                resp = await cli.post(
+                    "/v1/responses",
+                    json={
+                        "model": "hermes-agent",
+                        "input": "second message",
+                        "previous_response_id": "resp_prev",
+                    },
+                )
+
+            assert resp.status == 200
+            data = await resp.json()
+            stored = adapter._response_store.get(data["id"])["conversation_history"]
+            assert stored == agent_messages
+            first_rows = [
+                m for m in stored
+                if m.get("role") == "user" and "first message" in str(m.get("content"))
+            ]
+            assert len(first_rows) == 1
+
+    @pytest.mark.asyncio
+    async def test_streamed_memory_sidecar_chained_turns_store_each_message_once(self, adapter):
+        """The streaming persistence path shares the doubling fix."""
+        turns = [
+            ("stream turn one", "reply one"),
+            ("stream turn two", "reply two"),
+        ]
+
+        def _make_mock(reply):
+            async def _mock_run_agent(**kwargs):
+                cb = kwargs.get("stream_delta_callback")
+                if cb:
+                    cb(reply)
+                return (
+                    {
+                        "final_response": reply,
+                        "messages": self._simulate_staging_agent_turn(
+                            kwargs["conversation_history"],
+                            kwargs["user_message"],
+                            reply,
+                        ),
+                        "api_calls": 1,
+                    },
+                    {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+                )
+            return _mock_run_agent
+
+        app = _create_app(adapter)
+        prev_id = None
+        stored_histories = []
+        async with TestClient(TestServer(app)) as cli:
+            for user_text, reply in turns:
+                payload = {
+                    "model": "hermes-agent",
+                    "input": user_text,
+                    "stream": True,
+                }
+                if prev_id:
+                    payload["previous_response_id"] = prev_id
+                with patch.object(
+                    adapter, "_run_agent", side_effect=_make_mock(reply)
+                ):
+                    resp = await cli.post("/v1/responses", json=payload)
+                    body = await resp.text()
+                assert resp.status == 200
+                prev_id = None
+                for event in _parse_sse_events(body):
+                    if event.get("type") == "response.completed":
+                        prev_id = event["response"]["id"]
+                        break
+                assert prev_id
+                stored_histories.append(
+                    adapter._response_store.get(prev_id)["conversation_history"]
+                )
+
+        for turn_number, history in enumerate(stored_histories, start=1):
+            for user_text, _reply in turns[:turn_number]:
+                rows = [
+                    m for m in history
+                    if m.get("role") == "user" and user_text in str(m.get("content"))
+                ]
+                assert len(rows) == 1, (
+                    f"after streamed turn {turn_number}, {user_text!r} stored "
+                    f"{len(rows)} times"
+                )
+        assert [len(h) for h in stored_histories] == [2, 4]
+
     @pytest.mark.asyncio
     async def test_previous_response_id_stores_compacted_transcript_as_authoritative(self, adapter):
         """After compression, previous_response_id must resume compacted history."""

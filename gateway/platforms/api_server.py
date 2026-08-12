@@ -4957,7 +4957,25 @@ class APIServerAdapter(BasePlatformAdapter):
         result: Dict[str, Any],
         final_response: Any,
     ) -> List[Dict[str, Any]]:
-        """Build the stored Responses transcript without duplicating history."""
+        """Build the stored Responses transcript without duplicating history.
+
+        The agent's ``result["messages"]`` is a full transcript that embeds
+        the input history, so appending it after ``prior`` doubles every
+        stored message — repeated ``previous_response_id`` chaining then
+        grows the snapshot as h(n+1) = 2*h(n) + 2 (the staging 2026-08-11
+        doubling; AE-204 family). Concatenation is therefore reserved for
+        result shapes that provably do NOT embed the history:
+
+        - transcript-shaped results (prefix match, current-user anchor, or
+          a compaction summary) are adopted verbatim;
+        - a suffix that starts at this turn's user row gets ``prior``
+          prepended once;
+        - any other result that still carries user rows is treated as a
+          perturbed transcript (alternation repair merges user rows and
+          rewrites content mid-turn) and adopted — never re-concatenated;
+        - only user-row-free suffixes (assistant/tool output of the current
+          turn) are appended after ``prior + current_user``.
+        """
         prior = list(conversation_history)
         current_user = {"role": "user", "content": user_message}
         agent_messages = result.get("messages") if isinstance(result, dict) else None
@@ -4969,6 +4987,26 @@ class APIServerAdapter(BasePlatformAdapter):
                 result,
             )
             if turn_start or APIServerAdapter._messages_include_compaction_summary(agent_messages):
+                return list(agent_messages)
+
+            # turn_start == 0: either the current turn genuinely starts at
+            # index 0, or no prefix/anchor matched at all.
+            current_idx = APIServerAdapter._response_current_user_row_index(
+                agent_messages, user_message
+            )
+            if current_idx == 0:
+                # Suffix beginning at this turn's user row (also the clean
+                # first turn, where prior is empty). Prepend prior only —
+                # appending current_user too is what duplicated the user row.
+                return prior + list(agent_messages)
+            if any(
+                isinstance(msg, dict) and msg.get("role") == "user"
+                for msg in agent_messages
+            ):
+                # User rows present but no recognizable prefix or anchor: a
+                # perturbed transcript (e.g. repair merged this turn's user
+                # row into a prior one). It already embeds the history —
+                # adopt it; re-embedding prior is never correct.
                 return list(agent_messages)
 
             full_history = prior
@@ -4994,14 +5032,21 @@ class APIServerAdapter(BasePlatformAdapter):
         history exponentially.
 
         Underscore-prefixed fields are Hermes runtime bookkeeping, not message
-        semantics. Ignore them recursively for prefix detection while retaining
-        the original messages unchanged in the stored authoritative transcript.
+        semantics. So is the ``api_content`` persistence sidecar that memory
+        prefetch / plugin injection stamps on the current turn's user row
+        (see ``agent/turn_context.py``): on platforms with live memory recall
+        (staging Hindsight) every turn's user row carries it, and keeping it
+        in the projection made the expected-prefix match fail on every turn —
+        the fallthrough then re-embedded the whole prior history each turn
+        (the staging 2026-08-11 h(n+1)=2h(n)+2 doubling). Ignore both
+        recursively for prefix detection while retaining the original
+        messages unchanged in the stored authoritative transcript.
         """
         if isinstance(value, dict):
             return {
                 key: APIServerAdapter._response_prefix_projection(item)
                 for key, item in value.items()
-                if not str(key).startswith("_")
+                if not str(key).startswith("_") and key != "api_content"
             }
         if isinstance(value, list):
             return [
@@ -5038,7 +5083,45 @@ class APIServerAdapter(BasePlatformAdapter):
             and projected_messages[:len(projected_prior)] == projected_prior
         ):
             return len(prior)
+        # Prefix comparison failed — mid-turn perturbations (alternation
+        # repair merging user rows, content rewrites) can invalidate the
+        # prior rows without making the transcript any less authoritative.
+        # Anchor on this turn's user row instead: the current turn's user
+        # message is always the LAST user row of a real transcript (steers
+        # and memory blocks never append user rows after it). A positive
+        # index proves the transcript embeds (a possibly perturbed form of)
+        # the history, and marks where the current turn starts.
+        current_idx = APIServerAdapter._response_current_user_row_index(
+            agent_messages, user_message
+        )
+        if current_idx is not None and current_idx > 0:
+            return current_idx
         return 0
+
+    @staticmethod
+    def _response_current_user_row_index(
+        agent_messages: List[Dict[str, Any]],
+        user_message: Any,
+    ) -> Optional[int]:
+        """Index of the current turn's user row in ``result["messages"]``.
+
+        Examines only the last user-role row (the current turn appends its
+        user row and then assistant/tool rows exclusively) and compares
+        projected content, so persistence sidecars (``api_content``,
+        ``_db_persisted``) cannot hide the match. Returns ``None`` when the
+        last user row does not carry this turn's content — e.g. when repair
+        merged it into an earlier user row, or the result is a user-row-free
+        suffix.
+        """
+        target = APIServerAdapter._response_prefix_projection(user_message)
+        for i in range(len(agent_messages) - 1, -1, -1):
+            msg = agent_messages[i]
+            if isinstance(msg, dict) and msg.get("role") == "user":
+                projected = APIServerAdapter._response_prefix_projection(
+                    msg.get("content")
+                )
+                return i if projected == target else None
+        return None
 
     @classmethod
     def _turn_transcript_messages(
