@@ -4970,11 +4970,14 @@ class APIServerAdapter(BasePlatformAdapter):
           a compaction summary) are adopted verbatim;
         - a suffix that starts at this turn's user row gets ``prior``
           prepended once;
-        - any other result that still carries user rows is treated as a
-          perturbed transcript (alternation repair merges user rows and
-          rewrites content mid-turn) and adopted — never re-concatenated;
-        - only user-row-free suffixes (assistant/tool output of the current
-          turn) are appended after ``prior + current_user``.
+        - a result that still carries user rows AND whose head row proves
+          it embeds the prior history (see
+          ``_response_messages_embed_prior``) is a perturbed transcript
+          (alternation repair merges user rows and rewrites content
+          mid-turn) and is adopted — never re-concatenated;
+        - everything else (user-row-free assistant/tool suffixes, and
+          suffix shapes carrying mid-turn user-role nudges) is appended
+          after ``prior + current_user`` — prior history is never dropped.
         """
         prior = list(conversation_history)
         current_user = {"role": "user", "content": user_message}
@@ -4999,14 +5002,24 @@ class APIServerAdapter(BasePlatformAdapter):
                 # first turn, where prior is empty). Prepend prior only —
                 # appending current_user too is what duplicated the user row.
                 return prior + list(agent_messages)
-            if any(
-                isinstance(msg, dict) and msg.get("role") == "user"
-                for msg in agent_messages
+            if (
+                any(
+                    isinstance(msg, dict) and msg.get("role") == "user"
+                    for msg in agent_messages
+                )
+                and APIServerAdapter._response_messages_embed_prior(
+                    prior, agent_messages
+                )
             ):
-                # User rows present but no recognizable prefix or anchor: a
-                # perturbed transcript (e.g. repair merged this turn's user
-                # row into a prior one). It already embeds the history —
-                # adopt it; re-embedding prior is never correct.
+                # User rows present, no recognizable prefix or anchor, but
+                # the head row proves the result embeds the prior history:
+                # a perturbed transcript (e.g. repair merged this turn's
+                # user row into a prior one). Adopt it; re-embedding prior
+                # is never correct. Without the head proof (a suffix shape
+                # carrying mid-turn user-role nudges — only reachable from
+                # mocked/older hosts, never the live runtime, which always
+                # returns the full transcript), fall through to the legacy
+                # concatenation so prior history is never dropped.
                 return list(agent_messages)
 
             full_history = prior
@@ -5105,13 +5118,18 @@ class APIServerAdapter(BasePlatformAdapter):
     ) -> Optional[int]:
         """Index of the current turn's user row in ``result["messages"]``.
 
-        Examines only the last user-role row (the current turn appends its
-        user row and then assistant/tool rows exclusively) and compares
-        projected content, so persistence sidecars (``api_content``,
-        ``_db_persisted``) cannot hide the match. Returns ``None`` when the
-        last user row does not carry this turn's content — e.g. when repair
-        merged it into an earlier user row, or the result is a user-row-free
-        suffix.
+        Scans user-role rows from the end and returns the LAST one whose
+        projected content equals this turn's user message; projection strips
+        persistence sidecars (``api_content``, ``_db_persisted``) so they
+        cannot hide the match. Scanning past the last user row matters:
+        ``conversation_loop.py`` legitimately appends user-role rows AFTER
+        the current turn's user row mid-turn (empty-response recovery,
+        codex-incomplete/verification/kanban nudges, continue markers), so
+        the transcript's final user row may be a nudge rather than the turn
+        anchor. Taking the last matching row keeps repeated user inputs
+        ("continue") anchored to the current turn. Returns ``None`` when no
+        user row carries this turn's content — e.g. when repair merged it
+        into an earlier user row, or the result is a user-row-free suffix.
         """
         target = APIServerAdapter._response_prefix_projection(user_message)
         for i in range(len(agent_messages) - 1, -1, -1):
@@ -5120,8 +5138,55 @@ class APIServerAdapter(BasePlatformAdapter):
                 projected = APIServerAdapter._response_prefix_projection(
                     msg.get("content")
                 )
-                return i if projected == target else None
+                if projected == target:
+                    return i
         return None
+
+    @staticmethod
+    def _response_messages_embed_prior(
+        prior: List[Dict[str, Any]],
+        agent_messages: List[Dict[str, Any]],
+    ) -> bool:
+        """Structural proof that ``agent_messages`` embeds the prior history.
+
+        Used only on the last-resort adoption branch, where no prefix match
+        and no current-user anchor exist. A real agent transcript always
+        starts with (a possibly repaired form of) the prior history's first
+        row: ``run_conversation`` builds ``messages = list(history) + ...``
+        and every mid-turn user-role injection in ``conversation_loop.py``
+        (recovery/verification/kanban nudges, continue markers) APPENDS to
+        that full list — the runtime never produces a suffix-shaped result.
+        Suffix shapes only come from mocked or older host integrations, and
+        adopting one of those verbatim would silently DROP the prior turns.
+
+        The head row survives every repair pass with its original content
+        first: pass 0 (assistant merge) and pass 2 (user merge) concatenate
+        the earlier row's content before the later one's, so an embedded
+        head either equals ``prior[0]`` under projection or is a string that
+        starts with ``prior[0]``'s string content. A plain length comparison
+        is NOT sufficient — a nudge-bearing suffix can be longer than the
+        prior history.
+        """
+        if not prior or not agent_messages:
+            return False
+        prior_head = prior[0]
+        agent_head = agent_messages[0]
+        if not isinstance(prior_head, dict) or not isinstance(agent_head, dict):
+            return False
+        if agent_head.get("role") != prior_head.get("role"):
+            return False
+        projected_prior_head = APIServerAdapter._response_prefix_projection(prior_head)
+        projected_agent_head = APIServerAdapter._response_prefix_projection(agent_head)
+        if projected_agent_head == projected_prior_head:
+            return True
+        prior_content = prior_head.get("content")
+        agent_content = agent_head.get("content")
+        return (
+            isinstance(prior_content, str)
+            and bool(prior_content)
+            and isinstance(agent_content, str)
+            and agent_content.startswith(prior_content)
+        )
 
     @classmethod
     def _turn_transcript_messages(

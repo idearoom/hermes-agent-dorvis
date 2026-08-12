@@ -3053,6 +3053,124 @@ class TestResponsesEndpoint:
             assert len(user_rows) == 1
 
     @pytest.mark.asyncio
+    async def test_nudge_bearing_suffix_preserves_prior_history(self, adapter):
+        """A suffix with a mid-turn user-role nudge must not drop prior turns.
+
+        conversation_loop.py appends user-role rows mid-turn (recovery and
+        verification nudges, continue markers), so a mocked/older host could
+        return a suffix whose LAST user row is a nudge rather than the turn
+        anchor. The current-user anchor must still find this turn's user row
+        at index 0 and prepend the prior history exactly once.
+        """
+        prior_history = [
+            {"role": "user", "content": "What is 1+1?"},
+            {"role": "assistant", "content": "2"},
+        ]
+        adapter._response_store.put(
+            "resp_prev",
+            {
+                "response": {"id": "resp_prev", "status": "completed"},
+                "conversation_history": list(prior_history),
+                "session_id": "api-test-session",
+            },
+        )
+        suffix_messages = [
+            {"role": "user", "content": "Now add 1 more"},
+            {"role": "assistant", "content": ""},
+            {
+                "role": "user",
+                "content": "[System: Continue now. Execute the required tool calls.]",
+            },
+            {"role": "assistant", "content": "3"},
+        ]
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (
+                    {
+                        "final_response": "3",
+                        "messages": list(suffix_messages),
+                        "api_calls": 1,
+                    },
+                    {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+                )
+                resp = await cli.post(
+                    "/v1/responses",
+                    json={
+                        "model": "hermes-agent",
+                        "input": "Now add 1 more",
+                        "previous_response_id": "resp_prev",
+                    },
+                )
+
+            assert resp.status == 200
+            data = await resp.json()
+            stored = adapter._response_store.get(data["id"])["conversation_history"]
+            assert stored == prior_history + suffix_messages
+            assert stored[0] == prior_history[0], "prior history must be preserved"
+            current_rows = [
+                m for m in stored
+                if m.get("role") == "user" and m.get("content") == "Now add 1 more"
+            ]
+            assert len(current_rows) == 1
+
+    @pytest.mark.asyncio
+    async def test_nudge_only_suffix_without_current_user_keeps_prior_and_user(self, adapter):
+        """A nudge-bearing suffix lacking this turn's user row keeps the
+        legacy ``prior + current_user + suffix`` shape — adopt-verbatim must
+        never fire without structural proof that the result embeds prior
+        history, or the prior turns would be silently dropped."""
+        prior_history = [
+            {"role": "user", "content": "What is 1+1?"},
+            {"role": "assistant", "content": "2"},
+        ]
+        adapter._response_store.put(
+            "resp_prev",
+            {
+                "response": {"id": "resp_prev", "status": "completed"},
+                "conversation_history": list(prior_history),
+                "session_id": "api-test-session",
+            },
+        )
+        suffix_messages = [
+            {"role": "assistant", "content": ""},
+            {
+                "role": "user",
+                "content": "[System: Continue now. Execute the required tool calls.]",
+            },
+            {"role": "assistant", "content": "3"},
+        ]
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (
+                    {
+                        "final_response": "3",
+                        "messages": list(suffix_messages),
+                        "api_calls": 1,
+                    },
+                    {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+                )
+                resp = await cli.post(
+                    "/v1/responses",
+                    json={
+                        "model": "hermes-agent",
+                        "input": "Now add 1 more",
+                        "previous_response_id": "resp_prev",
+                    },
+                )
+
+            assert resp.status == 200
+            data = await resp.json()
+            stored = adapter._response_store.get(data["id"])["conversation_history"]
+            assert stored == prior_history + [
+                {"role": "user", "content": "Now add 1 more"}
+            ] + suffix_messages
+            assert stored[0] == prior_history[0], "prior history must be preserved"
+
+    @pytest.mark.asyncio
     async def test_turn_after_incomplete_snapshot_stores_each_message_once(self, adapter):
         """Chaining off an incomplete snapshot (trailing user row) must not double.
 
