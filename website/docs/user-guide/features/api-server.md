@@ -202,6 +202,14 @@ Returns `200` with the cancelled response object, `409` when the response has
 already reached a terminal state (a repeated cancel lands here), or `404` for
 an unknown id.
 
+The cancelled envelope carries the usage the run accrued before it was stopped,
+so an abandoned turn's spend is still visible. Token counts are committed when
+a provider response returns, so the request that was in flight at the interrupt
+is not in them; the figure is reported as `completeness: partial` with a
+`run_interrupted_before_completion` warning rather than as a total. An
+`incomplete` envelope, left behind when a stream drops, reports usage the same
+way.
+
 Only streaming responses are cancellable: a non-streaming `POST /v1/responses`
 does not mint its id until the run has already finished.
 
