@@ -4337,6 +4337,20 @@ class APIServerAdapter(BasePlatformAdapter):
             # get a TransferEncodingError from incomplete chunked encoding.
             import traceback as _tb
             _persist_incomplete_if_needed()
+            # This unwind abandons the turn without the client having
+            # disconnected, so nothing else will stop the executor thread.
+            # The other two unwinds already interrupt here; leaving this one
+            # out strands a running agent behind an ``incomplete`` record,
+            # which POST /v1/responses/{id}/cancel reads as already terminal
+            # — it would answer 409 for a run still executing tools.
+            agent = agent_ref[0] if agent_ref else None
+            if agent is not None:
+                try:
+                    agent.interrupt("SSE writer failed mid-stream")
+                except Exception:
+                    pass
+            if not agent_task.done():
+                agent_task.cancel()
             agent_error = _redact_api_error_text(_tb.format_exc())
             try:
                 failed_env = _envelope("failed")

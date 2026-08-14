@@ -5124,6 +5124,161 @@ class TestCancelResponse:
 
         mock_agent.interrupt.assert_not_called()
 
+    @pytest.mark.asyncio
+    async def test_cancel_halts_tool_execution_on_the_executor_thread(self, adapter):
+        """The stop must reach the executor thread, not just the stream.
+
+        ``_run_agent`` runs the agent on a thread pool, so cancelling its
+        asyncio wrapper detaches the stream and leaves the tool loop running —
+        the exact orphan this route exists to end.  Drive the real executor
+        path with an agent that keeps calling tools until something interrupts
+        it, and assert the loop stops advancing once the HTTP cancel lands.
+        """
+        import queue as _q
+
+        interrupted = threading.Event()
+        started = threading.Event()
+        tool_calls: list[int] = []
+
+        class _LoopingAgent:
+            """Calls a tool every tick until interrupted, like a real loop."""
+
+            session_prompt_tokens = 0
+            session_completion_tokens = 0
+            session_total_tokens = 0
+            session_id = "session-cancel-tools"
+            _session_messages: list = []
+
+            def interrupt(self, reason=None):
+                interrupted.set()
+
+            def run_conversation(self, **kwargs):
+                started.set()
+                deadline = time.monotonic() + 5
+                while not interrupted.is_set() and time.monotonic() < deadline:
+                    tool_calls.append(len(tool_calls))
+                    time.sleep(0.01)
+                return {"final_response": "", "messages": [], "api_calls": len(tool_calls)}
+
+            def shutdown_memory_provider(self):
+                pass
+
+            def close(self):
+                pass
+
+        agent_ref = [None, None]
+        stream_q: _q.Queue = _q.Queue()
+        response_id = f"resp_{uuid.uuid4().hex[:28]}"
+
+        with patch.object(adapter, "_create_agent", return_value=_LoopingAgent()):
+            agent_task = asyncio.ensure_future(
+                adapter._run_agent(
+                    user_message="run tools until stopped",
+                    conversation_history=[],
+                    session_id="session-cancel-tools",
+                    agent_ref=agent_ref,
+                )
+            )
+            writer, patcher, written = self._start_stream(
+                adapter,
+                agent_ref=agent_ref,
+                stream_q=stream_q,
+                agent_task=agent_task,
+                response_id=response_id,
+            )
+            try:
+                app = _create_app(adapter)
+                async with TestClient(TestServer(app)) as cli:
+                    for _ in range(200):
+                        await asyncio.sleep(0.01)
+                        if started.is_set() and tool_calls:
+                            break
+                    assert tool_calls, "agent never reached its tool loop"
+
+                    resp = await cli.post(f"/v1/responses/{response_id}/cancel")
+                    assert resp.status == 200
+                    assert (await resp.json())["status"] == "cancelled"
+
+                    assert interrupted.wait(timeout=2), "interrupt never reached the thread"
+                    calls_at_cancel = len(tool_calls)
+                    # Long enough for ~25 more ticks had the loop survived.
+                    await asyncio.sleep(0.25)
+                    assert len(tool_calls) <= calls_at_cancel + 1
+
+                    with pytest.raises(asyncio.CancelledError):
+                        await writer
+            finally:
+                interrupted.set()
+                patcher.stop()
+                adapter._inflight_responses.pop(response_id, None)
+
+    @pytest.mark.asyncio
+    async def test_writer_crash_interrupts_agent_before_recording_incomplete(self, adapter):
+        """``incomplete`` is this route's already-terminal answer, so it must
+        never outlive a running agent.
+
+        The writer's generic-exception unwind (a failed SSE write that is not
+        an ``OSError``, a serialization bug) abandons the turn without the
+        client having disconnected — nothing else will stop the executor
+        thread afterwards.  Left uninterrupted, the record reads ``incomplete``
+        while tools keep running and a later cancel answers 409 for a run
+        nothing contained.
+        """
+        import queue as _q
+
+        import gateway.platforms.api_server as api_mod
+
+        class _ExplodingStreamResponse:
+            async def prepare(self, req):
+                pass
+
+            async def write(self, payload):
+                raise RuntimeError("transport is closing")
+
+        agent = MagicMock()
+        agent_ref = [agent, None]
+        stream_q: _q.Queue = _q.Queue()
+
+        async def _agent_coro():
+            await asyncio.sleep(30)
+            return ({}, {})
+
+        agent_task = asyncio.ensure_future(_agent_coro())
+        agent_task.add_done_callback(lambda _fut: stream_q.put(None))
+        response_id = f"resp_{uuid.uuid4().hex[:28]}"
+        fake_request = MagicMock()
+        fake_request.headers = {}
+
+        with patch.object(
+            api_mod.web, "StreamResponse", return_value=_ExplodingStreamResponse()
+        ):
+            await adapter._write_sse_responses(
+                request=fake_request,
+                response_id=response_id,
+                model="hermes-agent",
+                created_at=int(time.time()),
+                stream_q=stream_q,
+                agent_task=agent_task,
+                agent_ref=agent_ref,
+                conversation_history=[],
+                user_message="long running turn",
+                instructions=None,
+                conversation=None,
+                store=True,
+                session_id="session-writer-crash",
+            )
+
+        assert adapter._response_store.get(response_id)["response"]["status"] == "incomplete"
+        agent.interrupt.assert_called_once()
+        with pytest.raises(asyncio.CancelledError):
+            await agent_task
+        assert response_id not in adapter._inflight_responses
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(f"/v1/responses/{response_id}/cancel")
+            assert resp.status == 409
+
 
 # ---------------------------------------------------------------------------
 # DELETE /v1/responses/{response_id}
