@@ -200,7 +200,7 @@ def _agent_token_count(agent: Any, name: str, default: Optional[int] = 0) -> Opt
         return default
 
 
-def _session_usage_snapshot(agent: Any) -> Dict[str, Any]:
+def _session_usage_snapshot(agent: Any, *, include_cost: bool = True) -> Dict[str, Any]:
     from agent.runtime_usage import snapshot_agent_usage
     attributed = snapshot_agent_usage(agent)
     input_tokens = _coerce_token_count(attributed.get("input_tokens"), 0) or 0
@@ -258,7 +258,11 @@ def _session_usage_snapshot(agent: Any) -> Dict[str, Any]:
         model = getattr(agent, "model", "") or ""
     except Exception:
         model = ""
-    if isinstance(model, str) and model:
+    # Pricing resolution can reach a provider's /models endpoint on a cold
+    # cache, which is fine on the executor thread every normal call runs on and
+    # not fine on the event loop. Callers that snapshot from the loop pass
+    # ``include_cost=False`` and publish tokens without a cost estimate.
+    if include_cost and isinstance(model, str) and model:
         try:
             from agent.usage_pricing import CanonicalUsage, estimate_usage_cost
 
@@ -296,13 +300,18 @@ def _interrupted_usage_snapshot(agent: Any) -> Optional[Dict[str, Any]]:
     published — an undercount, never an invented number — so it is labelled
     partial and carries a warning naming why.
 
+    Both callers snapshot from the event loop while the agent's own thread is
+    still running, so the cost estimate is left out: its pricing lookup can
+    block on a provider request, and no envelope field is worth stalling the
+    gateway for.
+
     Returns ``None`` when the agent is gone or has committed nothing, leaving
     the caller's own usage in place rather than overwriting it with zeros.
     """
     if agent is None:
         return None
     try:
-        snapshot = _session_usage_snapshot(agent)
+        snapshot = _session_usage_snapshot(agent, include_cost=False)
     except Exception:
         logger.debug("Accrued usage snapshot failed for interrupted run", exc_info=True)
         return None

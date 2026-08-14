@@ -4993,6 +4993,33 @@ class TestCancelResponse:
             patcher.stop()
             adapter._inflight_responses.pop(response_id, None)
 
+    def test_interrupted_usage_snapshot_skips_the_pricing_lookup(self, adapter):
+        """Cost resolution can block on a provider request.
+
+        Both interrupted-usage callers read the agent from the event loop
+        while its own thread is still running, so that snapshot must not reach
+        the pricing path — no envelope field is worth stalling the gateway
+        for. The ordinary end-of-run snapshot, taken on the executor thread,
+        still prices.
+        """
+        import gateway.platforms.api_server as api_mod
+
+        agent = _make_api_agent()
+        agent.model = "claude-opus-4"
+        agent.provider = "anthropic"
+        agent.base_url = ""
+
+        with patch("agent.usage_pricing.estimate_usage_cost") as priced:
+            snapshot = api_mod._interrupted_usage_snapshot(agent)
+        priced.assert_not_called()
+        assert snapshot["total_tokens"] == 3
+        assert "cost_usd" not in snapshot
+        assert "cost_status" not in snapshot
+
+        with patch("agent.usage_pricing.estimate_usage_cost") as priced:
+            api_mod._session_usage_snapshot(agent)
+        priced.assert_called_once()
+
     @pytest.mark.asyncio
     async def test_incomplete_envelope_carries_usage_accrued_before_the_unwind(
         self, adapter
