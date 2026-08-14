@@ -5,6 +5,7 @@ Exposes an HTTP server with endpoints:
 - POST /v1/chat/completions        — OpenAI Chat Completions format (stateless; opt-in session continuity via X-Hermes-Session-Id header; opt-in long-term memory scoping via X-Hermes-Session-Key header)
 - POST /v1/responses               — OpenAI Responses API format (stateful via previous_response_id; X-Hermes-Session-Key supported)
 - GET  /v1/responses/{response_id} — Retrieve a stored response
+- POST /v1/responses/{response_id}/cancel — Terminate an in-flight response, preserving its envelope
 - DELETE /v1/responses/{response_id} — Delete a stored response
 - GET  /v1/models                  — lists hermes-agent and any configured model_routes aliases
 - GET  /v1/capabilities            — machine-readable API capabilities for external UIs
@@ -1266,6 +1267,15 @@ class APIServerAdapter(BasePlatformAdapter):
         self._runner: Optional["web.AppRunner"] = None
         self._site: Optional["web.TCPSite"] = None
         self._response_store = make_response_store()
+        # Streaming /v1/responses turns still owned by this process, keyed by
+        # response_id, for POST /v1/responses/{id}/cancel. The value is the
+        # same mutable dict the SSE writer holds, so the cancel handler and
+        # the writer agree on whether a terminal `cancelled` snapshot was
+        # already persisted. Registration is per-process: a cancel that lands
+        # on a different gateway task (only possible during a blue/green
+        # deploy overlap, ADR 0177) can mark the shared stored envelope
+        # terminal but cannot reach the other task's executor thread.
+        self._inflight_responses: Dict[str, Dict[str, Any]] = {}
         # Active run streams: run_id -> asyncio.Queue of SSE event dicts
         self._run_streams: Dict[str, "asyncio.Queue[Optional[Dict]]"] = {}
         # Creation timestamps for orphaned-run TTL sweep
@@ -1814,6 +1824,7 @@ class APIServerAdapter(BasePlatformAdapter):
             ("POST", "/v1/chat/completions", self._handle_chat_completions),
             ("POST", "/v1/responses", self._handle_responses),
             ("GET", "/v1/responses/{response_id}", self._handle_get_response),
+            ("POST", "/v1/responses/{response_id}/cancel", self._handle_cancel_response),
             ("DELETE", "/v1/responses/{response_id}", self._handle_delete_response),
             # Generic platform HTTP event callback ingress. Authenticated by
             # the target adapter's own verifier (platform-signed bearer), NOT
@@ -2531,6 +2542,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "models": {"method": "GET", "path": "/v1/models"},
                 "chat_completions": {"method": "POST", "path": "/v1/chat/completions"},
                 "responses": {"method": "POST", "path": "/v1/responses"},
+                "response_cancel": {"method": "POST", "path": "/v1/responses/{response_id}/cancel"},
                 "runs": {"method": "POST", "path": "/v1/runs"},
                 "run_status": {"method": "GET", "path": "/v1/runs/{run_id}"},
                 "run_events": {"method": "GET", "path": "/v1/runs/{run_id}/events"},
@@ -3831,6 +3843,53 @@ class APIServerAdapter(BasePlatformAdapter):
                 conversation_history_snapshot=incomplete_history,
             )
 
+        def _persist_cancelled_snapshot(reason: str) -> Dict[str, Any]:
+            """Write the terminal ``cancelled`` envelope and return it.
+
+            Called by ``_handle_cancel_response`` on the event loop rather
+            than from this coroutine, so it must not await: it snapshots
+            whatever partial output the stream produced before the cancel
+            and marks the record terminal in place. Setting
+            ``terminal_snapshot_persisted`` is what stops the writer's own
+            unwind from overwriting ``cancelled`` with ``incomplete``.
+            """
+            nonlocal terminal_snapshot_persisted
+            cancelled_text = "".join(final_text_parts) or final_response_text
+            cancelled_items: List[Dict[str, Any]] = list(emitted_items)
+            if cancelled_text:
+                cancelled_items.append({
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": cancelled_text}],
+                })
+            cancelled_env = _envelope("cancelled")
+            cancelled_env["output"] = cancelled_items
+            cancelled_env["usage"] = _responses_usage_payload(usage)
+            cancelled_env["incomplete_details"] = {"reason": reason}
+            cancelled_history = list(conversation_history)
+            cancelled_history.append({"role": "user", "content": user_message})
+            if cancelled_text:
+                cancelled_history.append({"role": "assistant", "content": cancelled_text})
+            _persist_response_snapshot(
+                cancelled_env,
+                conversation_history_snapshot=cancelled_history,
+            )
+            terminal_snapshot_persisted = True
+            return cancelled_env
+
+        # Publish this turn to the cancel route for as long as the stream is
+        # this process's to stop. The agent runs on an executor thread that
+        # no asyncio cancellation can reach, so ``agent_ref`` (the same list
+        # ``_run_agent`` fills in) is the only handle that revokes further
+        # tool execution.
+        cancel_entry: Dict[str, Any] = {
+            "agent_ref": agent_ref,
+            "task": agent_task,
+            "persist_cancelled": _persist_cancelled_snapshot,
+            "cancelled": False,
+        }
+        self._inflight_responses[response_id] = cancel_entry
+
         try:
             # response.created — initial envelope, status=in_progress
             created_env = _envelope("in_progress")
@@ -4295,6 +4354,9 @@ class APIServerAdapter(BasePlatformAdapter):
             except Exception:
                 pass
             logger.error("Agent crashed mid-stream for %s: %s", response_id, str(agent_error)[:300])
+        finally:
+            if self._inflight_responses.get(response_id) is cancel_entry:
+                self._inflight_responses.pop(response_id, None)
 
         return response
 
@@ -4469,7 +4531,10 @@ class APIServerAdapter(BasePlatformAdapter):
                     "payload": payload if isinstance(payload, dict) else {},
                 }))
 
-            agent_ref = [None]
+            # Slot 1 is the cancel route's pending-interrupt slot (see
+            # _run_agent): a cancel that arrives while the agent is still
+            # being constructed parks its reason there instead of dropping it.
+            agent_ref = [None, None]
             agent_task = asyncio.ensure_future(self._run_agent(
                 user_message=user_message,
                 conversation_history=conversation_history,
@@ -4607,8 +4672,15 @@ class APIServerAdapter(BasePlatformAdapter):
         return web.json_response(response_data, headers=response_headers)
 
     # ------------------------------------------------------------------
-    # GET / DELETE response endpoints
+    # GET / CANCEL / DELETE response endpoints
     # ------------------------------------------------------------------
+
+    # A response whose record already reached one of these can no longer be
+    # cancelled — including ``incomplete``, which is the snapshot a detected
+    # SSE disconnect leaves behind after it has already interrupted the agent.
+    _TERMINAL_RESPONSE_STATUSES = frozenset(
+        {"completed", "failed", "cancelled", "canceled", "incomplete"}
+    )
 
     async def _handle_get_response(self, request: "web.Request") -> "web.Response":
         """GET /v1/responses/{response_id} — retrieve a stored response."""
@@ -4622,6 +4694,143 @@ class APIServerAdapter(BasePlatformAdapter):
             return web.json_response(_openai_error(f"Response not found: {response_id}"), status=404)
 
         return web.json_response(stored["response"])
+
+    async def _handle_cancel_response(self, request: "web.Request") -> "web.Response":
+        """POST /v1/responses/{response_id}/cancel — terminate an in-flight response.
+
+        The containment half of a headless client's recovery-then-terminate
+        policy: when a client abandons a streaming response it needs the
+        runtime to stop executing tools on its behalf, and it needs the
+        stored envelope to survive so recovery and forensics can still read
+        what the run did. DELETE satisfies neither — it destroys exactly the
+        record the client came back for.
+
+        Statuses, per the OpenAI Responses shape:
+
+        - ``200`` + the response object with terminal status ``cancelled``.
+        - ``409`` when the response already reached a terminal state; a
+          repeated cancel lands here, which is the idempotent answer.
+        - ``404`` (OpenAI error body) for an id this gateway never stored.
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        response_id = request.match_info["response_id"]
+        entry = self._inflight_responses.get(response_id)
+        stored = self._response_store.get(response_id)
+
+        if entry is None and stored is None:
+            return web.json_response(
+                _openai_error(
+                    f"Response not found: {response_id}",
+                    code="response_not_found",
+                ),
+                status=404,
+            )
+
+        stored_status = ""
+        if isinstance(stored, dict) and isinstance(stored.get("response"), dict):
+            stored_status = str(stored["response"].get("status") or "")
+        if (entry is not None and entry.get("cancelled")) or (
+            stored_status in self._TERMINAL_RESPONSE_STATUSES
+        ):
+            return web.json_response(
+                _openai_error(
+                    f"Response is already terminal and cannot be cancelled: {response_id}",
+                    code="response_already_terminal",
+                ),
+                status=409,
+            )
+
+        cancelled_env: Optional[Dict[str, Any]] = None
+        interrupted = False
+        if entry is not None:
+            entry["cancelled"] = True
+            persist_cancelled = entry.get("persist_cancelled")
+            if callable(persist_cancelled):
+                try:
+                    cancelled_env = persist_cancelled("cancelled")
+                except Exception:
+                    logger.error(
+                        "[api_server] failed to persist cancelled snapshot for %s",
+                        response_id,
+                        exc_info=True,
+                    )
+            interrupted = self._interrupt_inflight_response(entry, response_id)
+            task = entry.get("task")
+            if task is not None and not task.done():
+                task.cancel()
+
+        if cancelled_env is None:
+            cancelled_env = self._mark_stored_response_cancelled(response_id, stored)
+
+        logger.info(
+            "[api_server] cancelled response %s (agent interrupted=%s, in-flight here=%s)",
+            response_id,
+            interrupted,
+            entry is not None,
+        )
+        return web.json_response(cancelled_env)
+
+    def _interrupt_inflight_response(
+        self, entry: Dict[str, Any], response_id: str
+    ) -> bool:
+        """Revoke further tool execution for a registered in-flight response.
+
+        The agent runs on an executor thread, so cancelling its asyncio
+        wrapper only detaches the stream — ``agent.interrupt`` is the call
+        that breaks the tool-calling loop and aborts in-flight tool work.
+        The agent object appears partway through ``_run_agent``'s executor
+        body, so the reason is parked in the ref's pending-interrupt slot
+        *before* reading it: a cancel that arrives during agent construction
+        is then honored by the executor thread itself rather than lost.
+        """
+        agent_ref = entry.get("agent_ref")
+        if not isinstance(agent_ref, list) or not agent_ref:
+            return False
+        reason = "Cancelled via /v1/responses/{id}/cancel"
+        if len(agent_ref) > 1:
+            agent_ref[1] = reason
+        agent = agent_ref[0]
+        if agent is None:
+            return False
+        try:
+            agent.interrupt(reason)
+            return True
+        except Exception:
+            logger.debug(
+                "[api_server] interrupt failed while cancelling response %s",
+                response_id,
+                exc_info=True,
+            )
+            return False
+
+    def _mark_stored_response_cancelled(
+        self, response_id: str, stored: Optional[Dict[str, Any]]
+    ) -> Dict[str, Any]:
+        """Flip a stored envelope to ``cancelled`` without discarding it.
+
+        The fallback for responses this process holds no stream for — a
+        record left in_progress by a gateway that has since restarted, or by
+        a sibling task during a blue/green overlap. Marking the shared record
+        terminal is all this path can honestly do; it does not reach another
+        process's executor thread.
+        """
+        if isinstance(stored, dict) and isinstance(stored.get("response"), dict):
+            cancelled_env = dict(stored["response"])
+            cancelled_env["status"] = "cancelled"
+            cancelled_env["incomplete_details"] = {"reason": "cancelled"}
+            record = dict(stored)
+            record["response"] = cancelled_env
+            self._response_store.put(response_id, record)
+            return cancelled_env
+        return {
+            "id": response_id,
+            "object": "response",
+            "status": "cancelled",
+            "incomplete_details": {"reason": "cancelled"},
+        }
 
     async def _handle_delete_response(self, request: "web.Request") -> "web.Response":
         """DELETE /v1/responses/{response_id} — delete a stored response."""
@@ -5529,6 +5738,12 @@ class APIServerAdapter(BasePlatformAdapter):
         at ``agent_ref[0]`` before ``run_conversation`` begins.  This allows
         callers (e.g. the SSE writer) to call ``agent.interrupt()`` from
         another thread to stop in-progress LLM calls.
+
+        A caller that may need to stop the run before the agent exists (the
+        Responses cancel route) passes a two-element list instead: it parks
+        an interrupt reason in ``agent_ref[1]``, and this executor body
+        honors it the moment construction finishes, closing the window where
+        an interrupt would have had no agent to land on.
         """
         loop = asyncio.get_running_loop()
         # Capture before hopping to the executor — ContextVars do not follow
@@ -5570,6 +5785,17 @@ class APIServerAdapter(BasePlatformAdapter):
                         agent._compression_event_callback = compression_event_callback
                     if agent_ref is not None:
                         agent_ref[0] = agent
+                        pending_interrupt = (
+                            agent_ref[1] if len(agent_ref) > 1 else None
+                        )
+                        if pending_interrupt:
+                            try:
+                                agent.interrupt(str(pending_interrupt))
+                            except Exception:
+                                logger.debug(
+                                    "Pending interrupt failed on agent startup",
+                                    exc_info=True,
+                                )
                     # Track executor-backed agents for drain-cap interruption.
                     agent_key = id(agent)
                     self._inflight_run_agents[agent_key] = agent

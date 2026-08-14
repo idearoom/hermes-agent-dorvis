@@ -668,6 +668,9 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_post("/v1/chat/completions", adapter._handle_chat_completions)
     app.router.add_post("/v1/responses", adapter._handle_responses)
     app.router.add_get("/v1/responses/{response_id}", adapter._handle_get_response)
+    app.router.add_post(
+        "/v1/responses/{response_id}/cancel", adapter._handle_cancel_response
+    )
     app.router.add_delete("/v1/responses/{response_id}", adapter._handle_delete_response)
     app.router.add_post(
         "/api/platforms/{platform}/events",
@@ -4798,6 +4801,328 @@ class TestGetResponse:
         async with TestClient(TestServer(app)) as cli:
             resp = await cli.get("/v1/responses/resp_any")
             assert resp.status == 401
+
+
+# ---------------------------------------------------------------------------
+# POST /v1/responses/{response_id}/cancel
+# ---------------------------------------------------------------------------
+
+
+class TestCancelResponse:
+    """Terminate an abandoned streaming response without destroying it.
+
+    A headless client that loses its SSE stream needs two things the pinned
+    gateway could not give it: the runtime to stop executing tools on its
+    behalf, and the stored envelope to survive so recovery and forensics can
+    still read what the run did.  DELETE only ever offered the second half
+    inverted — it removes exactly the record the client came back for.
+    """
+
+    @staticmethod
+    def _start_stream(adapter, *, agent_ref, stream_q, agent_task, response_id):
+        """Drive _write_sse_responses as a task, as _handle_responses does.
+
+        Returns the writer task, the StreamResponse patcher, and the list of
+        SSE payloads written so far — tests wait on an actual emitted event
+        rather than on a sleep, since the writer batches text deltas.
+        """
+        import gateway.platforms.api_server as api_mod
+
+        written: list[str] = []
+
+        class _FakeStreamResponse:
+            async def prepare(self, req):
+                pass
+
+            async def write(self, payload):
+                written.append(payload.decode() if isinstance(payload, bytes) else str(payload))
+
+        fake_request = MagicMock()
+        fake_request.headers = {}
+        agent_task.add_done_callback(lambda _fut: stream_q.put(None))
+        patcher = patch.object(
+            api_mod.web, "StreamResponse", return_value=_FakeStreamResponse()
+        )
+        patcher.start()
+        writer = asyncio.ensure_future(
+            adapter._write_sse_responses(
+                request=fake_request,
+                response_id=response_id,
+                model="hermes-agent",
+                created_at=int(time.time()),
+                stream_q=stream_q,
+                agent_task=agent_task,
+                agent_ref=agent_ref,
+                conversation_history=[],
+                user_message="long running turn",
+                instructions=None,
+                conversation=None,
+                store=True,
+                session_id=None,
+            )
+        )
+        return writer, patcher, written
+
+    @staticmethod
+    async def _await_event(written: list, event_type: str) -> None:
+        for _ in range(200):
+            await asyncio.sleep(0.01)
+            if any(event_type in payload for payload in written):
+                return
+        raise AssertionError(f"SSE event {event_type} never arrived")
+
+    @pytest.mark.asyncio
+    async def test_cancel_live_response_stops_agent_and_preserves_envelope(self, adapter):
+        """The acceptance case: a live turn is stopped, its record survives."""
+        import queue as _q
+
+        agent = MagicMock()
+        agent_ref = [agent, None]
+        stream_q: _q.Queue = _q.Queue()
+
+        async def _agent_coro():
+            stream_q.put("partial answer")
+            await asyncio.sleep(30)
+            return ({}, {})
+
+        agent_task = asyncio.ensure_future(_agent_coro())
+        response_id = f"resp_{uuid.uuid4().hex[:28]}"
+        writer, patcher, written = self._start_stream(
+            adapter,
+            agent_ref=agent_ref,
+            stream_q=stream_q,
+            agent_task=agent_task,
+            response_id=response_id,
+        )
+        try:
+            app = _create_app(adapter)
+            async with TestClient(TestServer(app)) as cli:
+                await self._await_event(written, "response.output_text.delta")
+                assert adapter._response_store.get(response_id)["response"]["status"] == (
+                    "in_progress"
+                )
+
+                resp = await cli.post(f"/v1/responses/{response_id}/cancel")
+                assert resp.status == 200
+                body = await resp.json()
+                assert body["id"] == response_id
+                assert body["object"] == "response"
+                assert body["status"] == "cancelled"
+
+                # The agent loop was revoked, not merely detached from the stream.
+                agent.interrupt.assert_called_once()
+
+                with pytest.raises(asyncio.CancelledError):
+                    await writer
+
+                # GET still serves the envelope — this is what DELETE destroys.
+                stored_resp = await cli.get(f"/v1/responses/{response_id}")
+                assert stored_resp.status == 200
+                stored_body = await stored_resp.json()
+                assert stored_body["status"] == "cancelled"
+                output_text = "".join(
+                    part.get("text", "")
+                    for item in stored_body.get("output", [])
+                    if item.get("type") == "message"
+                    for part in item.get("content", [])
+                )
+                assert "partial answer" in output_text
+        finally:
+            patcher.stop()
+            adapter._inflight_responses.pop(response_id, None)
+
+    @pytest.mark.asyncio
+    async def test_repeat_cancel_reports_already_terminal(self, adapter):
+        """Idempotency: the second cancel is answered 409, not 200."""
+        import queue as _q
+
+        agent = MagicMock()
+        agent_ref = [agent, None]
+        stream_q: _q.Queue = _q.Queue()
+
+        async def _agent_coro():
+            await asyncio.sleep(30)
+            return ({}, {})
+
+        agent_task = asyncio.ensure_future(_agent_coro())
+        response_id = f"resp_{uuid.uuid4().hex[:28]}"
+        writer, patcher, written = self._start_stream(
+            adapter,
+            agent_ref=agent_ref,
+            stream_q=stream_q,
+            agent_task=agent_task,
+            response_id=response_id,
+        )
+        try:
+            app = _create_app(adapter)
+            async with TestClient(TestServer(app)) as cli:
+                await self._await_event(written, "response.created")
+
+                assert (await cli.post(f"/v1/responses/{response_id}/cancel")).status == 200
+                repeat = await cli.post(f"/v1/responses/{response_id}/cancel")
+                assert repeat.status == 409
+                assert (await repeat.json())["error"]["code"] == "response_already_terminal"
+
+                with pytest.raises(asyncio.CancelledError):
+                    await writer
+        finally:
+            patcher.stop()
+            adapter._inflight_responses.pop(response_id, None)
+
+    @pytest.mark.asyncio
+    async def test_cancel_completed_response_returns_409(self, adapter):
+        """A finished response cannot be cancelled, and says so distinguishably."""
+        mock_result = {"final_response": "Hello!", "messages": [], "api_calls": 1}
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (
+                    mock_result,
+                    {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                )
+                created = await cli.post(
+                    "/v1/responses", json={"model": "hermes-agent", "input": "Hi"}
+                )
+            response_id = (await created.json())["id"]
+
+            resp = await cli.post(f"/v1/responses/{response_id}/cancel")
+            assert resp.status == 409
+            body = await resp.json()
+            assert body["error"]["code"] == "response_already_terminal"
+
+            # 409 must not have mutated the record.
+            stored = await cli.get(f"/v1/responses/{response_id}")
+            assert (await stored.json())["status"] == "completed"
+
+    @pytest.mark.asyncio
+    async def test_cancel_incomplete_response_returns_409(self, adapter):
+        """A disconnect-detected turn is already contained; report that."""
+        response_id = "resp_incomplete"
+        adapter._response_store.put(
+            response_id,
+            {
+                "response": {
+                    "id": response_id,
+                    "object": "response",
+                    "status": "incomplete",
+                },
+                "conversation_history": [],
+                "instructions": None,
+                "session_id": None,
+            },
+        )
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(f"/v1/responses/{response_id}/cancel")
+            assert resp.status == 409
+
+    @pytest.mark.asyncio
+    async def test_cancel_unknown_id_returns_openai_error_body(self, adapter):
+        """404 must carry an OpenAI error body.
+
+        The agent-platform worker distinguishes "the gateway knows this route
+        and has never seen that id" from "this build has no cancel route" by
+        the presence of that body; a bare framework 404 reads as unsupported.
+        """
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post("/v1/responses/resp_nonexistent/cancel")
+            assert resp.status == 404
+            body = await resp.json()
+            assert isinstance(body.get("error"), dict)
+            assert body["error"]["code"] == "response_not_found"
+
+    @pytest.mark.asyncio
+    async def test_cancel_orphaned_in_progress_record_marks_it_terminal(self, adapter):
+        """A record this process holds no stream for still becomes terminal.
+
+        Left by a gateway that restarted mid-turn: the executor thread is
+        already gone, so flipping the shared record is complete containment.
+        """
+        response_id = "resp_orphan"
+        adapter._response_store.put(
+            response_id,
+            {
+                "response": {
+                    "id": response_id,
+                    "object": "response",
+                    "status": "in_progress",
+                    "output": [],
+                },
+                "conversation_history": [{"role": "user", "content": "hi"}],
+                "instructions": None,
+                "session_id": "sess-orphan",
+            },
+        )
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(f"/v1/responses/{response_id}/cancel")
+            assert resp.status == 200
+            assert (await resp.json())["status"] == "cancelled"
+
+        stored = adapter._response_store.get(response_id)
+        assert stored["response"]["status"] == "cancelled"
+        assert stored["conversation_history"] == [{"role": "user", "content": "hi"}]
+        assert stored["session_id"] == "sess-orphan"
+
+    @pytest.mark.asyncio
+    async def test_cancel_requires_auth(self, auth_adapter):
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post("/v1/responses/resp_any/cancel")
+            assert resp.status == 401
+
+    def test_cancel_route_is_registered(self, adapter):
+        assert (
+            "POST",
+            "/v1/responses/{response_id}/cancel",
+            adapter._handle_cancel_response,
+        ) in adapter._http_route_table()
+
+    def test_cancel_parks_interrupt_reason_before_the_agent_exists(self, adapter):
+        """The construction window must not swallow a cancel."""
+        agent_ref = [None, None]
+        entry = {"agent_ref": agent_ref, "task": None, "cancelled": False}
+
+        assert adapter._interrupt_inflight_response(entry, "resp_early") is False
+        assert agent_ref[1]
+
+    @pytest.mark.asyncio
+    async def test_parked_interrupt_fires_when_the_agent_appears(self, adapter):
+        """_run_agent honors the parked reason before running a single tool."""
+        mock_agent = _make_api_agent()
+        agent_ref = [None, "Cancelled via /v1/responses/{id}/cancel"]
+
+        with patch.object(adapter, "_create_agent", return_value=mock_agent):
+            await adapter._run_agent(
+                user_message="hello",
+                conversation_history=[],
+                session_id="session-parked-interrupt",
+                agent_ref=agent_ref,
+            )
+
+        mock_agent.interrupt.assert_called_once_with(
+            "Cancelled via /v1/responses/{id}/cancel"
+        )
+
+    @pytest.mark.asyncio
+    async def test_single_slot_agent_ref_is_untouched(self, adapter):
+        """Every other _run_agent caller passes [None]; leave them alone."""
+        mock_agent = _make_api_agent()
+        agent_ref = [None]
+
+        with patch.object(adapter, "_create_agent", return_value=mock_agent):
+            await adapter._run_agent(
+                user_message="hello",
+                conversation_history=[],
+                session_id="session-single-slot",
+                agent_ref=agent_ref,
+            )
+
+        mock_agent.interrupt.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

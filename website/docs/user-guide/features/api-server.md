@@ -190,6 +190,21 @@ The server automatically chains to the latest response in that conversation. Lik
 
 Retrieve a previously stored response by ID.
 
+### POST /v1/responses/\{id\}/cancel
+
+Stop an in-flight response and mark it terminal without discarding it. The
+agent's tool-calling loop is interrupted, and the stored envelope stays
+retrievable with status `cancelled` so `GET /v1/responses/{id}` and
+`previous_response_id` chaining keep working — this is the difference from
+`DELETE`, which removes the record entirely.
+
+Returns `200` with the cancelled response object, `409` when the response has
+already reached a terminal state (a repeated cancel lands here), or `404` for
+an unknown id.
+
+Only streaming responses are cancellable: a non-streaming `POST /v1/responses`
+does not mint its id until the run has already finished.
+
 ### DELETE /v1/responses/\{id\}
 
 Delete a stored response.
