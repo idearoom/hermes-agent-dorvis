@@ -282,6 +282,42 @@ def _session_usage_snapshot(agent: Any) -> Dict[str, Any]:
     return usage
 
 
+# Marks usage read off an agent that never got to report its own snapshot.
+_INTERRUPTED_USAGE_WARNING = "run_interrupted_before_completion"
+
+
+def _interrupted_usage_snapshot(agent: Any) -> Optional[Dict[str, Any]]:
+    """Usage accrued by a run stopped before it returned a snapshot of its own.
+
+    Only turn-boundary counters exist here: the agent commits provider usage
+    when a response comes back, so tokens spent inside the request that was in
+    flight at the interrupt are reported by nobody and cannot be reconstructed.
+    The last committed cumulative is therefore the most that can honestly be
+    published — an undercount, never an invented number — so it is labelled
+    partial and carries a warning naming why.
+
+    Returns ``None`` when the agent is gone or has committed nothing, leaving
+    the caller's own usage in place rather than overwriting it with zeros.
+    """
+    if agent is None:
+        return None
+    try:
+        snapshot = _session_usage_snapshot(agent)
+    except Exception:
+        logger.debug("Accrued usage snapshot failed for interrupted run", exc_info=True)
+        return None
+    if not any(
+        _coerce_token_count(snapshot.get(key), 0)
+        for key in ("input_tokens", "output_tokens", "total_tokens")
+    ):
+        return None
+    snapshot["completeness"] = "partial"
+    warnings = set(snapshot.get("warnings") or ())
+    warnings.add(_INTERRUPTED_USAGE_WARNING)
+    snapshot["warnings"] = sorted(str(value) for value in warnings)
+    return snapshot
+
+
 _RESPONSES_USAGE_EXTRA_KEYS = (
     "cache_read_tokens",
     "cache_write_tokens",
@@ -3813,6 +3849,37 @@ class APIServerAdapter(BasePlatformAdapter):
             if conversation:
                 self._response_store.set_conversation(conversation, response_id)
 
+        def _best_known_usage() -> Dict[str, Any]:
+            """Usage for an envelope written while the agent may still be running.
+
+            ``usage`` is only filled in once ``agent_task`` returns, so every
+            unwind that beats the agent to the end — a cancel, a disconnect, a
+            writer crash — would otherwise publish zeros for a run that really
+            spent tokens, and the spend of an abandoned headless run would be
+            invisible to cost accounting. The agent object still holds its
+            committed counters, so read those instead.
+            """
+            if any(
+                _coerce_token_count(usage.get(key), 0)
+                for key in ("input_tokens", "output_tokens", "total_tokens")
+            ):
+                return usage
+            live_agent = agent_ref[0] if agent_ref else None
+            return _interrupted_usage_snapshot(live_agent) or usage
+
+        def _mark_terminal() -> None:
+            """Record that this turn can no longer be cancelled.
+
+            ``_handle_cancel_response`` otherwise reads terminality off the
+            stored envelope, which ``store=false`` never writes — a cancel
+            landing on an already-finished stream would be answered
+            ``accepted`` for a run nothing needed to contain. The in-flight
+            entry is the only witness in that case.
+            """
+            nonlocal terminal_snapshot_persisted
+            terminal_snapshot_persisted = True
+            cancel_entry["terminal"] = True
+
         def _persist_incomplete_if_needed() -> None:
             """Persist an ``incomplete`` snapshot if no terminal one was written.
 
@@ -3821,7 +3888,10 @@ class APIServerAdapter(BasePlatformAdapter):
             GET /v1/responses/{id} and ``previous_response_id`` chaining keep
             working after abrupt stream termination.
             """
-            if not store or terminal_snapshot_persisted:
+            if terminal_snapshot_persisted:
+                return
+            _mark_terminal()
+            if not store:
                 return
             incomplete_text = "".join(final_text_parts) or final_response_text
             incomplete_items: List[Dict[str, Any]] = list(emitted_items)
@@ -3833,7 +3903,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 })
             incomplete_env = _envelope("incomplete")
             incomplete_env["output"] = incomplete_items
-            incomplete_env["usage"] = _responses_usage_payload(usage)
+            incomplete_env["usage"] = _responses_usage_payload(_best_known_usage())
             incomplete_history = list(conversation_history)
             incomplete_history.append({"role": "user", "content": user_message})
             if incomplete_text:
@@ -3849,11 +3919,10 @@ class APIServerAdapter(BasePlatformAdapter):
             Called by ``_handle_cancel_response`` on the event loop rather
             than from this coroutine, so it must not await: it snapshots
             whatever partial output the stream produced before the cancel
-            and marks the record terminal in place. Setting
-            ``terminal_snapshot_persisted`` is what stops the writer's own
-            unwind from overwriting ``cancelled`` with ``incomplete``.
+            and marks the record terminal in place. ``_mark_terminal`` is what
+            stops the writer's own unwind from overwriting ``cancelled`` with
+            ``incomplete``.
             """
-            nonlocal terminal_snapshot_persisted
             cancelled_text = "".join(final_text_parts) or final_response_text
             cancelled_items: List[Dict[str, Any]] = list(emitted_items)
             if cancelled_text:
@@ -3864,7 +3933,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 })
             cancelled_env = _envelope("cancelled")
             cancelled_env["output"] = cancelled_items
-            cancelled_env["usage"] = _responses_usage_payload(usage)
+            cancelled_env["usage"] = _responses_usage_payload(_best_known_usage())
             cancelled_env["incomplete_details"] = {"reason": reason}
             cancelled_history = list(conversation_history)
             cancelled_history.append({"role": "user", "content": user_message})
@@ -3874,7 +3943,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 cancelled_env,
                 conversation_history_snapshot=cancelled_history,
             )
-            terminal_snapshot_persisted = True
+            _mark_terminal()
             return cancelled_env
 
         # Publish this turn to the cancel route for as long as the stream is
@@ -3887,6 +3956,7 @@ class APIServerAdapter(BasePlatformAdapter):
             "task": agent_task,
             "persist_cancelled": _persist_cancelled_snapshot,
             "cancelled": False,
+            "terminal": False,
         }
         self._inflight_responses[response_id] = cancel_entry
 
@@ -4271,7 +4341,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     failed_env,
                     conversation_history_snapshot=_failed_history,
                 )
-                terminal_snapshot_persisted = True
+                _mark_terminal()
                 await _write_event("response.failed", {
                     "type": "response.failed",
                     "response": failed_env,
@@ -4291,7 +4361,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     completed_env,
                     conversation_history_snapshot=full_history,
                 )
-                terminal_snapshot_persisted = True
+                _mark_terminal()
                 await _write_event("response.completed", {
                     "type": "response.completed",
                     "response": completed_env,
@@ -4359,7 +4429,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     "message": _redact_api_error_text(_exc, limit=500),
                     "type": _responses_error_type(_exc),
                 }
-                failed_env["usage"] = _responses_usage_payload(usage)
+                failed_env["usage"] = _responses_usage_payload(_best_known_usage())
                 await _write_event("response.failed", {
                     "type": "response.failed",
                     "response": failed_env,
@@ -4746,9 +4816,10 @@ class APIServerAdapter(BasePlatformAdapter):
         stored_status = ""
         if isinstance(stored, dict) and isinstance(stored.get("response"), dict):
             stored_status = str(stored["response"].get("status") or "")
-        if (entry is not None and entry.get("cancelled")) or (
-            stored_status in self._TERMINAL_RESPONSE_STATUSES
-        ):
+        entry_terminal = entry is not None and (
+            entry.get("cancelled") or entry.get("terminal")
+        )
+        if entry_terminal or stored_status in self._TERMINAL_RESPONSE_STATUSES:
             return web.json_response(
                 _openai_error(
                     f"Response is already terminal and cannot be cancelled: {response_id}",

@@ -4932,6 +4932,219 @@ class TestCancelResponse:
             adapter._inflight_responses.pop(response_id, None)
 
     @pytest.mark.asyncio
+    async def test_cancelled_envelope_carries_usage_accrued_before_the_cancel(
+        self, adapter
+    ):
+        """An abandoned run's spend has to survive its cancellation.
+
+        The writer's ``usage`` is only filled in when the agent task returns,
+        so a cancel that beats the agent to the end published zeros — an
+        abandoned headless run that had already paid for completed turns
+        looked free to everything reading the envelope.
+        """
+        import queue as _q
+
+        agent = _make_api_agent()
+        agent.session_prompt_tokens = 120
+        agent.session_completion_tokens = 45
+        agent.session_total_tokens = 165
+        agent.session_api_calls = 2
+        agent_ref = [agent, None]
+        stream_q: _q.Queue = _q.Queue()
+
+        async def _agent_coro():
+            stream_q.put("partial answer")
+            await asyncio.sleep(30)
+            return ({}, {})
+
+        agent_task = asyncio.ensure_future(_agent_coro())
+        response_id = f"resp_{uuid.uuid4().hex[:28]}"
+        writer, patcher, written = self._start_stream(
+            adapter,
+            agent_ref=agent_ref,
+            stream_q=stream_q,
+            agent_task=agent_task,
+            response_id=response_id,
+        )
+        try:
+            app = _create_app(adapter)
+            async with TestClient(TestServer(app)) as cli:
+                await self._await_event(written, "response.output_text.delta")
+
+                resp = await cli.post(f"/v1/responses/{response_id}/cancel")
+                assert resp.status == 200
+                usage = (await resp.json())["usage"]
+                assert usage["input_tokens"] == 120
+                assert usage["output_tokens"] == 45
+                assert usage["total_tokens"] == 165
+                # Turn-boundary counters are all that exist: tokens spent
+                # inside the request in flight at the interrupt are reported
+                # by nobody, so this is an honest undercount, not a total.
+                assert usage["completeness"] == "partial"
+                assert "run_interrupted_before_completion" in usage["warnings"]
+
+                with pytest.raises(asyncio.CancelledError):
+                    await writer
+
+                # The stored envelope is what run-cost accounting reads back.
+                stored_body = await (await cli.get(f"/v1/responses/{response_id}")).json()
+                assert stored_body["usage"]["total_tokens"] == 165
+        finally:
+            patcher.stop()
+            adapter._inflight_responses.pop(response_id, None)
+
+    @pytest.mark.asyncio
+    async def test_incomplete_envelope_carries_usage_accrued_before_the_unwind(
+        self, adapter
+    ):
+        """The disconnect unwind had the identical zero-usage gap.
+
+        ``incomplete`` is the record a client that lost its stream comes back
+        to, so it has to account for the run the same way ``cancelled`` does.
+        """
+        import queue as _q
+
+        import gateway.platforms.api_server as api_mod
+
+        class _DisconnectingStreamResponse:
+            async def prepare(self, req):
+                pass
+
+            async def write(self, payload):
+                raise ConnectionResetError("client went away")
+
+        agent = _make_api_agent()
+        agent.session_prompt_tokens = 90
+        agent.session_completion_tokens = 30
+        agent.session_total_tokens = 120
+        agent.session_api_calls = 1
+        agent_ref = [agent, None]
+        stream_q: _q.Queue = _q.Queue()
+
+        async def _agent_coro():
+            await asyncio.sleep(30)
+            return ({}, {})
+
+        agent_task = asyncio.ensure_future(_agent_coro())
+        agent_task.add_done_callback(lambda _fut: stream_q.put(None))
+        response_id = f"resp_{uuid.uuid4().hex[:28]}"
+        fake_request = MagicMock()
+        fake_request.headers = {}
+
+        with patch.object(
+            api_mod.web, "StreamResponse", return_value=_DisconnectingStreamResponse()
+        ):
+            await adapter._write_sse_responses(
+                request=fake_request,
+                response_id=response_id,
+                model="hermes-agent",
+                created_at=int(time.time()),
+                stream_q=stream_q,
+                agent_task=agent_task,
+                agent_ref=agent_ref,
+                conversation_history=[],
+                user_message="long running turn",
+                instructions=None,
+                conversation=None,
+                store=True,
+                session_id="session-disconnect-usage",
+            )
+
+        stored = adapter._response_store.get(response_id)["response"]
+        assert stored["status"] == "incomplete"
+        assert stored["usage"]["input_tokens"] == 90
+        assert stored["usage"]["output_tokens"] == 30
+        assert stored["usage"]["total_tokens"] == 120
+        assert stored["usage"]["completeness"] == "partial"
+        assert "run_interrupted_before_completion" in stored["usage"]["warnings"]
+
+    @pytest.mark.asyncio
+    async def test_terminal_unstored_stream_reports_already_terminal(self, adapter):
+        """``store=false`` leaves no envelope to read terminality from.
+
+        The stored record is this route's usual witness, so a turn that had
+        already finished without one was answered 200 — reporting containment
+        of a run there was nothing left to contain. The in-flight entry knows
+        the turn is over even when nothing was written down.
+        """
+        import queue as _q
+
+        import gateway.platforms.api_server as api_mod
+
+        release = asyncio.Event()
+        written: list[str] = []
+
+        class _ParkedStreamResponse:
+            """Holds the stream open on its terminal event.
+
+            The entry is unregistered the moment the writer returns, so the
+            window this asserts on only exists while the terminal write is
+            still in flight.
+            """
+
+            async def prepare(self, req):
+                pass
+
+            async def write(self, payload):
+                text = payload.decode() if isinstance(payload, bytes) else str(payload)
+                written.append(text)
+                if "response.completed" in text:
+                    await release.wait()
+
+        agent = MagicMock()
+        agent_ref = [agent, None]
+        stream_q: _q.Queue = _q.Queue()
+
+        async def _agent_coro():
+            return (
+                {"final_response": "done", "messages": [], "api_calls": 1},
+                {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+            )
+
+        agent_task = asyncio.ensure_future(_agent_coro())
+        agent_task.add_done_callback(lambda _fut: stream_q.put(None))
+        response_id = f"resp_{uuid.uuid4().hex[:28]}"
+        fake_request = MagicMock()
+        fake_request.headers = {}
+
+        with patch.object(
+            api_mod.web, "StreamResponse", return_value=_ParkedStreamResponse()
+        ):
+            writer = asyncio.ensure_future(
+                adapter._write_sse_responses(
+                    request=fake_request,
+                    response_id=response_id,
+                    model="hermes-agent",
+                    created_at=int(time.time()),
+                    stream_q=stream_q,
+                    agent_task=agent_task,
+                    agent_ref=agent_ref,
+                    conversation_history=[],
+                    user_message="short turn",
+                    instructions=None,
+                    conversation=None,
+                    store=False,
+                    session_id=None,
+                )
+            )
+            try:
+                app = _create_app(adapter)
+                async with TestClient(TestServer(app)) as cli:
+                    await self._await_event(written, "response.completed")
+                    assert adapter._response_store.get(response_id) is None
+
+                    resp = await cli.post(f"/v1/responses/{response_id}/cancel")
+                    assert resp.status == 409
+                    assert (await resp.json())["error"]["code"] == (
+                        "response_already_terminal"
+                    )
+                    agent.interrupt.assert_not_called()
+            finally:
+                release.set()
+                await writer
+                adapter._inflight_responses.pop(response_id, None)
+
+    @pytest.mark.asyncio
     async def test_repeat_cancel_reports_already_terminal(self, adapter):
         """Idempotency: the second cancel is answered 409, not 200."""
         import queue as _q
