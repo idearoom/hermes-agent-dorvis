@@ -305,8 +305,7 @@ def _interrupted_usage_snapshot(agent: Any) -> Optional[Dict[str, Any]]:
     block on a provider request, and no envelope field is worth stalling the
     gateway for.
 
-    Returns ``None`` when the agent is gone or has committed nothing, leaving
-    the caller's own usage in place rather than overwriting it with zeros.
+    Returns ``None`` only when there is no agent to read.
     """
     if agent is None:
         return None
@@ -315,12 +314,15 @@ def _interrupted_usage_snapshot(agent: Any) -> Optional[Dict[str, Any]]:
     except Exception:
         logger.debug("Accrued usage snapshot failed for interrupted run", exc_info=True)
         return None
-    if not any(
+    if any(
         _coerce_token_count(snapshot.get(key), 0)
         for key in ("input_tokens", "output_tokens", "total_tokens")
     ):
-        return None
-    snapshot["completeness"] = "partial"
+        snapshot["completeness"] = "partial"
+    # A run interrupted before its first provider response came back keeps the
+    # snapshot's own ``unavailable``: an unlabelled zero is indistinguishable
+    # from a measured zero downstream, and reporting a free run for one whose
+    # spend is simply unknown is the same lie in the other direction.
     warnings = set(snapshot.get("warnings") or ())
     warnings.add(_INTERRUPTED_USAGE_WARNING)
     snapshot["warnings"] = sorted(str(value) for value in warnings)
@@ -3874,7 +3876,34 @@ class APIServerAdapter(BasePlatformAdapter):
             ):
                 return usage
             live_agent = agent_ref[0] if agent_ref else None
-            return _interrupted_usage_snapshot(live_agent) or usage
+            return (
+                _interrupted_usage_snapshot(live_agent)
+                or _finished_task_usage()
+                or usage
+            )
+
+        def _finished_task_usage() -> Optional[Dict[str, Any]]:
+            """The agent's own snapshot when it beat the writer to the end.
+
+            ``_run_agent`` clears ``agent_ref`` on its executor thread before
+            the future resolves, so an unwind landing between the agent
+            returning and the writer reading its result sees no live agent
+            while a complete snapshot already sits in the finished task. That
+            snapshot is not partial — the run really did finish; only its
+            delivery was abandoned — so it is published as the agent reported
+            it.
+            """
+            if not agent_task.done() or agent_task.cancelled():
+                return None
+            try:
+                if agent_task.exception() is not None:
+                    return None
+                _finished_result, task_usage = agent_task.result()
+            except Exception:
+                return None
+            if not isinstance(task_usage, dict):
+                return None
+            return task_usage or None
 
         def _mark_terminal() -> None:
             """Record that this turn can no longer be cancelled.

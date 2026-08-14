@@ -5086,6 +5086,139 @@ class TestCancelResponse:
         assert "run_interrupted_before_completion" in stored["usage"]["warnings"]
 
     @pytest.mark.asyncio
+    async def test_cancel_before_the_first_provider_response_reports_unavailable(
+        self, adapter
+    ):
+        """An unknown spend must not be published as a measured zero.
+
+        Cancelling during the very first provider request leaves nothing
+        committed, and a bare ``{0, 0, 0}`` carries no way to tell that apart
+        from a run that genuinely cost nothing — consumers read it as a
+        reading. The aggregate's own ``unavailable`` says which it is.
+        """
+        import queue as _q
+
+        agent = _make_api_agent()
+        agent.session_prompt_tokens = 0
+        agent.session_completion_tokens = 0
+        agent.session_total_tokens = 0
+        agent.session_api_calls = 0
+        agent_ref = [agent, None]
+        stream_q: _q.Queue = _q.Queue()
+
+        async def _agent_coro():
+            await asyncio.sleep(30)
+            return ({}, {})
+
+        agent_task = asyncio.ensure_future(_agent_coro())
+        response_id = f"resp_{uuid.uuid4().hex[:28]}"
+        writer, patcher, written = self._start_stream(
+            adapter,
+            agent_ref=agent_ref,
+            stream_q=stream_q,
+            agent_task=agent_task,
+            response_id=response_id,
+        )
+        try:
+            app = _create_app(adapter)
+            async with TestClient(TestServer(app)) as cli:
+                await self._await_event(written, "response.created")
+
+                resp = await cli.post(f"/v1/responses/{response_id}/cancel")
+                usage = (await resp.json())["usage"]
+                assert usage["total_tokens"] == 0
+                assert usage["completeness"] == "unavailable"
+                assert "no_provider_usage_reported" in usage["warnings"]
+                assert "run_interrupted_before_completion" in usage["warnings"]
+
+                with pytest.raises(asyncio.CancelledError):
+                    await writer
+        finally:
+            patcher.stop()
+            adapter._inflight_responses.pop(response_id, None)
+
+    @pytest.mark.asyncio
+    async def test_unwind_after_the_agent_finished_publishes_its_own_snapshot(
+        self, adapter
+    ):
+        """The agent can beat the writer to the end and still be unwound.
+
+        ``_run_agent`` drops its ``agent_ref`` on the executor thread before
+        the task resolves, so a disconnect during the final drain finds no
+        live agent to read while the finished task already holds a complete
+        snapshot. Falling back to zeros there discards a figure the gateway
+        genuinely has.
+        """
+        import queue as _q
+
+        import gateway.platforms.api_server as api_mod
+
+        class _DropOnDeltaStreamResponse:
+            async def prepare(self, req):
+                pass
+
+            async def write(self, payload):
+                text = payload.decode() if isinstance(payload, bytes) else str(payload)
+                if "output_text.delta" in text:
+                    raise ConnectionResetError("client went away")
+
+        agent = _make_api_agent()
+        agent_ref = [agent, None]
+        stream_q: _q.Queue = _q.Queue()
+
+        async def _agent_coro():
+            stream_q.put("partial answer")
+            # Mirrors _run_agent's executor finally: the ref is cleared before
+            # the future resolves.
+            agent_ref[0] = None
+            return (
+                {"final_response": "partial answer", "messages": [], "api_calls": 1},
+                {
+                    "input_tokens": 90,
+                    "output_tokens": 30,
+                    "total_tokens": 120,
+                    "scope": "run_aggregate",
+                    "completeness": "complete",
+                    "warnings": [],
+                },
+            )
+
+        agent_task = asyncio.ensure_future(_agent_coro())
+        agent_task.add_done_callback(lambda _fut: stream_q.put(None))
+        response_id = f"resp_{uuid.uuid4().hex[:28]}"
+        fake_request = MagicMock()
+        fake_request.headers = {}
+
+        with patch.object(
+            api_mod.web,
+            "StreamResponse",
+            return_value=_DropOnDeltaStreamResponse(),
+        ):
+            await adapter._write_sse_responses(
+                request=fake_request,
+                response_id=response_id,
+                model="hermes-agent",
+                created_at=int(time.time()),
+                stream_q=stream_q,
+                agent_task=agent_task,
+                agent_ref=agent_ref,
+                conversation_history=[],
+                user_message="long running turn",
+                instructions=None,
+                conversation=None,
+                store=True,
+                session_id="session-late-disconnect",
+            )
+
+        stored = adapter._response_store.get(response_id)["response"]
+        assert stored["status"] == "incomplete"
+        assert stored["usage"]["total_tokens"] == 120
+        # The run itself finished; only its delivery was abandoned, so the
+        # agent's own completeness stands rather than being downgraded.
+        assert stored["usage"]["completeness"] == "complete"
+        assert "run_interrupted_before_completion" not in stored["usage"]["warnings"]
+
+    @pytest.mark.asyncio
     async def test_terminal_unstored_stream_reports_already_terminal(self, adapter):
         """``store=false`` leaves no envelope to read terminality from.
 
