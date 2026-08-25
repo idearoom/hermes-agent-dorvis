@@ -4,9 +4,55 @@ This fork carries IdeaRoom-specific runtime patches on top of NousResearch
 `hermes-agent` upstream. Keep this file current whenever a patch is added,
 removed, rebased, or promoted.
 
-Current upstream base for the carried branch: `64702f8f91661149128ca1a721f7a0fd4c22113b`
-(merged into fork `main` as `f576538b5`; previous base
-`a7f65e3bcd937cd095ba599ab5927af2093a0d95`).
+Current upstream base for the carried branch: `fcbd1076a93841fa88855acce810e342a5b78101`
+(official annotated release tag `v2026.8.19`, Hermes v0.20.5; previous base
+`64702f8f91661149128ca1a721f7a0fd4c22113b`).
+
+### 2026-08-24 rebase notes (64702f8f9 → fcbd1076a)
+
+The upstream release is a large rollup, so every conflict was resolved at the
+runtime contract rather than by choosing one side wholesale. Notable results:
+
+- **Behavior-neutral first release** — upstream's new tool, skill, web-extract,
+  compaction, stall/repetition recovery, stream-hook, webhook, monitoring, and
+  messaging implementations remain available in source, but no Dorvis
+  model-visible tool set or production behavior is enabled by this rebase.
+  Product adoption is evaluated separately after parity is proved.
+- **Postgres session store, v22 → v26 re-audit** — upstream advances the state
+  schema through v26, including prompt normalization, usage/display fields,
+  hygiene state, and turn leases. The adapter now mirrors the exact v26 SQL
+  surface (`cd2cb9ee351693e62e9dc8e425885a4a08148551d9577d506f4a11be4a715d5f`),
+  ports the widened read/write/search/token-writer interface, and treats a
+  configured Postgres DSN as mandatory. Ordinary boot observes an existing
+  store without DDL and refuses v22, drift, or partial catalogs. The only
+  accepted transition is the explicit, drained, transactional v22→v26 command;
+  its dry run verifies the exact predecessor without writes.
+- **Postgres process ownership** — upstream's local-PID lock recovery cannot
+  prove liveness across Fargate tasks. Postgres leases therefore expire by TTL
+  only; a PID belonging to another task is never treated as local evidence.
+- **SessionDB adapter shape** — `PgSessionDB(SessionDB)` remains the narrow
+  compatibility adapter for this release. Upstream's patient write helper,
+  read context, projected search, message-column cache, JSON reset markers,
+  and token-writer drain semantics were carried into that seam instead of
+  duplicating the full session-store module.
+- **Agent lifecycle and observability** — Dorvis request provenance, complete
+  usage accounting, terminal plugin metadata, memory/observer events, and
+  background-review trace linking compose with upstream's new provider,
+  reasoning, retry, verification, delegation, and stream-hook paths. The
+  upstream control flow is retained; Dorvis hooks stay fail-open and additive.
+- **Compression and context** — upstream native compaction, cache-boundary,
+  protected-tail, and retry-state work is retained alongside Dorvis's stateful
+  compression quality gate and boundary-continuity handoff. Neither side may
+  reset the other's failure/anti-thrash state.
+- **Gateway serving contract** — upstream's expanded API/gateway/profile
+  lifecycle is retained while Dorvis keeps Postgres routing, exact storage
+  attestation, readiness, drain mode, runtime footer/source identity, complete
+  usage, and typed terminal failures. Default-home construction continues to
+  use `open_session_db_for_home` so it cannot bypass DSN dispatch.
+- **Container dependency closure** — the release's Node 26 runtime is retained.
+  The Azure extra pairs `azure-identity==1.25.3` with `msal==1.37.0`, whose
+  cryptography range is compatible with upstream's security-pinned
+  `cryptography==50.0.0`; the image lock and `uv pip check` enforce the result.
 
 ### 2026-07-21 rebase notes (a7f65e3bc → 64702f8f9)
 
@@ -153,7 +199,7 @@ notable resolutions:
 | Skill review gate removal (AE-81) | Promoted in fork history | Keep AWS runtime-created skills in the current free-write posture by removing the pending skill review API surface and tests that would reintroduce the old approval queue. | `gateway/platforms/api_server.py`, `tests/gateway/test_api_server.py` | Medium: API surface and product workflow posture | IdeaRoom Agentic Systems |
 | API server memory cleanup (AE-47) | Carried in fork history | Ensure API-server and runs flows clean up memory providers when runs end and skip next-turn memory prefetch when a client sends a follow-up before the previous turn finishes. | `gateway/platforms/api_server.py`, `run_agent.py`, `tests/gateway/test_api_server.py`, `tests/gateway/test_api_server_runs.py`, `tests/run_agent/test_memory_sync_interrupted.py` | Medium: gateway run lifecycle and memory provider cleanup | IdeaRoom Agentic Systems |
 | Local Codex auth adoption | Carried in fork history | Recover local parity on fresh profile volumes by adopting a valid mounted Codex CLI auth snapshot only when `CODEX_HOME` is explicit and Hermes Codex auth state is absent. | `hermes_cli/auth.py`, `tests/hermes_cli/test_auth_codex_self_heal.py` | Low: Codex OAuth credential resolution | IdeaRoom Agentic Systems |
-| Postgres session store (D6b, AE-115) | Carried in fork history | Move the shared session store (`state.db`) off EFS SQLite into a dedicated `hermes_state` Postgres schema so blue/green gateway deploys can run two tasks against shared state (ADR 0177 in idearoom-agents). `SessionDB.__new__` dispatches to `PgSessionDB` when `HERMES_STATE_STORE_DSN` is set and no explicit `db_path` is given; the SQLite path is unchanged otherwise. `PgSessionDB` inherits SessionDB method bodies over a SQLite→Postgres statement translator (tsvector/ILIKE replace FTS5/trigram search) and pins the upstream `SCHEMA_VERSION` + DDL surface hash, refusing to boot on rebase drift. Includes a one-time `state.db` → Postgres migration script. | `hermes_state.py` (the `__new__` seam plus the `open_session_db_for_home` helper), `hermes_state_pg.py`, `gateway/platforms/api_server.py` (per-profile session-DB routing must not pass an explicit `db_path` for the default home), `scripts/migrate_state_to_postgres.py`, `tests/gateway/test_session_store_pg.py`, `tests/gateway/test_session_store_pg_unit.py`, `tests/conftest.py` | Medium: the only upstream-file edit is `SessionDB.__new__`, but any upstream change to `SCHEMA_SQL` / `DEFERRED_INDEX_SQL` or to SessionDB SQL dialect requires re-auditing `hermes_state_pg.py` and updating its pinned `EXPECTED_SCHEMA_VERSION` / `EXPECTED_SCHEMA_SURFACE_SHA256` (the boot guard enforces this loudly, but only by falling back to local SQLite — the alarm and deploy-readiness check in idearoom-agents are what make that visible). Any new `SessionDB(db_path=...)` call site on a gateway path silently defeats the store dispatch and must be reviewed. | IdeaRoom Agentic Systems |
+| Postgres session store (D6b, AE-115) | Carried in fork history | Move the shared session store (`state.db`) off EFS SQLite into a dedicated `hermes_state` Postgres schema so blue/green gateway deploys can run two tasks against shared state (ADR 0177 in idearoom-agents). `SessionDB.__new__` dispatches to `PgSessionDB` when `HERMES_STATE_STORE_DSN` is set and no explicit `db_path` is given; a configured DSN is mandatory and initialization failures stop boot rather than falling back. `PgSessionDB` inherits SessionDB method bodies over a SQLite→Postgres statement translator (tsvector/ILIKE replace FTS5/trigram search) and pins the upstream `SCHEMA_VERSION` + DDL surface hash. Ordinary boot creates only a truly absent fresh schema and never migrates an existing one. Includes explicit `state.db`→Postgres and drained v22→v26 migration entrypoints. | `hermes_state.py` (the `__new__` seam plus the `open_session_db_for_home` helper), `hermes_state_pg.py`, `gateway/platforms/api_server.py` (per-profile session-DB routing must not pass an explicit `db_path` for the default home), `scripts/migrate_state_to_postgres.py`, `scripts/migrate_pg_schema_v22_to_v26.py`, `tests/gateway/test_session_store_pg.py`, `tests/gateway/test_session_store_pg_unit.py`, `tests/conftest.py` | High: any upstream change to `SCHEMA_SQL` / `DEFERRED_INDEX_SQL`, migration order, SessionDB SQL dialect, write patience, read context, token writer, or search projection requires re-auditing `hermes_state_pg.py` and updating its pinned `EXPECTED_SCHEMA_VERSION` / `EXPECTED_SCHEMA_SURFACE_SHA256`. The boot guard refuses every unknown or partial catalog. Any new `SessionDB(db_path=...)` call site on a gateway path silently defeats store dispatch and must be reviewed. | IdeaRoom Agentic Systems |
 | Gateway drain mode (AE-117) | Carried in fork history | Enable drain-based blue/green deploys (parent-repo ADR 0177): a draining gateway refuses new run launches with `503 {"error": {"code": "gateway_draining"}}`, finishes in-flight runs and their established SSE streams, holds ECS task scale-in protection while active runs exist (clean no-op off ECS), reports `{draining, active_runs}` on the readiness surface, and self-exits at zero (hard cap `HERMES_DRAIN_CAP_SECONDS`, default 3600, with clean terminal events at the cap). Triggers: `HERMES_DRAIN_ON_SIGTERM`-gated unplanned SIGTERM, or authenticated `POST /admin/drain`. Reuses upstream machinery: the drain-control marker (`gateway/drain_control.py`) quiesces the relay side, and self-exit goes through `runner.stop()`'s graceful shutdown. Mostly additive: new `gateway/drain_mode.py` plus narrow hooks (SIGTERM handler branch + `start_drain_mode_tasks` in `gateway/run.py`; refusal checks, `/admin/drain`, readiness fields, inflight-agent registry, and a draining-run orphan-sweep guard in `api_server.py`). | `gateway/drain_mode.py`, `gateway/run.py`, `gateway/platforms/api_server.py`, `tests/gateway/test_drain_mode.py`, `tests/gateway/test_api_server_drain.py`, `scripts/drain_mode_sim.py`, `website/docs/reference/environment-variables.md` | Medium: api_server launch handlers/readiness and the run.py SIGTERM handler + runner.start background-task block | IdeaRoom Agentic Systems |
 
 ## Maintenance Rules

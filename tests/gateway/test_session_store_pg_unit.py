@@ -6,18 +6,21 @@ converter, the rebase-drift schema guard, the row shim, and the
 lives in ``test_session_store_pg.py`` (guarded by HERMES_STATE_TEST_DSN).
 """
 
+import inspect
 import sqlite3
 
 import pytest
 
 import hermes_state
 import hermes_state_pg
+from scripts import migrate_pg_schema_v22_to_v26 as migration_script
 from hermes_state import SessionDB
 from hermes_state_pg import (
     EXPECTED_SCHEMA_SURFACE_SHA256,
     EXPECTED_SCHEMA_VERSION,
     PgSessionDB,
     _Row,
+    _TxnConn,
     _translate_sql,
     assert_schema_compat,
     schema_surface_hash,
@@ -78,6 +81,75 @@ def test_hex_blob_literals_become_escape_strings():
     assert "E'\\x0A'" in out and "E'\\x0D'" in out
 
 
+def test_sqlite_null_safe_parameter_comparisons_translate_to_postgres():
+    sql = (
+        "UPDATE sessions SET title = ? "
+        "WHERE id = ? AND title IS ? AND title_source IS NOT ?"
+    )
+    out = _translate_sql(sql, with_params=True)
+    assert "title IS NOT DISTINCT FROM %s" in out
+    assert "title_source IS DISTINCT FROM %s" in out
+    assert " IS %s" not in out
+    assert " IS NOT %s" not in out
+
+
+def test_v26_create_session_reset_marker_json_translates_to_jsonb():
+    sql = """UPDATE sessions SET model_config = CASE
+        WHEN excluded.model_config IS NOT NULL
+             AND json_type(sessions.model_config, '$._reset_from') IS NOT NULL
+             AND json_remove(sessions.model_config, '$._reset_from') = '{}'
+        THEN json_set(
+            excluded.model_config,
+            '$._reset_from',
+            json_extract(sessions.model_config, '$._reset_from')
+        )
+        ELSE sessions.model_config
+    END"""
+
+    out = _translate_sql(sql, with_params=False)
+
+    assert "json_type(" not in out
+    assert "json_remove(" not in out
+    assert "json_set(" not in out
+    assert "jsonb_set(" in out
+    assert "sessions.model_config::jsonb -> '_reset_from'" in out
+
+
+def test_v26_reopen_reset_marker_json_translates_to_jsonb():
+    sql = (
+        "UPDATE sessions AS child SET model_config = json_set("
+        "COALESCE(child.model_config, '{}'), '$._reset_from', "
+        "child.parent_session_id) WHERE child.parent_session_id = ?"
+    )
+
+    out = _translate_sql(sql, with_params=True)
+
+    assert "json_set(" not in out
+    assert "jsonb_set(" in out
+    assert "to_jsonb(child.parent_session_id)" in out
+    assert out.endswith("child.parent_session_id = %s")
+
+
+def test_transaction_shim_emulates_sqlite_changes_for_v26_lineage_writes(
+    monkeypatch,
+):
+    class _WriteResult:
+        rowcount = 7
+
+    raw = object()
+    monkeypatch.setattr(
+        hermes_state_pg,
+        "_run_statement",
+        lambda conn, sql, params: _WriteResult(),
+    )
+    conn = _TxnConn(raw)
+
+    conn.execute("UPDATE sessions SET archived = 1")
+    result = conn.execute("SELECT changes()")
+
+    assert result.fetchone()[0] == 7
+
+
 # ── FTS5 → tsquery ─────────────────────────────────────────────────────────
 
 
@@ -101,6 +173,11 @@ def test_fts5_to_tsquery(fts5, expected):
 
 
 def test_schema_compat_passes_on_current_tree():
+    assert EXPECTED_SCHEMA_VERSION == 26
+    assert (
+        EXPECTED_SCHEMA_SURFACE_SHA256
+        == "cd2cb9ee351693e62e9dc8e425885a4a08148551d9577d506f4a11be4a715d5f"
+    )
     assert hermes_state.SCHEMA_VERSION == EXPECTED_SCHEMA_VERSION
     assert schema_surface_hash() == EXPECTED_SCHEMA_SURFACE_SHA256
     assert_schema_compat()  # must not raise
@@ -147,6 +224,10 @@ class _MarkerConn:
 
     def execute(self, sql, params=None):
         self.executed.append((sql, params))
+        if "COUNT(*), MIN(version)" in sql:
+            if self._version is None:
+                return _MarkerResult((0, None, None))
+            return _MarkerResult((1, self._version, self._version))
         if "SELECT version" in sql:
             return _MarkerResult(
                 None if self._version is None else (self._version,)
@@ -165,70 +246,45 @@ class _MarkerConn:
         ]
 
 
-def test_persisted_markers_advance_from_the_audited_v19_predecessor():
-    """AE-182: the v19→v22 delta is additive, so the store expands in place.
-
-    ``_init_pg_schema`` applies PG_SCHEMA_SQL + PG_EXPAND_SQL before the marker
-    check, so by the time this runs the database already has the v22 shape.
-    The markers are then advanced rather than held back: no build between this
-    one and the v19 predecessor can use the Postgres store at all (they trip
-    ``assert_schema_compat`` and fall back to local SQLite), so a held-back
-    marker would protect nothing and would mask genuine future drift.
-    """
-    previous_hash = hermes_state_pg._V19_SURFACE_SHA256_PRE_ACTIVE_NULL_INDEX
-    conn = _MarkerConn(version=19, surface=previous_hash)
+def test_current_persisted_markers_are_accepted_without_mutation():
+    conn = _MarkerConn(
+        version=EXPECTED_SCHEMA_VERSION,
+        surface=EXPECTED_SCHEMA_SURFACE_SHA256,
+    )
 
     PgSessionDB._assert_persisted_schema_markers(
         PgSessionDB.__new__(PgSessionDB), conn
     )
 
-    # v20 analytics backfill ran, then the version marker advanced.
-    assert conn.ran("INSERT INTO hermes_state.session_model_usage")
-    assert conn.ran("UPDATE hermes_state.schema_version SET version") == [
-        (
-            "UPDATE hermes_state.schema_version SET version = %s",
-            (EXPECTED_SCHEMA_VERSION,),
-        )
-    ]
-    assert conn.ran("UPDATE hermes_state.state_meta SET value") == [
-        (
-            "UPDATE hermes_state.state_meta SET value = %s WHERE key = %s",
-            (EXPECTED_SCHEMA_SURFACE_SHA256, "pg_backend_schema_surface_sha256"),
-        )
-    ]
+    assert not conn.ran("INSERT")
+    assert not conn.ran("UPDATE")
 
 
-def test_both_audited_v19_surface_markers_are_accepted():
-    for previous_hash in (
-        hermes_state_pg._V19_SURFACE_SHA256_PRE_ACTIVE_NULL_INDEX,
-        hermes_state_pg._V19_SURFACE_SHA256,
-    ):
-        conn = _MarkerConn(version=19, surface=previous_hash)
+def test_v22_markers_require_the_explicit_drain_migration():
+    conn = _MarkerConn(
+        version=22,
+        surface=hermes_state_pg._V22_SCHEMA_SURFACE_SHA256,
+    )
+
+    with pytest.raises(RuntimeError, match="migration required"):
         PgSessionDB._assert_persisted_schema_markers(
             PgSessionDB.__new__(PgSessionDB), conn
         )
-        assert conn.ran("UPDATE hermes_state.state_meta SET value")
+
+    assert not conn.ran("INSERT")
+    assert not conn.ran("UPDATE")
+    assert not conn.ran("ALTER")
 
 
-def test_fresh_store_persists_the_current_schema_markers():
+def test_missing_persisted_markers_fail_closed():
     conn = _MarkerConn(version=None, surface=None)
 
-    PgSessionDB._assert_persisted_schema_markers(
-        PgSessionDB.__new__(PgSessionDB), conn
-    )
+    with pytest.raises(RuntimeError, match="missing schema_version"):
+        PgSessionDB._assert_persisted_schema_markers(
+            PgSessionDB.__new__(PgSessionDB), conn
+        )
 
-    assert (
-        "INSERT INTO hermes_state.schema_version (version) VALUES (%s)",
-        (EXPECTED_SCHEMA_VERSION,),
-    ) in conn.executed
-    assert any(
-        sql.startswith("INSERT INTO hermes_state.state_meta")
-        and params
-        == ("pg_backend_schema_surface_sha256", EXPECTED_SCHEMA_SURFACE_SHA256)
-        for sql, params in conn.executed
-    )
-    # A fresh store is already at the terminal shape — no data migration.
-    assert not conn.ran("INSERT INTO hermes_state.session_model_usage")
+    assert not conn.ran("INSERT")
 
 
 def test_unknown_persisted_schema_version_fails_closed():
@@ -247,26 +303,309 @@ def test_unknown_persisted_schema_surface_fails_closed():
         )
 
 
-def test_v20_backfill_failure_does_not_block_boot(monkeypatch):
-    """Analytics backfill is best-effort — falling back to SQLite is worse."""
+class _RowsResult:
+    def __init__(self, rows=()):
+        self._rows = list(rows)
+        self._offset = 0
 
-    class _AngryConn(_MarkerConn):
-        def execute(self, sql, params=None):
-            if "session_model_usage" in sql:
-                self.executed.append((sql, params))
-                raise RuntimeError("relation is being rewritten")
-            return super().execute(sql, params)
+    def fetchone(self):
+        if self._offset >= len(self._rows):
+            return None
+        row = self._rows[self._offset]
+        self._offset += 1
+        return row
 
-    conn = _AngryConn(
-        version=19, surface=hermes_state_pg._V19_SURFACE_SHA256
+    def fetchall(self):
+        rows = self._rows[self._offset :]
+        self._offset = len(self._rows)
+        return rows
+
+    def fetchmany(self, size=1):
+        rows = self._rows[self._offset : self._offset + size]
+        self._offset += len(rows)
+        return rows
+
+
+class _Context:
+    def __init__(self, value):
+        self.value = value
+
+    def __enter__(self):
+        return self.value
+
+    def __exit__(self, exc_type, exc, traceback):
+        return False
+
+
+class _Pool:
+    def __init__(self, conn):
+        self.conn = conn
+
+    def connection(self):
+        return _Context(self.conn)
+
+
+class _AbsentSchemaConn:
+    def __init__(self):
+        self.executed = []
+
+    def execute(self, sql, params=None):
+        self.executed.append((sql, params))
+        if "to_regnamespace" in sql:
+            return _RowsResult([(None,)])
+        if "COUNT(*), MIN(version)" in sql:
+            return _RowsResult([(0, None, None)])
+        return _RowsResult()
+
+    def transaction(self):
+        return _Context(self)
+
+
+def test_explicit_migration_mode_refuses_an_absent_schema_before_ddl():
+    conn = _AbsentSchemaConn()
+    db = PgSessionDB.__new__(PgSessionDB)
+    db._pool = _Pool(conn)
+    db._allow_schema_migration = True
+    db._storage_attestation = None
+
+    with pytest.raises(RuntimeError, match="existing.*v22"):
+        db._init_pg_schema()
+
+    assert not any(
+        sql.lstrip().startswith(("CREATE", "ALTER", "INSERT", "UPDATE", "DELETE"))
+        for sql, _ in conn.executed
     )
-    PgSessionDB._assert_persisted_schema_markers(
-        PgSessionDB.__new__(PgSessionDB), conn
+
+
+def test_explicit_migration_mode_refuses_an_already_v26_store():
+    conn = _MarkerConn(
+        version=EXPECTED_SCHEMA_VERSION,
+        surface=EXPECTED_SCHEMA_SURFACE_SHA256,
     )
-    assert conn.ran("UPDATE hermes_state.schema_version SET version")
+
+    with pytest.raises(RuntimeError, match="requires schema_version 22"):
+        PgSessionDB._assert_v22_migration_precondition(conn)
+
+    assert not conn.ran("INSERT")
+    assert not conn.ran("UPDATE")
+    assert not conn.ran("ALTER")
 
 
-# ── v19 → v22 schema mirror ────────────────────────────────────────────────
+class _CatalogConn:
+    def __init__(
+        self,
+        *,
+        omit_column=None,
+        version=22,
+        surface=None,
+        prompt_rows=(),
+        catalog_version=22,
+    ):
+        self.executed = []
+        self.version = version
+        self.surface = surface or hermes_state_pg._V22_SCHEMA_SURFACE_SHA256
+        self.omit_column = omit_column
+        self.prompt_rows = prompt_rows
+        self.catalog_version = catalog_version
+
+    def execute(self, sql, params=None):
+        self.executed.append((sql, params))
+        if "to_regnamespace" in sql:
+            return _RowsResult([("hermes_state",)])
+        if "to_regclass" in sql:
+            return _RowsResult([("hermes_state.schema_version",)])
+        if "information_schema.columns" in sql:
+            columns = (
+                hermes_state_pg._V22_REQUIRED_COLUMNS
+                if self.catalog_version == 22
+                else hermes_state_pg._REQUIRED_COLUMNS
+            )
+            rows = [
+                (table, column)
+                for table, table_columns in columns.items()
+                for column in table_columns
+                if (table, column) != self.omit_column
+            ]
+            return _RowsResult(rows)
+        if "FROM pg_indexes" in sql:
+            indexes = (
+                hermes_state_pg._V22_REQUIRED_INDEXES
+                if self.catalog_version == 22
+                else hermes_state_pg._REQUIRED_INDEXES
+            )
+            return _RowsResult(
+                (index,) for index in indexes
+            )
+        if "constraint_type = 'PRIMARY KEY'" in sql:
+            primary_keys = (
+                hermes_state_pg._V22_REQUIRED_PRIMARY_KEYS
+                if self.catalog_version == 22
+                else hermes_state_pg._REQUIRED_PRIMARY_KEYS
+            )
+            return _RowsResult(
+                (table, column, ordinal)
+                for table, columns in primary_keys.items()
+                for ordinal, column in enumerate(columns, start=1)
+            )
+        if "constraint_type = 'FOREIGN KEY'" in sql:
+            foreign_keys = (
+                hermes_state_pg._V22_REQUIRED_FOREIGN_KEYS
+                if self.catalog_version == 22
+                else hermes_state_pg._REQUIRED_FOREIGN_KEYS
+            )
+            return _RowsResult(foreign_keys)
+        if "SELECT id, system_prompt" in sql:
+            return _RowsResult(self.prompt_rows)
+        if "COUNT(*), MIN(version)" in sql:
+            return _RowsResult([(1, self.version, self.version)])
+        if "SELECT version" in sql:
+            return _RowsResult([(self.version,)])
+        if "SELECT value" in sql:
+            return _RowsResult([(self.surface,)])
+        if sql.strip().startswith("UPDATE hermes_state.schema_version"):
+            self.version = int(params[0])
+        if sql.strip().startswith("UPDATE hermes_state.state_meta"):
+            self.surface = str(params[0])
+        if sql.lstrip().startswith(("CREATE", "ALTER")):
+            self.catalog_version = EXPECTED_SCHEMA_VERSION
+        return _RowsResult()
+
+    def transaction(self):
+        return _Context(self)
+
+
+def test_catalog_verification_fails_when_a_v26_column_is_missing():
+    conn = _CatalogConn(
+        omit_column=("messages", "display_metadata"), catalog_version=26
+    )
+
+    with pytest.raises(RuntimeError, match="display_metadata"):
+        PgSessionDB._verify_catalog(conn)
+
+
+def test_ordinary_boot_refuses_v22_without_running_migration_ddl():
+    conn = _CatalogConn()
+    db = PgSessionDB.__new__(PgSessionDB)
+    db._pool = _Pool(conn)
+    db._allow_schema_migration = False
+    db._storage_attestation = None
+
+    with pytest.raises(RuntimeError, match="migration required"):
+        db._init_pg_schema()
+
+    assert not any(
+        sql.lstrip().startswith(("CREATE", "ALTER", "INSERT", "UPDATE", "DELETE"))
+        for sql, _ in conn.executed
+    )
+    assert db._storage_attestation is None
+
+
+def test_explicit_v22_preflight_accepts_only_the_exact_catalog():
+    conn = _CatalogConn()
+
+    PgSessionDB._assert_v22_migration_precondition(conn)
+
+    assert not any(
+        sql.lstrip().startswith(("CREATE", "ALTER", "INSERT", "UPDATE", "DELETE"))
+        for sql, _ in conn.executed
+    )
+
+
+def test_explicit_v22_preflight_rejects_a_partly_widened_catalog():
+    conn = _CatalogConn(catalog_version=26)
+
+    with pytest.raises(RuntimeError, match="unexpected"):
+        PgSessionDB._assert_v22_migration_precondition(conn)
+
+    assert not any(
+        sql.lstrip().startswith(("CREATE", "ALTER", "INSERT", "UPDATE", "DELETE"))
+        for sql, _ in conn.executed
+    )
+
+
+def test_migration_script_dry_run_observes_v22_without_exposing_dsn(
+    monkeypatch, capsys
+):
+    observed = []
+
+    def _inspect(dsn):
+        observed.append(dsn)
+        return {
+            "backend": "postgres",
+            "schema_version": 22,
+            "surface_marker": hermes_state_pg._V22_SCHEMA_SURFACE_SHA256,
+        }
+
+    monkeypatch.setattr(
+        migration_script, "inspect_v22_migration_precondition", _inspect
+    )
+    secret_dsn = "postgresql://operator:do-not-print@example.invalid/db"
+
+    assert migration_script.main(["--dsn", secret_dsn]) == 0
+
+    output = capsys.readouterr()
+    assert observed == [secret_dsn]
+    assert "schema_version=22" in output.out
+    assert hermes_state_pg._V22_SCHEMA_SURFACE_SHA256 in output.out
+    assert secret_dsn not in output.out
+    assert secret_dsn not in output.err
+
+
+def test_explicit_v22_migration_repairs_titles_before_unique_index():
+    conn = _CatalogConn()
+    db = PgSessionDB.__new__(PgSessionDB)
+
+    db._migrate_v22_to_v26(conn)
+
+    statements = [sql for sql, _ in conn.executed]
+    dedupe_at = statements.index(hermes_state_pg.PG_V26_DEDUPLICATE_TITLES_SQL)
+    title_index_at = next(
+        i for i, sql in enumerate(statements) if "idx_sessions_title_unique" in sql
+    )
+    assert dedupe_at < title_index_at
+    assert "ORDER BY started_at DESC, id DESC" in (
+        " ".join(hermes_state_pg.PG_V26_DEDUPLICATE_TITLES_SQL.split())
+    )
+    assert conn.version == EXPECTED_SCHEMA_VERSION
+    assert conn.surface == EXPECTED_SCHEMA_SURFACE_SHA256
+
+
+def test_explicit_v22_migration_content_addresses_legacy_prompts():
+    conn = _CatalogConn(prompt_rows=(("session-1", "system prompt"),))
+    db = PgSessionDB.__new__(PgSessionDB)
+
+    db._migrate_v22_to_v26(conn)
+
+    prompt_insert = next(
+        params
+        for sql, params in conn.executed
+        if sql.startswith("INSERT INTO hermes_state.system_prompts")
+    )
+    assert prompt_insert == (
+        "e16202309c92180728dd7fd1c59f16004a6d5ee245538c28d2a9a22edf2dd2ab",
+        "system prompt",
+    )
+    assert any(
+        "SET system_prompt_hash = %s, system_prompt = NULL" in sql
+        and params == (prompt_insert[0], "session-1")
+        for sql, params in conn.executed
+    )
+
+
+def test_explicit_v22_migration_rejects_an_unknown_surface_before_ddl():
+    conn = _CatalogConn(surface="unknown")
+    db = PgSessionDB.__new__(PgSessionDB)
+
+    with pytest.raises(RuntimeError, match="Refusing v22→v26 migration"):
+        db._migrate_v22_to_v26(conn)
+
+    assert not any(
+        sql.lstrip().startswith(("CREATE", "ALTER", "UPDATE"))
+        for sql, _ in conn.executed
+    )
+
+
+# ── v26 schema mirror and backend seams ────────────────────────────────────
 
 
 @pytest.mark.parametrize(
@@ -280,7 +619,24 @@ def test_v20_backfill_failure_does_not_block_boot(monkeypatch):
         "hermes_state.async_delegations",
     ],
 )
-def test_pg_schema_mirrors_the_v22_tables(fragment):
+def test_pg_schema_mirrors_the_v26_tables(fragment):
+    assert any(fragment in stmt for stmt in hermes_state_pg.PG_SCHEMA_SQL)
+
+
+@pytest.mark.parametrize(
+    "fragment",
+    [
+        "hermes_state.system_prompts",
+        "hermes_state.gateway_hygiene_state",
+        "hermes_state.session_turn_leases",
+        "idx_session_turn_leases_expires",
+        "idx_sessions_system_prompt_hash",
+        "idx_sessions_title_unique",
+        "idx_messages_session_id",
+        "idx_messages_assistant_calls_by_session",
+    ],
+)
+def test_pg_schema_contains_every_v26_table_and_index(fragment):
     assert any(fragment in stmt for stmt in hermes_state_pg.PG_SCHEMA_SQL)
 
 
@@ -291,9 +647,21 @@ def test_pg_schema_mirrors_the_v22_tables(fragment):
         "profile_name",
         "effect_disposition",
         "api_content",
+        "system_prompt_hash",
+        "git_metadata_generation",
+        "title_source",
+        "last_activity_at",
+        "last_activity_description",
+        "last_activity_provenance",
+        "compression_ineffective_count",
+        "pinned",
+        "hidden",
+        "last_read_at",
+        "display_kind",
+        "display_metadata",
     ],
 )
-def test_v22_columns_are_both_created_and_expanded(column):
+def test_v26_columns_are_both_created_and_expanded(column):
     """Fresh databases get the column from CREATE TABLE; existing ones from
     the additive ALTER. Missing either one silently drops writes."""
     assert any(column in stmt for stmt in hermes_state_pg.PG_SCHEMA_SQL)
@@ -301,6 +669,62 @@ def test_v22_columns_are_both_created_and_expanded(column):
         column in stmt and "ADD COLUMN IF NOT EXISTS" in stmt
         for stmt in hermes_state_pg.PG_EXPAND_SQL
     )
+
+
+def test_pg_backend_overrides_new_transaction_and_search_seams():
+    signature = inspect.signature(PgSessionDB._execute_write)
+    assert "patience_s" in signature.parameters
+    assert "_read_ctx" in PgSessionDB.__dict__
+    assert "_search_messages_impl" in PgSessionDB.__dict__
+    assert "search_messages" not in PgSessionDB.__dict__
+    assert "_message_column_names" in PgSessionDB.__dict__
+
+
+def test_pg_never_reclaims_a_foreign_holder_from_local_pid_liveness():
+    db = PgSessionDB.__new__(PgSessionDB)
+    assert db._lock_holder_process_is_dead("12345:foreign-task") is False
+
+
+def test_pg_attestation_is_exact_and_does_not_expose_the_dsn():
+    db = PgSessionDB.__new__(PgSessionDB)
+    db._storage_attestation = {
+        "backend": "postgres",
+        "schema_version": EXPECTED_SCHEMA_VERSION,
+        "surface_marker": EXPECTED_SCHEMA_SURFACE_SHA256,
+    }
+
+    assert db.storage_attestation() == {
+        "backend": "postgres",
+        "schema_version": 26,
+        "surface_marker": EXPECTED_SCHEMA_SURFACE_SHA256,
+    }
+
+
+def test_pg_close_drains_token_writer_before_closing_pool(monkeypatch):
+    events = []
+
+    class _ClosePool:
+        def close(self):
+            events.append("pool-close")
+
+    hook = object()
+    db = PgSessionDB.__new__(PgSessionDB)
+    db._closed = False
+    db._conn = object()
+    db._pool = _ClosePool()
+    db._token_atexit_hook = hook
+    db._stop_token_writer = lambda: events.append("token-drain")
+    monkeypatch.setattr(
+        hermes_state.atexit,
+        "unregister",
+        lambda registered: events.append(("unregister", registered)),
+    )
+
+    db.close()
+
+    assert events == ["token-drain", ("unregister", hook), "pool-close"]
+    assert db._conn is None
+    assert db._closed is True
 
 
 def test_statement_override_keys_still_exist_upstream():
@@ -335,8 +759,8 @@ def test_statement_override_is_applied_by_the_translator():
     assert "?" not in out
 
 
-def test_expand_migration_is_additive_only():
-    """ADR 0177 coexistence: a draining old task must keep working."""
+def test_explicit_column_expansion_contains_no_destructive_ddl():
+    """The drained transaction widens columns without dropping old data."""
     for stmt in hermes_state_pg.PG_EXPAND_SQL:
         assert "ADD COLUMN IF NOT EXISTS" in stmt
         for destructive in (" DROP ", " RENAME ", " ALTER COLUMN "):

@@ -506,6 +506,20 @@ class TestDrainReadiness:
         assert payload["active_runs"] == 0
         assert payload["checks"]["gateway_not_draining"] is True
 
+    def test_configured_postgres_backends_require_positive_attestation(
+        self, adapter, monkeypatch
+    ):
+        monkeypatch.setenv("HERMES_STATE_STORE_DSN", "postgresql://configured")
+        monkeypatch.setenv("HERMES_RESPONSE_STORE_DSN", "postgresql://configured")
+
+        payload, status = adapter._readiness_payload()
+
+        assert status == 503
+        assert payload["checks"]["session_store_postgres"] is False
+        assert payload["checks"]["response_store_postgres"] is False
+        assert payload["session_store"]["backend"] != "postgres"
+        assert payload["response_store"]["backend"] != "postgres"
+
     def test_payload_flips_when_draining(self, adapter):
         adapter._drain_mode.begin("test")
         payload, status = adapter._readiness_payload()

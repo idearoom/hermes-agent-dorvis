@@ -114,7 +114,7 @@ The active provider is chosen by the `cron.provider` config key:
   historical in-process loop calling `scheduler.tick()` every 60 seconds. This
   is byte-identical to the pre-provider behavior.
 - **a named provider** (e.g. `chronos`, a managed-cron provider for
-  scale-to-zero deployments) → discovered from `plugins/cron/<name>/` or
+  scale-to-zero deployments) → discovered from `plugins/cron_providers/<name>/` or
   `$HERMES_HOME/plugins/<name>/`.
 
 If a named provider is missing, fails to load, or reports `is_available() ==
@@ -176,7 +176,9 @@ agent↔Nous wire contract lives in `docs/chronos-managed-cron-contract.md`.
 Each cron job runs in a completely fresh agent session:
 
 - No conversation history from previous runs
-- No memory of previous cron executions (unless persisted to memory/files)
+- No memory of previous cron executions (persistent memory — MEMORY.md /
+  USER.md — does load, like any other agent run, so durable preferences and
+  facts carry over; per-run conversation context does not)
 - The prompt must be self-contained — cron jobs cannot ask clarifying questions
 - The `cronjob` toolset is disabled (recursion guard)
 

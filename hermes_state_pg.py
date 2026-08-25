@@ -50,11 +50,13 @@ import re
 import sqlite3
 import threading
 import time
+from collections import deque
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, TypeVar
+from typing import Any, Callable, Collection, Dict, List, Optional, TypeVar
 
 import hermes_state
-from hermes_state import DEFAULT_DB_PATH, SessionDB
+from hermes_state import SessionDB
 
 logger = logging.getLogger(__name__)
 
@@ -68,49 +70,20 @@ _SCHEMA = "hermes_state"
 # The SCHEMA_VERSION and the sha256 of the upstream SQLite DDL that this
 # Postgres adapter was audited against. If an upstream rebase bumps the
 # version or edits SCHEMA_SQL/DEFERRED_INDEX_SQL, PgSessionDB must refuse to
-# boot until a human re-audits PG_SCHEMA_SQL (and ships any expand/contract
-# migration per ADR 0177's coexistence rule), then updates these constants.
-EXPECTED_SCHEMA_VERSION = 22
+# boot until a human re-audits PG_SCHEMA_SQL (and ships an explicit safe
+# migration/cutover when needed), then updates these constants.
+EXPECTED_SCHEMA_VERSION = 26
 EXPECTED_SCHEMA_SURFACE_SHA256 = (
+    "cd2cb9ee351693e62e9dc8e425885a4a08148551d9577d506f4a11be4a715d5f"
+)
+_V22_SCHEMA_SURFACE_SHA256 = (
     "ffb802aede5aab2e95d1eb46188864c11b4b8e290c538ada64c06b9a14747654"
 )
 
 # ── Audited predecessor markers (AE-182) ───────────────────────────────────
-# The GPT-5.6 upstream rebase (fork commit e415d8591) carried hermes_state.py
-# from v19 to v22 without re-auditing this adapter, so every gateway boot
-# since then tripped the guard above and silently fell back to the local
-# SQLite/JSONL store. The v19→v22 delta is purely ADDITIVE (two sessions
-# columns, two messages columns, two new tables + their indexes), so the
-# Postgres side upgrades in place: PG_EXPAND_SQL applies the additive DDL and
-# _assert_persisted_schema_markers advances the persisted markers.
-#
-# Two v19-era surface markers exist in the wild depending on which build first
-# initialized a given database; both are explicitly audited as additive
-# predecessors of the v22 surface. Everything else still fails closed.
-_V19_SURFACE_SHA256_PRE_ACTIVE_NULL_INDEX = (
-    "df28fdc5fd8be0e48373abed404a6cd33ccf88f2fa11962ac29d53d75ced15a0"
-)
-_V19_SURFACE_SHA256 = (
-    "c330e63b92990f7d5528e2f2faf980d147f125ca491833e65bf7834e81fbfbdc"
-)
-
-# Persisted surface markers that may be accepted (and then advanced) after
-# _init_pg_schema has applied the additive IF NOT EXISTS / ADD COLUMN IF NOT
-# EXISTS DDL. Every other unknown marker still fails closed.
-_COMPATIBLE_PREVIOUS_SCHEMA_SURFACE_SHA256 = frozenset(
-    {
-        # Upstream 2ebf9a90: before the legacy-SQLite active=NULL repair index.
-        _V19_SURFACE_SHA256_PRE_ACTIVE_NULL_INDEX,
-        # Upstream v19 terminal surface (with that repair index).
-        _V19_SURFACE_SHA256,
-    }
-)
-
-# Persisted schema_version values this build knows how to expand in place.
-# Anything else means "a different hermes build owns this database" and still
-# raises rather than writing into an unknown shape.
-_UPGRADEABLE_FROM_SCHEMA_VERSIONS = frozenset({19})
-
+# v22 is the only audited migration predecessor. This release adds a durable
+# cross-task turn lease, so the transition is deliberately drain-only: runtime
+# boot observes and refuses v22; the explicit migration command owns all DDL.
 # state_meta keys used by the Pg backend's persisted markers.
 _META_SURFACE_KEY = "pg_backend_schema_surface_sha256"
 
@@ -159,7 +132,7 @@ def _normalize_dsn(dsn: str) -> str:
     return dsn.replace("sslmode=no-verify", "sslmode=require")
 
 
-# ── Postgres DDL (mirrors hermes_state.SCHEMA_SQL @ v22) ───────────────────
+# ── Postgres DDL (mirrors hermes_state.SCHEMA_SQL @ v26) ───────────────────
 # Type mapping: TEXT→TEXT, REAL→DOUBLE PRECISION, INTEGER→BIGINT,
 # AUTOINCREMENT→IDENTITY (BY DEFAULT, so the migration script can insert
 # explicit ids). FKs are DEFERRABLE so the one-time migration can bulk-copy
@@ -176,6 +149,10 @@ PG_SCHEMA_SQL: List[str] = [
     f"""CREATE TABLE IF NOT EXISTS {_SCHEMA}.schema_version (
         version BIGINT NOT NULL
     )""",
+    f"""CREATE TABLE IF NOT EXISTS {_SCHEMA}.system_prompts (
+        hash TEXT PRIMARY KEY,
+        prompt TEXT NOT NULL
+    )""",
     f"""CREATE TABLE IF NOT EXISTS {_SCHEMA}.sessions (
         id TEXT PRIMARY KEY,
         source TEXT NOT NULL,
@@ -190,6 +167,7 @@ PG_SCHEMA_SQL: List[str] = [
         model TEXT,
         model_config TEXT,
         system_prompt TEXT,
+        system_prompt_hash TEXT,
         parent_session_id TEXT,
         started_at DOUBLE PRECISION NOT NULL,
         ended_at DOUBLE PRECISION,
@@ -204,6 +182,7 @@ PG_SCHEMA_SQL: List[str] = [
         cwd TEXT,
         git_branch TEXT,
         git_repo_root TEXT,
+        git_metadata_generation BIGINT NOT NULL DEFAULT 0,
         billing_provider TEXT,
         billing_base_url TEXT,
         billing_mode TEXT,
@@ -213,6 +192,10 @@ PG_SCHEMA_SQL: List[str] = [
         cost_source TEXT,
         pricing_version TEXT,
         title TEXT,
+        title_source TEXT,
+        last_activity_at DOUBLE PRECISION,
+        last_activity_description TEXT,
+        last_activity_provenance TEXT,
         api_call_count BIGINT DEFAULT 0,
         handoff_state TEXT,
         handoff_platform TEXT,
@@ -220,10 +203,16 @@ PG_SCHEMA_SQL: List[str] = [
         compression_failure_cooldown_until DOUBLE PRECISION,
         compression_failure_error TEXT,
         compression_fallback_streak BIGINT NOT NULL DEFAULT 0,
+        compression_ineffective_count BIGINT NOT NULL DEFAULT 0,
         profile_name TEXT,
         rewind_count BIGINT NOT NULL DEFAULT 0,
         archived BIGINT NOT NULL DEFAULT 0,
+        pinned BIGINT NOT NULL DEFAULT 0,
+        hidden BIGINT NOT NULL DEFAULT 0,
+        last_read_at DOUBLE PRECISION,
         FOREIGN KEY (parent_session_id) REFERENCES {_SCHEMA}.sessions(id)
+            DEFERRABLE INITIALLY IMMEDIATE,
+        FOREIGN KEY (system_prompt_hash) REFERENCES {_SCHEMA}.system_prompts(hash)
             DEFERRABLE INITIALLY IMMEDIATE
     )""",
     f"""CREATE TABLE IF NOT EXISTS {_SCHEMA}.messages (
@@ -248,7 +237,9 @@ PG_SCHEMA_SQL: List[str] = [
         observed BIGINT DEFAULT 0,
         active BIGINT NOT NULL DEFAULT 1,
         compacted BIGINT NOT NULL DEFAULT 0,
-        api_content TEXT
+        api_content TEXT,
+        display_kind TEXT,
+        display_metadata TEXT
     )""",
     # v20/v22 (upstream cb7f6bbb2 + eb6aa0360): per-model, per-task usage
     # attribution. Created at the terminal v22 shape — ``task`` is part of the
@@ -315,7 +306,8 @@ PG_SCHEMA_SQL: List[str] = [
         task_json TEXT,
         delivery_claim TEXT,
         delivery_claimed_at DOUBLE PRECISION,
-        owner_instance TEXT
+        owner_instance TEXT,
+        origin_session_id TEXT NOT NULL DEFAULT ''
     )""",
     f"""CREATE TABLE IF NOT EXISTS {_SCHEMA}.state_meta (
         key TEXT PRIMARY KEY,
@@ -328,8 +320,18 @@ PG_SCHEMA_SQL: List[str] = [
         updated_at DOUBLE PRECISION NOT NULL,
         PRIMARY KEY (scope, session_key)
     )""",
+    f"""CREATE TABLE IF NOT EXISTS {_SCHEMA}.gateway_hygiene_state (
+        session_key TEXT PRIMARY KEY,
+        failure_streak BIGINT NOT NULL DEFAULT 0
+    )""",
     f"""CREATE TABLE IF NOT EXISTS {_SCHEMA}.compression_locks (
         session_id TEXT PRIMARY KEY,
+        holder TEXT NOT NULL,
+        acquired_at DOUBLE PRECISION NOT NULL,
+        expires_at DOUBLE PRECISION NOT NULL
+    )""",
+    f"""CREATE TABLE IF NOT EXISTS {_SCHEMA}.session_turn_leases (
+        conversation_id TEXT PRIMARY KEY,
         holder TEXT NOT NULL,
         acquired_at DOUBLE PRECISION NOT NULL,
         expires_at DOUBLE PRECISION NOT NULL
@@ -369,7 +371,13 @@ PG_SCHEMA_SQL: List[str] = [
     f"CREATE INDEX IF NOT EXISTS idx_sessions_parent ON {_SCHEMA}.sessions(parent_session_id)",
     f"CREATE INDEX IF NOT EXISTS idx_sessions_started ON {_SCHEMA}.sessions(started_at DESC)",
     f"CREATE INDEX IF NOT EXISTS idx_messages_session ON {_SCHEMA}.messages(session_id, timestamp)",
+    f"CREATE INDEX IF NOT EXISTS idx_messages_session_id ON {_SCHEMA}.messages(session_id, id)",
+    f"CREATE INDEX IF NOT EXISTS idx_messages_assistant_calls_by_session "
+    f"ON {_SCHEMA}.messages(session_id) "
+    f"WHERE role = 'assistant' AND tool_calls IS NOT NULL",
     f"CREATE INDEX IF NOT EXISTS idx_compression_locks_expires ON {_SCHEMA}.compression_locks(expires_at)",
+    f"CREATE INDEX IF NOT EXISTS idx_session_turn_leases_expires "
+    f"ON {_SCHEMA}.session_turn_leases(expires_at)",
     f"CREATE INDEX IF NOT EXISTS idx_session_model_usage_session "
     f"ON {_SCHEMA}.session_model_usage(session_id)",
     f"CREATE INDEX IF NOT EXISTS idx_session_model_usage_model "
@@ -389,6 +397,10 @@ PG_SCHEMA_SQL: List[str] = [
     f"ON {_SCHEMA}.sessions(source, user_id, chat_id, chat_type, thread_id, started_at DESC)",
     f"CREATE INDEX IF NOT EXISTS idx_sessions_handoff_state "
     f"ON {_SCHEMA}.sessions(handoff_state, started_at)",
+    f"CREATE INDEX IF NOT EXISTS idx_sessions_system_prompt_hash "
+    f"ON {_SCHEMA}.sessions(system_prompt_hash)",
+    f"CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_title_unique "
+    f"ON {_SCHEMA}.sessions(title) WHERE title IS NOT NULL",
     f"CREATE INDEX IF NOT EXISTS idx_messages_platform_msg_id "
     f"ON {_SCHEMA}.messages(session_id, platform_message_id) "
     f"WHERE platform_message_id IS NOT NULL",
@@ -400,64 +412,439 @@ PG_SCHEMA_SQL: List[str] = [
     f"USING GIN (to_tsvector('simple', {_SEARCH_TEXT_SQL.format(a='')}))",
 ]
 
-# ── Expand migration (ADR 0177 coexistence) ────────────────────────────────
+# ── Explicit drain-only column expansion ──────────────────────────────────
 # ``CREATE TABLE IF NOT EXISTS`` never adds columns to a table that already
-# exists, so the v19→v22 column additions need explicit ALTERs. All of them are
-# additive and either nullable or defaulted, which is what makes them
-# coexistence-safe: a still-draining v19 gateway task keeps working against the
-# widened tables because its SQL never names the new columns, and Postgres 11+
-# adds a defaulted column via catalog metadata rather than a table rewrite, so
-# there is no long exclusive lock on ``messages``. Runs inside the bootstrap
-# advisory lock, after PG_SCHEMA_SQL, on every boot (idempotent).
+# exists, so the drain-only v22→v26 migration applies these idempotent ALTERs
+# explicitly. Runtime boot never executes them: v22 tasks cannot honor v26
+# turn leases and therefore must not coexist with a widened store.
 PG_EXPAND_SQL: List[str] = [
     f"ALTER TABLE {_SCHEMA}.sessions ADD COLUMN IF NOT EXISTS "
     "compression_fallback_streak BIGINT NOT NULL DEFAULT 0",
     f"ALTER TABLE {_SCHEMA}.sessions ADD COLUMN IF NOT EXISTS profile_name TEXT",
     f"ALTER TABLE {_SCHEMA}.messages ADD COLUMN IF NOT EXISTS effect_disposition TEXT",
     f"ALTER TABLE {_SCHEMA}.messages ADD COLUMN IF NOT EXISTS api_content TEXT",
-    # AE-183 owner identity (see the async_delegations DDL above). Additive and
-    # nullable, so a still-draining task that predates it keeps working: its
-    # rows land with owner_instance NULL, which the recovery pass reads as
-    # "legacy, same host" — exactly the behavior that task expects.
+    f"ALTER TABLE {_SCHEMA}.sessions ADD COLUMN IF NOT EXISTS system_prompt_hash TEXT",
+    f"ALTER TABLE {_SCHEMA}.sessions ADD COLUMN IF NOT EXISTS "
+    "git_metadata_generation BIGINT NOT NULL DEFAULT 0",
+    f"ALTER TABLE {_SCHEMA}.sessions ADD COLUMN IF NOT EXISTS title_source TEXT",
+    f"ALTER TABLE {_SCHEMA}.sessions ADD COLUMN IF NOT EXISTS last_activity_at DOUBLE PRECISION",
+    f"ALTER TABLE {_SCHEMA}.sessions ADD COLUMN IF NOT EXISTS last_activity_description TEXT",
+    f"ALTER TABLE {_SCHEMA}.sessions ADD COLUMN IF NOT EXISTS last_activity_provenance TEXT",
+    f"ALTER TABLE {_SCHEMA}.sessions ADD COLUMN IF NOT EXISTS "
+    "compression_ineffective_count BIGINT NOT NULL DEFAULT 0",
+    f"ALTER TABLE {_SCHEMA}.sessions ADD COLUMN IF NOT EXISTS pinned BIGINT NOT NULL DEFAULT 0",
+    f"ALTER TABLE {_SCHEMA}.sessions ADD COLUMN IF NOT EXISTS hidden BIGINT NOT NULL DEFAULT 0",
+    f"ALTER TABLE {_SCHEMA}.sessions ADD COLUMN IF NOT EXISTS last_read_at DOUBLE PRECISION",
+    f"ALTER TABLE {_SCHEMA}.messages ADD COLUMN IF NOT EXISTS display_kind TEXT",
+    f"ALTER TABLE {_SCHEMA}.messages ADD COLUMN IF NOT EXISTS display_metadata TEXT",
+    # AE-183 owner identity (see the async_delegations DDL above). Legacy rows
+    # keep NULL, which the recovery pass reads as "legacy, same host".
     f"ALTER TABLE {_SCHEMA}.async_delegations ADD COLUMN IF NOT EXISTS "
     "owner_instance TEXT",
+    f"ALTER TABLE {_SCHEMA}.async_delegations ADD COLUMN IF NOT EXISTS "
+    "origin_session_id TEXT NOT NULL DEFAULT ''",
 ]
 
-# Data migration for the v19→v20 step (upstream cb7f6bbb2): seed one
-# session_model_usage row per historical session from the aggregate counters
-# already on the sessions row, so insights/analytics read uniformly from the
-# new table instead of showing nothing for pre-v20 sessions. Postgres port of
-# the SQLite ``INSERT OR IGNORE ... SELECT`` in hermes_state._init_schema.
-# ``ON CONFLICT DO NOTHING`` keeps it idempotent — a row already written by the
-# live accounting path always wins over the stale aggregate.
-PG_V20_USAGE_BACKFILL_SQL = f"""
-    INSERT INTO {_SCHEMA}.session_model_usage (
-        session_id, model, billing_provider, billing_base_url, billing_mode,
-        task, api_call_count, input_tokens, output_tokens, cache_read_tokens,
-        cache_write_tokens, reasoning_tokens, estimated_cost_usd,
-        actual_cost_usd, cost_status, cost_source, first_seen, last_seen
+# v25 adds a content-addressed system-prompt reference. Postgres lacks
+# ``ALTER TABLE ... ADD CONSTRAINT IF NOT EXISTS``, so the explicit migration
+# guards the semantic constraint in a DO block. Fresh databases get the same
+# constraint inline in PG_SCHEMA_SQL.
+PG_V26_CONSTRAINT_SQL: List[str] = [
+    f"""DO $$
+    BEGIN
+        IF NOT EXISTS (
+            SELECT 1
+            FROM pg_constraint
+            WHERE conname = 'sessions_system_prompt_hash_fkey'
+              AND conrelid = '{_SCHEMA}.sessions'::regclass
+        ) THEN
+            ALTER TABLE {_SCHEMA}.sessions
+            ADD CONSTRAINT sessions_system_prompt_hash_fkey
+            FOREIGN KEY (system_prompt_hash)
+            REFERENCES {_SCHEMA}.system_prompts(hash)
+            DEFERRABLE INITIALLY IMMEDIATE;
+        END IF;
+    END $$""",
+]
+
+# The v26 unique title index cannot be created until legacy duplicates are
+# repaired. Retain the newest session deterministically (started_at, then id)
+# and preserve every older session with a NULL alias.
+PG_V26_DEDUPLICATE_TITLES_SQL = f"""
+    WITH ranked AS (
+        SELECT id,
+               ROW_NUMBER() OVER (
+                   PARTITION BY title
+                   ORDER BY started_at DESC, id DESC
+               ) AS title_rank
+        FROM {_SCHEMA}.sessions
+        WHERE title IS NOT NULL
     )
-    SELECT id, COALESCE(model, 'unknown'),
-           COALESCE(billing_provider, ''),
-           COALESCE(billing_base_url, ''),
-           COALESCE(billing_mode, ''),
-           '',
-           COALESCE(api_call_count, 0),
-           COALESCE(input_tokens, 0),
-           COALESCE(output_tokens, 0),
-           COALESCE(cache_read_tokens, 0),
-           COALESCE(cache_write_tokens, 0),
-           COALESCE(reasoning_tokens, 0),
-           COALESCE(estimated_cost_usd, 0),
-           COALESCE(actual_cost_usd, 0),
-           cost_status, cost_source,
-           started_at, COALESCE(ended_at, started_at)
-    FROM {_SCHEMA}.sessions
-    WHERE COALESCE(input_tokens, 0) + COALESCE(output_tokens, 0)
-          + COALESCE(cache_read_tokens, 0) + COALESCE(cache_write_tokens, 0)
-          + COALESCE(reasoning_tokens, 0) > 0
-    ON CONFLICT DO NOTHING
+    UPDATE {_SCHEMA}.sessions AS session
+    SET title = NULL
+    FROM ranked
+    WHERE session.id = ranked.id
+      AND ranked.title_rank > 1
 """
+
+_REQUIRED_COLUMNS: Dict[str, frozenset[str]] = {
+    "schema_version": frozenset({"version"}),
+    "system_prompts": frozenset({"hash", "prompt"}),
+    "sessions": frozenset(
+        {
+            "id", "source", "user_id", "session_key", "chat_id",
+            "chat_type", "thread_id", "display_name", "origin_json",
+            "expiry_finalized", "model", "model_config", "system_prompt",
+            "system_prompt_hash", "parent_session_id", "started_at",
+            "ended_at", "end_reason", "message_count", "tool_call_count",
+            "input_tokens", "output_tokens", "cache_read_tokens",
+            "cache_write_tokens", "reasoning_tokens", "cwd", "git_branch",
+            "git_repo_root", "git_metadata_generation", "billing_provider",
+            "billing_base_url", "billing_mode", "estimated_cost_usd",
+            "actual_cost_usd", "cost_status", "cost_source",
+            "pricing_version", "title", "title_source", "last_activity_at",
+            "last_activity_description", "last_activity_provenance",
+            "api_call_count", "handoff_state", "handoff_platform",
+            "handoff_error", "compression_failure_cooldown_until",
+            "compression_failure_error", "compression_fallback_streak",
+            "compression_ineffective_count", "profile_name", "rewind_count",
+            "archived", "pinned", "hidden", "last_read_at",
+        }
+    ),
+    "messages": frozenset(
+        {
+            "id", "session_id", "role", "content", "tool_call_id",
+            "tool_calls", "tool_name", "effect_disposition", "timestamp",
+            "token_count", "finish_reason", "reasoning",
+            "reasoning_content", "reasoning_details",
+            "codex_reasoning_items", "codex_message_items",
+            "platform_message_id", "observed", "active", "compacted",
+            "api_content", "display_kind", "display_metadata",
+        }
+    ),
+    "session_model_usage": frozenset(
+        {
+            "session_id", "model", "billing_provider", "billing_base_url",
+            "billing_mode", "task", "api_call_count", "input_tokens",
+            "output_tokens", "cache_read_tokens", "cache_write_tokens",
+            "reasoning_tokens", "estimated_cost_usd", "actual_cost_usd",
+            "cost_status", "cost_source", "first_seen", "last_seen",
+        }
+    ),
+    "async_delegations": frozenset(
+        {
+            "delegation_id", "origin_session", "origin_ui_session_id",
+            "parent_session_id", "state", "dispatched_at", "completed_at",
+            "updated_at", "event_json", "result_json", "delivery_state",
+            "delivery_attempts", "delivered_at", "owner_pid",
+            "owner_started_at", "task_json", "delivery_claim",
+            "delivery_claimed_at", "owner_instance", "origin_session_id",
+        }
+    ),
+    "state_meta": frozenset({"key", "value"}),
+    "gateway_routing": frozenset(
+        {"scope", "session_key", "entry_json", "updated_at"}
+    ),
+    "gateway_hygiene_state": frozenset({"session_key", "failure_streak"}),
+    "compression_locks": frozenset(
+        {"session_id", "holder", "acquired_at", "expires_at"}
+    ),
+    "session_turn_leases": frozenset(
+        {"conversation_id", "holder", "acquired_at", "expires_at"}
+    ),
+    "telegram_dm_topic_mode": frozenset(
+        {
+            "chat_id", "user_id", "enabled", "activated_at", "updated_at",
+            "has_topics_enabled", "allows_users_to_create_topics",
+            "capability_checked_at", "intro_message_id", "pinned_message_id",
+        }
+    ),
+    "telegram_dm_topic_bindings": frozenset(
+        {
+            "chat_id", "thread_id", "user_id", "session_key", "session_id",
+            "managed_mode", "linked_at", "updated_at",
+        }
+    ),
+}
+
+# Exact catalog accepted by the one-shot migration preflight. These sets
+# describe the fork's audited v22 Postgres surface, including owner_instance
+# (the IdeaRoom async-delegation extension) and excluding every v23-v26
+# addition. A marker alone is not proof of shape: an interrupted/manual DDL
+# attempt can leave the marker at v22 while the catalog is already widened.
+_V22_REQUIRED_COLUMNS: Dict[str, frozenset[str]] = {
+    "schema_version": frozenset({"version"}),
+    "sessions": frozenset(
+        {
+            "id",
+            "source",
+            "user_id",
+            "session_key",
+            "chat_id",
+            "chat_type",
+            "thread_id",
+            "display_name",
+            "origin_json",
+            "expiry_finalized",
+            "model",
+            "model_config",
+            "system_prompt",
+            "parent_session_id",
+            "started_at",
+            "ended_at",
+            "end_reason",
+            "message_count",
+            "tool_call_count",
+            "input_tokens",
+            "output_tokens",
+            "cache_read_tokens",
+            "cache_write_tokens",
+            "reasoning_tokens",
+            "cwd",
+            "git_branch",
+            "git_repo_root",
+            "billing_provider",
+            "billing_base_url",
+            "billing_mode",
+            "estimated_cost_usd",
+            "actual_cost_usd",
+            "cost_status",
+            "cost_source",
+            "pricing_version",
+            "title",
+            "api_call_count",
+            "handoff_state",
+            "handoff_platform",
+            "handoff_error",
+            "compression_failure_cooldown_until",
+            "compression_failure_error",
+            "compression_fallback_streak",
+            "profile_name",
+            "rewind_count",
+            "archived",
+        }
+    ),
+    "messages": frozenset(
+        {
+            "id",
+            "session_id",
+            "role",
+            "content",
+            "tool_call_id",
+            "tool_calls",
+            "tool_name",
+            "effect_disposition",
+            "timestamp",
+            "token_count",
+            "finish_reason",
+            "reasoning",
+            "reasoning_content",
+            "reasoning_details",
+            "codex_reasoning_items",
+            "codex_message_items",
+            "platform_message_id",
+            "observed",
+            "active",
+            "compacted",
+            "api_content",
+        }
+    ),
+    "session_model_usage": frozenset(
+        {
+            "session_id",
+            "model",
+            "billing_provider",
+            "billing_base_url",
+            "billing_mode",
+            "task",
+            "api_call_count",
+            "input_tokens",
+            "output_tokens",
+            "cache_read_tokens",
+            "cache_write_tokens",
+            "reasoning_tokens",
+            "estimated_cost_usd",
+            "actual_cost_usd",
+            "cost_status",
+            "cost_source",
+            "first_seen",
+            "last_seen",
+        }
+    ),
+    "async_delegations": frozenset(
+        {
+            "delegation_id",
+            "origin_session",
+            "origin_ui_session_id",
+            "parent_session_id",
+            "state",
+            "dispatched_at",
+            "completed_at",
+            "updated_at",
+            "event_json",
+            "result_json",
+            "delivery_state",
+            "delivery_attempts",
+            "delivered_at",
+            "owner_pid",
+            "owner_started_at",
+            "task_json",
+            "delivery_claim",
+            "delivery_claimed_at",
+            "owner_instance",
+        }
+    ),
+    "state_meta": frozenset({"key", "value"}),
+    "gateway_routing": frozenset(
+        {"scope", "session_key", "entry_json", "updated_at"}
+    ),
+    "compression_locks": frozenset(
+        {"session_id", "holder", "acquired_at", "expires_at"}
+    ),
+    "telegram_dm_topic_mode": frozenset(
+        {
+            "chat_id",
+            "user_id",
+            "enabled",
+            "activated_at",
+            "updated_at",
+            "has_topics_enabled",
+            "allows_users_to_create_topics",
+            "capability_checked_at",
+            "intro_message_id",
+            "pinned_message_id",
+        }
+    ),
+    "telegram_dm_topic_bindings": frozenset(
+        {
+            "chat_id",
+            "thread_id",
+            "user_id",
+            "session_key",
+            "session_id",
+            "managed_mode",
+            "linked_at",
+            "updated_at",
+        }
+    ),
+}
+
+_REQUIRED_INDEXES = frozenset(
+    {
+        "idx_telegram_dm_topic_bindings_session",
+        "idx_telegram_dm_topic_bindings_user",
+        "idx_sessions_source",
+        "idx_sessions_source_id",
+        "idx_sessions_parent",
+        "idx_sessions_started",
+        "idx_messages_session",
+        "idx_messages_session_id",
+        "idx_messages_assistant_calls_by_session",
+        "idx_compression_locks_expires",
+        "idx_session_turn_leases_expires",
+        "idx_session_model_usage_session",
+        "idx_session_model_usage_model",
+        "idx_async_delegations_delivery",
+        "idx_messages_session_active",
+        "idx_messages_active_null",
+        "idx_sessions_session_key",
+        "idx_sessions_gateway_peer",
+        "idx_sessions_handoff_state",
+        "idx_sessions_system_prompt_hash",
+        "idx_sessions_title_unique",
+        "idx_messages_platform_msg_id",
+        "idx_messages_search_tsv",
+    }
+)
+
+_V22_REQUIRED_INDEXES = frozenset(
+    {
+        "idx_telegram_dm_topic_bindings_session",
+        "idx_telegram_dm_topic_bindings_user",
+        "idx_sessions_source",
+        "idx_sessions_source_id",
+        "idx_sessions_parent",
+        "idx_sessions_started",
+        "idx_messages_session",
+        "idx_compression_locks_expires",
+        "idx_session_model_usage_session",
+        "idx_session_model_usage_model",
+        "idx_async_delegations_delivery",
+        "idx_messages_session_active",
+        "idx_messages_active_null",
+        "idx_sessions_session_key",
+        "idx_sessions_gateway_peer",
+        "idx_sessions_handoff_state",
+        "idx_messages_platform_msg_id",
+        "idx_messages_search_tsv",
+    }
+)
+
+_REQUIRED_PRIMARY_KEYS = {
+    "system_prompts": ("hash",),
+    "sessions": ("id",),
+    "messages": ("id",),
+    "session_model_usage": (
+        "session_id", "model", "billing_provider", "billing_base_url",
+        "billing_mode", "task",
+    ),
+    "async_delegations": ("delegation_id",),
+    "state_meta": ("key",),
+    "gateway_routing": ("scope", "session_key"),
+    "gateway_hygiene_state": ("session_key",),
+    "compression_locks": ("session_id",),
+    "session_turn_leases": ("conversation_id",),
+    "telegram_dm_topic_mode": ("chat_id",),
+    "telegram_dm_topic_bindings": ("chat_id", "thread_id"),
+}
+
+_V22_REQUIRED_PRIMARY_KEYS = {
+    table: columns
+    for table, columns in _REQUIRED_PRIMARY_KEYS.items()
+    if table in _V22_REQUIRED_COLUMNS
+}
+
+_REQUIRED_FOREIGN_KEYS = frozenset(
+    {
+        ("sessions", "parent_session_id", "sessions", "id", "YES", "NO"),
+        (
+            "sessions", "system_prompt_hash", "system_prompts", "hash",
+            "YES", "NO",
+        ),
+        ("messages", "session_id", "sessions", "id", "YES", "NO"),
+        (
+            "session_model_usage", "session_id", "sessions", "id",
+            "YES", "NO",
+        ),
+        (
+            "telegram_dm_topic_bindings", "session_id", "sessions", "id",
+            "YES", "NO",
+        ),
+    }
+)
+
+_V22_REQUIRED_FOREIGN_KEYS = frozenset(
+    {
+        ("sessions", "parent_session_id", "sessions", "id", "YES", "NO"),
+        ("messages", "session_id", "sessions", "id", "YES", "NO"),
+        (
+            "session_model_usage",
+            "session_id",
+            "sessions",
+            "id",
+            "YES",
+            "NO",
+        ),
+        (
+            "telegram_dm_topic_bindings",
+            "session_id",
+            "sessions",
+            "id",
+            "YES",
+            "NO",
+        ),
+    }
+)
 
 # Best-effort statements: run after PG_SCHEMA_SQL, failures downgrade
 # gracefully (pg_trgm may be unavailable / unprivileged on some hosts; the
@@ -479,8 +866,24 @@ _JSON_EXTRACT_COALESCE_RE = re.compile(
 _JSON_EXTRACT_PLAIN_RE = re.compile(
     r"json_extract\(\s*([A-Za-z_][\w.]*)\s*,\s*'\$\.([A-Za-z_]\w*)'\s*\)"
 )
+_JSON_TYPE_SESSION_RESET_RE = re.compile(
+    r"json_type\(\s*sessions\.model_config\s*,\s*'\$\._reset_from'\s*\)"
+)
+_JSON_REMOVE_SESSION_RESET_RE = re.compile(
+    r"json_remove\(\s*sessions\.model_config\s*,\s*'\$\._reset_from'\s*\)"
+)
+_JSON_SET_EXCLUDED_RESET_RE = re.compile(
+    r"json_set\(\s*excluded\.model_config\s*,\s*'\$\._reset_from'\s*,\s*"
+    r"json_extract\(\s*sessions\.model_config\s*,\s*'\$\._reset_from'\s*\)\s*\)"
+)
+_JSON_SET_CHILD_RESET_RE = re.compile(
+    r"json_set\(\s*COALESCE\(\s*child\.model_config\s*,\s*'\{\}'\s*\)\s*,\s*"
+    r"'\$\._reset_from'\s*,\s*child\.parent_session_id\s*\)"
+)
 _INSERT_OR_IGNORE_RE = re.compile(r"^(\s*)INSERT\s+OR\s+IGNORE\s+INTO\b", re.IGNORECASE)
 _LIKE_RE = re.compile(r"\bLIKE\b")
+_IS_NOT_QMARK_RE = re.compile(r"\bIS\s+NOT\s+\?", re.IGNORECASE)
+_IS_QMARK_RE = re.compile(r"\bIS\s+\?", re.IGNORECASE)
 _INSERT_MESSAGES_RE = re.compile(r"^\s*INSERT\s+INTO\s+messages\s*\(", re.IGNORECASE)
 
 # ── Whole-statement overrides ──────────────────────────────────────────────
@@ -600,6 +1003,25 @@ def _translate_sql(sql: str, *, with_params: bool) -> str:
         + "'",
         sql,
     )
+    # v26 preserves reset lineage inside model_config. SQLite's JSON1 names
+    # have no PostgreSQL equivalents, so port the two exact runtime shapes
+    # before the broader scalar json_extract rewrite below.
+    sql = _JSON_SET_EXCLUDED_RESET_RE.sub(
+        "jsonb_set(excluded.model_config::jsonb, '{_reset_from}', "
+        "sessions.model_config::jsonb -> '_reset_from', true)::text",
+        sql,
+    )
+    sql = _JSON_SET_CHILD_RESET_RE.sub(
+        "jsonb_set(COALESCE(child.model_config, '{}')::jsonb, "
+        "'{_reset_from}', to_jsonb(child.parent_session_id), true)::text",
+        sql,
+    )
+    sql = _JSON_TYPE_SESSION_RESET_RE.sub(
+        "(sessions.model_config::jsonb -> '_reset_from')", sql
+    )
+    sql = _JSON_REMOVE_SESSION_RESET_RE.sub(
+        "(sessions.model_config::jsonb - '_reset_from')", sql
+    )
     sql = _JSON_EXTRACT_COALESCE_RE.sub(
         r"(COALESCE(\1, '{}')::jsonb ->> '\2')", sql
     )
@@ -611,6 +1033,12 @@ def _translate_sql(sql: str, *, with_params: bool) -> str:
             out.append(seg.replace("%", "%%") if with_params else seg)
             continue
         seg = _LIKE_RE.sub("ILIKE", seg)
+        # SQLite's ``expr IS ?`` / ``IS NOT ?`` are null-safe equality /
+        # inequality. PostgreSQL only accepts literal NULL/TRUE/FALSE after
+        # IS, so preserve the semantics with its null-safe operators before
+        # converting qmark placeholders.
+        seg = _IS_NOT_QMARK_RE.sub("IS DISTINCT FROM ?", seg)
+        seg = _IS_QMARK_RE.sub("IS NOT DISTINCT FROM ?", seg)
         if with_params:
             seg = seg.replace("%", "%%").replace("?", "%s")
         out.append(seg)
@@ -786,9 +1214,23 @@ class _TxnConn:
 
     def __init__(self, raw) -> None:
         self._raw = raw
+        self._last_change_count = 0
 
     def execute(self, sql: str, params=None) -> _Result:
-        return _run_statement(self._raw, sql, params)
+        if sql.strip().rstrip(";").lower() == "select changes()":
+            return _Result(
+                [_Row(["changes()"], (self._last_change_count,))],
+                rowcount=1,
+                lastrowid=None,
+            )
+        result = _run_statement(self._raw, sql, params)
+        statement = sql.lstrip().upper()
+        if statement.startswith(("INSERT", "UPDATE", "DELETE", "REPLACE")) or (
+            statement.startswith("WITH")
+            and re.search(r"\b(?:INSERT|UPDATE|DELETE)\b", statement)
+        ):
+            self._last_change_count = max(0, int(result.rowcount))
+        return result
 
     def executemany(self, sql: str, seq_of_params) -> None:
         import psycopg
@@ -875,6 +1317,7 @@ class PgSessionDB(SessionDB):
         dsn: Optional[str] = None,
         min_pool: int = 1,
         max_pool: int = 8,
+        allow_schema_migration: bool = False,
     ) -> None:
         # No super().__init__() — the SQLite constructor is all file/WAL
         # machinery. Replicate the instance attributes inherited methods use.
@@ -887,7 +1330,7 @@ class PgSessionDB(SessionDB):
 
         # Vestigial on Postgres; kept because a few local-CLI callers read
         # ``db.db_path`` for display. No SQLite I/O ever happens through it.
-        self.db_path = db_path or DEFAULT_DB_PATH
+        self.db_path = db_path or hermes_state._default_db_path()
         self.read_only = read_only
         # Reentrant: inherited read paths take ``with self._lock`` around
         # what is now a per-statement pooled checkout.
@@ -896,10 +1339,24 @@ class PgSessionDB(SessionDB):
         # tsvector search is always available; the ILIKE CJK path replaces
         # the trigram FTS5 table (works with or without pg_trgm).
         self._fts_enabled = True
+        self._fts_stale = False
         self._trigram_available = True
+        self._fts_cjk_available = False
         self._fts_unavailable_warned = False
         self._trigram_unavailable_warned = False
         self._closed = False
+        self._allow_schema_migration = bool(allow_schema_migration)
+        self._message_columns_cache: Optional[List[str]] = None
+        self._storage_attestation: Optional[Dict[str, Any]] = None
+        # Inherited async token-accounting methods require the same lifecycle
+        # state as SessionDB. The writer is backend-agnostic; only its writes
+        # flow through our Postgres transaction seam below.
+        self._token_queue: deque = deque()
+        self._token_queue_cond = threading.Condition(threading.Lock())
+        self._token_writer_thread: Optional[threading.Thread] = None
+        self._token_writer_stop = False
+        self._token_writer_busy = False
+        self._token_atexit_hook: Optional[Callable[[], None]] = None
 
         # Lazy imports — only the Postgres path needs psycopg installed.
         from psycopg import ClientCursor
@@ -933,6 +1390,14 @@ class PgSessionDB(SessionDB):
             raise
         self._conn = _PoolConn(self._pool)
 
+    def storage_attestation(self) -> Dict[str, Any]:
+        """Return the verified, non-secret storage identity for health checks."""
+        if self._storage_attestation is None:
+            raise RuntimeError(
+                "Postgres session-store attestation requested before schema verification"
+            )
+        return dict(self._storage_attestation)
+
     # ── Schema ──────────────────────────────────────────────────────────
 
     # Serializes concurrent cold-boot bootstrap (see _init_pg_schema).
@@ -944,26 +1409,68 @@ class PgSessionDB(SessionDB):
     )
 
     def _init_pg_schema(self) -> None:
-        # Two gateway tasks can construct PgSessionDB concurrently against
-        # the same database (the blue/green overlap window of ADR 0177, or a
-        # service scaling from zero). Postgres CREATE TABLE IF NOT EXISTS is
-        # not concurrency-safe when the table genuinely doesn't exist yet
-        # (both creators race in pg_type: "duplicate key value violates
-        # unique constraint pg_type_typname_nsp_index"), and the
-        # schema_version seed below is check-then-insert. Serialize the whole
-        # bootstrap behind a session advisory lock; after first boot the lock
-        # is held only for the duration of no-op IF NOT EXISTS statements.
+        """Create, verify, or explicitly migrate the Postgres schema.
+
+        The advisory lock serializes cold starts and the one-shot migration.
+        Existing stores are inspected before any DDL: ordinary boot against
+        v22 or a drifted v26 catalog is observation-only and fails closed.
+        """
         with self._pool.connection() as conn:
             conn.execute(
                 "SELECT pg_advisory_lock(%s)", (self._BOOTSTRAP_LOCK_KEY,)
             )
             try:
-                for stmt in PG_SCHEMA_SQL:
-                    conn.execute(stmt)
-                # Additive column migration for databases created by an
-                # earlier audited schema (see PG_EXPAND_SQL).
-                for stmt in PG_EXPAND_SQL:
-                    conn.execute(stmt)
+                namespace = conn.execute(
+                    "SELECT to_regnamespace(%s)", (_SCHEMA,)
+                ).fetchone()
+                schema_exists = bool(namespace and namespace[0] is not None)
+
+                if self._allow_schema_migration and not schema_exists:
+                    raise RuntimeError(
+                        "Postgres v22→v26 migration requires an existing "
+                        "hermes_state schema at the audited v22 shape; refusing "
+                        "to initialize an empty database in migration mode."
+                    )
+
+                with conn.transaction():
+                    if not schema_exists:
+                        self._create_fresh_schema(conn)
+                    else:
+                        version_table = conn.execute(
+                            "SELECT to_regclass(%s)",
+                            (f"{_SCHEMA}.schema_version",),
+                        ).fetchone()
+                        if not version_table or version_table[0] is None:
+                            raise RuntimeError(
+                                "Postgres session-store schema exists but its "
+                                "schema_version table is missing; refusing to "
+                                "repair an ambiguous partial store."
+                            )
+                        db_version = self._read_schema_version(conn)
+                        if self._allow_schema_migration:
+                            # _migrate_v22_to_v26 performs the complete,
+                            # observation-only v22 preflight before its first
+                            # DDL statement. Migration mode is intentionally
+                            # not an idempotent "ensure current" operation: a
+                            # wrong DSN pointing at v26 must fail too.
+                            self._migrate_v22_to_v26(conn)
+                        elif db_version == EXPECTED_SCHEMA_VERSION:
+                            self._assert_persisted_schema_markers(conn)
+                            self._verify_catalog(conn)
+                        else:
+                            # Stable fail-closed errors (including the explicit
+                            # drain instruction for v22) live at this seam.
+                            self._assert_persisted_schema_markers(conn)
+
+                self._storage_attestation = {
+                    "backend": "postgres",
+                    "schema_version": EXPECTED_SCHEMA_VERSION,
+                    "surface_marker": EXPECTED_SCHEMA_SURFACE_SHA256,
+                }
+
+                # Search acceleration is optional and outside the correctness
+                # transaction: an unavailable extension degrades to ILIKE and
+                # can never roll back a verified schema.
                 for stmt in PG_TRGM_SQL:
                     try:
                         conn.execute(stmt)
@@ -974,7 +1481,6 @@ class PgSessionDB(SessionDB):
                             exc,
                         )
                         break
-                self._assert_persisted_schema_markers(conn)
             finally:
                 try:
                     conn.execute(
@@ -988,131 +1494,349 @@ class PgSessionDB(SessionDB):
                         exc_info=True,
                     )
 
-    def _assert_persisted_schema_markers(self, conn) -> None:
-        """Record/verify/advance the schema version + surface hash in Postgres.
+    def _create_fresh_schema(self, conn) -> None:
+        for stmt in PG_SCHEMA_SQL:
+            conn.execute(stmt)
+        conn.execute(
+            f"INSERT INTO {_SCHEMA}.schema_version (version) VALUES (%s)",
+            (EXPECTED_SCHEMA_VERSION,),
+        )
+        conn.execute(
+            f"INSERT INTO {_SCHEMA}.state_meta (key, value) VALUES (%s, %s)",
+            (_META_SURFACE_KEY, EXPECTED_SCHEMA_SURFACE_SHA256),
+        )
+        self._assert_persisted_schema_markers(conn)
+        self._verify_catalog(conn)
 
-        Guards the other half of the drift matrix: this *database* was
-        initialized by a build pinned to a specific upstream schema. A build
-        pinned to a different one must not write into it silently — schema
-        moves need a deliberate expand/contract migration (ADR 0177).
-
-        When the persisted markers name an explicitly audited, purely additive
-        predecessor (v19 → v22, AE-182), the expand DDL has already been
-        applied by ``_init_pg_schema`` above and this method finishes the
-        migration: it runs the version-gated data backfills and advances the
-        markers. Every other value still fails closed.
-        """
+    @staticmethod
+    def _read_surface_marker(conn) -> Optional[str]:
         row = conn.execute(
-            f"SELECT version FROM {_SCHEMA}.schema_version LIMIT 1"
+            f"SELECT value FROM {_SCHEMA}.state_meta WHERE key = %s",
+            (_META_SURFACE_KEY,),
         ).fetchone()
-        if row is None:
-            conn.execute(
-                f"INSERT INTO {_SCHEMA}.schema_version (version) VALUES (%s)",
-                (EXPECTED_SCHEMA_VERSION,),
+        return None if row is None else str(row[0])
+
+    @staticmethod
+    def _read_schema_version(conn) -> int:
+        row = conn.execute(
+            f"SELECT COUNT(*), MIN(version), MAX(version) "
+            f"FROM {_SCHEMA}.schema_version"
+        ).fetchone()
+        if row is None or int(row[0]) != 1 or row[1] != row[2]:
+            count = 0 if row is None else int(row[0])
+            if count == 0:
+                raise RuntimeError(
+                    "Postgres session store is missing schema_version; "
+                    "refusing to infer it."
+                )
+            raise RuntimeError(
+                "Postgres session store must contain exactly one "
+                f"schema_version row (found {count}); refusing to infer it."
             )
-        else:
-            db_version = int(row[0])
-            if db_version != EXPECTED_SCHEMA_VERSION:
-                if db_version not in _UPGRADEABLE_FROM_SCHEMA_VERSIONS:
-                    raise RuntimeError(
-                        f"Postgres session store schema_version is {db_version}, "
-                        f"but this build expects {EXPECTED_SCHEMA_VERSION}. A "
-                        "different hermes build initialized this database — ship "
-                        "an explicit migration (ADR 0177 expand/contract) before "
-                        "pointing this build at it."
-                    )
-                self._apply_version_data_migrations(conn, db_version)
+        return int(row[1])
+
+    def _migrate_v22_to_v26(self, conn) -> None:
+        """Run the drained, transactional v22→v26 migration."""
+        self._assert_v22_migration_precondition(conn)
+
+        # Tables precede column expansion; indexes follow duplicate repair.
+        for stmt in PG_SCHEMA_SQL:
+            if "CREATE TABLE" in stmt or "CREATE SCHEMA" in stmt:
+                conn.execute(stmt)
+        for stmt in PG_EXPAND_SQL:
+            conn.execute(stmt)
+        for stmt in PG_V26_CONSTRAINT_SQL:
+            conn.execute(stmt)
+        self._migrate_system_prompts(conn)
+        conn.execute(PG_V26_DEDUPLICATE_TITLES_SQL)
+        for stmt in PG_SCHEMA_SQL:
+            if " INDEX " in stmt:
+                conn.execute(stmt)
+
+        # Validate the live transaction's catalog before claiming v26.
+        self._verify_catalog(conn)
+        conn.execute(
+            f"UPDATE {_SCHEMA}.schema_version SET version = %s",
+            (EXPECTED_SCHEMA_VERSION,),
+        )
+        conn.execute(
+            f"UPDATE {_SCHEMA}.state_meta SET value = %s WHERE key = %s",
+            (EXPECTED_SCHEMA_SURFACE_SHA256, _META_SURFACE_KEY),
+        )
+        self._assert_persisted_schema_markers(conn)
+
+    @staticmethod
+    def _assert_v22_migration_precondition(conn) -> None:
+        """Require the one exact source state accepted by the migration.
+
+        This method is observation-only and must remain ahead of every DDL
+        statement in :meth:`_migrate_v22_to_v26`. It is also reused by the
+        migration command's read-only dry-run.
+        """
+        db_version = PgSessionDB._read_schema_version(conn)
+        if db_version != 22:
+            raise RuntimeError(
+                "Postgres v22→v26 migration requires schema_version 22 "
+                f"exactly (found {db_version}); refusing to mutate this store."
+            )
+        surface = PgSessionDB._read_surface_marker(conn)
+        if surface != _V22_SCHEMA_SURFACE_SHA256:
+            raise RuntimeError(
+                "Refusing v22→v26 migration: persisted v22 schema surface "
+                f"is {surface!r}, expected {_V22_SCHEMA_SURFACE_SHA256}."
+            )
+        PgSessionDB._verify_catalog_shape(
+            conn,
+            required_columns=_V22_REQUIRED_COLUMNS,
+            required_indexes=_V22_REQUIRED_INDEXES,
+            required_primary_keys=_V22_REQUIRED_PRIMARY_KEYS,
+            required_foreign_keys=_V22_REQUIRED_FOREIGN_KEYS,
+            label="v22 migration source",
+            exact_relations=True,
+        )
+
+    @staticmethod
+    def _migrate_system_prompts(conn) -> None:
+        cursor = conn.execute(
+            f"SELECT id, system_prompt FROM {_SCHEMA}.sessions "
+            "WHERE system_prompt IS NOT NULL ORDER BY id"
+        )
+        while True:
+            rows = cursor.fetchmany(250)
+            if not rows:
+                return
+            for session_id, prompt in rows:
+                prompt_hash = hashlib.sha256(str(prompt).encode("utf-8")).hexdigest()
                 conn.execute(
-                    f"UPDATE {_SCHEMA}.schema_version SET version = %s",
-                    (EXPECTED_SCHEMA_VERSION,),
+                    f"INSERT INTO {_SCHEMA}.system_prompts (hash, prompt) "
+                    "VALUES (%s, %s) ON CONFLICT (hash) DO NOTHING",
+                    (prompt_hash, prompt),
                 )
-                logger.warning(
-                    "Postgres session store expanded from schema v%s to v%s "
-                    "(additive columns/tables applied; AE-182)",
-                    db_version,
-                    EXPECTED_SCHEMA_VERSION,
+                conn.execute(
+                    f"UPDATE {_SCHEMA}.sessions "
+                    "SET system_prompt_hash = %s, system_prompt = NULL "
+                    "WHERE id = %s",
+                    (prompt_hash, session_id),
                 )
+
+    @staticmethod
+    def _verify_catalog(conn) -> None:
+        """Prove every required v26 table/column/index/FK exists."""
+        PgSessionDB._verify_catalog_shape(
+            conn,
+            required_columns=_REQUIRED_COLUMNS,
+            required_indexes=_REQUIRED_INDEXES,
+            required_primary_keys=_REQUIRED_PRIMARY_KEYS,
+            required_foreign_keys=_REQUIRED_FOREIGN_KEYS,
+            label="v26",
+            exact_relations=True,
+        )
+
+    @staticmethod
+    def _verify_catalog_shape(
+        conn,
+        *,
+        required_columns: Dict[str, frozenset[str]],
+        required_indexes: frozenset[str],
+        required_primary_keys: Dict[str, tuple[str, ...]],
+        required_foreign_keys: frozenset[tuple[str, ...]],
+        label: str,
+        exact_relations: bool,
+    ) -> None:
+        """Verify a named Postgres catalog surface without mutating it."""
+        column_rows = conn.execute(
+            "SELECT table_name, column_name FROM information_schema.columns "
+            "WHERE table_schema = %s",
+            (_SCHEMA,),
+        ).fetchall()
+        actual_columns: Dict[str, set[str]] = {}
+        for table, column in column_rows:
+            actual_columns.setdefault(str(table), set()).add(str(column))
+
+        problems: List[str] = []
+        if exact_relations:
+            expected_tables = set(required_columns)
+            actual_tables = set(actual_columns)
+            if actual_tables != expected_tables:
+                missing_tables = sorted(expected_tables.difference(actual_tables))
+                unexpected_tables = sorted(actual_tables.difference(expected_tables))
+                if missing_tables:
+                    problems.append(f"missing tables {missing_tables}")
+                if unexpected_tables:
+                    problems.append(f"unexpected tables {unexpected_tables}")
+
+        for table, required in required_columns.items():
+            actual = actual_columns.get(table, set())
+            missing = required.difference(actual_columns.get(table, set()))
+            if missing:
+                problems.append(f"{table} missing columns {sorted(missing)}")
+            if exact_relations:
+                unexpected = actual.difference(required)
+                if unexpected:
+                    problems.append(
+                        f"{table} has unexpected columns {sorted(unexpected)}"
+                    )
+
+        index_rows = conn.execute(
+            "SELECT indexname FROM pg_indexes WHERE schemaname = %s",
+            (_SCHEMA,),
+        ).fetchall()
+        actual_indexes = {str(row[0]) for row in index_rows}
+        missing_indexes = required_indexes.difference(actual_indexes)
+        if missing_indexes:
+            problems.append(f"missing indexes {sorted(missing_indexes)}")
+
+        primary_key_rows = conn.execute(
+            "SELECT constraint_table.table_name, constraint_column.column_name, "
+            "constraint_column.ordinal_position "
+            "FROM information_schema.table_constraints AS constraint_table "
+            "JOIN information_schema.key_column_usage AS constraint_column "
+            "ON constraint_column.constraint_schema = constraint_table.constraint_schema "
+            "AND constraint_column.constraint_name = constraint_table.constraint_name "
+            "WHERE constraint_table.constraint_schema = %s "
+            "AND constraint_table.constraint_type = 'PRIMARY KEY' "
+            "ORDER BY constraint_table.table_name, constraint_column.ordinal_position",
+            (_SCHEMA,),
+        ).fetchall()
+        actual_primary_keys: Dict[str, List[tuple[int, str]]] = {}
+        for table, column, ordinal in primary_key_rows:
+            actual_primary_keys.setdefault(str(table), []).append(
+                (int(ordinal), str(column))
+            )
+        normalized_primary_keys = {
+            table: tuple(column for _, column in sorted(columns))
+            for table, columns in actual_primary_keys.items()
+        }
+        for table, expected_key_columns in required_primary_keys.items():
+            if normalized_primary_keys.get(table) != expected_key_columns:
+                problems.append(
+                    f"{table} primary key is "
+                    f"{normalized_primary_keys.get(table)}, "
+                    f"expected {expected_key_columns}"
+                )
+
+        foreign_key_rows = conn.execute(
+            "SELECT constraint_table.table_name, constraint_column.column_name, "
+            "referenced_table.table_name, referenced_column.column_name, "
+            "constraint_table.is_deferrable, constraint_table.initially_deferred "
+            "FROM information_schema.table_constraints AS constraint_table "
+            "JOIN information_schema.key_column_usage AS constraint_column "
+            "ON constraint_column.constraint_schema = constraint_table.constraint_schema "
+            "AND constraint_column.constraint_name = constraint_table.constraint_name "
+            "JOIN information_schema.referential_constraints AS reference_constraint "
+            "ON reference_constraint.constraint_schema = constraint_table.constraint_schema "
+            "AND reference_constraint.constraint_name = constraint_table.constraint_name "
+            "JOIN information_schema.key_column_usage AS referenced_column "
+            "ON referenced_column.constraint_schema = "
+            "reference_constraint.unique_constraint_schema "
+            "AND referenced_column.constraint_name = "
+            "reference_constraint.unique_constraint_name "
+            "AND referenced_column.ordinal_position = constraint_column.position_in_unique_constraint "
+            "JOIN information_schema.table_constraints AS referenced_table "
+            "ON referenced_table.constraint_schema = referenced_column.constraint_schema "
+            "AND referenced_table.constraint_name = referenced_column.constraint_name "
+            "WHERE constraint_table.constraint_schema = %s "
+            "AND constraint_table.constraint_type = 'FOREIGN KEY'",
+            (_SCHEMA,),
+        ).fetchall()
+        actual_foreign_keys = {
+            tuple(str(value) for value in row) for row in foreign_key_rows
+        }
+        missing_foreign_keys = required_foreign_keys.difference(
+            actual_foreign_keys
+        )
+        if missing_foreign_keys:
+            problems.append(
+                f"missing foreign keys {sorted(missing_foreign_keys)}"
+            )
+
+        if problems:
+            raise RuntimeError(
+                f"Postgres session-store {label} catalog verification failed: "
+                + "; ".join(problems)
+            )
+
+    def _assert_persisted_schema_markers(self, conn) -> None:
+        """Verify persisted markers without mutating them.
+
+        Fresh-store marker creation and the explicit v22→v26 transition live
+        on separate paths. Keeping this runtime gate observation-only prevents
+        an ordinary task boot from partly widening a v22 database before it
+        refuses to serve it.
+        """
+        db_version = self._read_schema_version(conn)
+        if db_version != EXPECTED_SCHEMA_VERSION:
+            if db_version == 22:
+                raise RuntimeError(
+                    "Postgres session store schema migration required "
+                    "(v22→v26). Drain every gateway task to zero and run the "
+                    "explicit migration before starting this image."
+                )
+            raise RuntimeError(
+                f"Postgres session store schema_version is {db_version}, but "
+                f"this build expects {EXPECTED_SCHEMA_VERSION}. Refusing to "
+                "write into a store owned by a different Hermes build."
+            )
         row = conn.execute(
             f"SELECT value FROM {_SCHEMA}.state_meta WHERE key = %s",
             (_META_SURFACE_KEY,),
         ).fetchone()
         if row is None:
-            conn.execute(
-                f"INSERT INTO {_SCHEMA}.state_meta (key, value) VALUES (%s, %s) "
-                "ON CONFLICT (key) DO NOTHING",
-                (_META_SURFACE_KEY, EXPECTED_SCHEMA_SURFACE_SHA256),
+            raise RuntimeError(
+                "Postgres session store is missing its schema surface marker; "
+                "refusing to infer or repair it during runtime boot."
             )
-        elif row[0] != EXPECTED_SCHEMA_SURFACE_SHA256:
-            if row[0] in _COMPATIBLE_PREVIOUS_SCHEMA_SURFACE_SHA256:
-                # _init_pg_schema applies all additive DDL before reaching this
-                # marker check, and the enclosing advisory lock serializes
-                # blue/green bootstraps, so advancing here is safe. Rollback
-                # note: no build between this one and the audited v19
-                # predecessor can use the Postgres store at all (they trip
-                # assert_schema_compat and fall back to local SQLite), so
-                # holding the marker back would protect nothing and would hide
-                # genuine future drift.
-                logger.warning(
-                    "advancing Postgres session-store schema surface marker "
-                    "%s -> %s after applying the audited additive DDL",
-                    row[0],
-                    EXPECTED_SCHEMA_SURFACE_SHA256,
-                )
-                conn.execute(
-                    f"UPDATE {_SCHEMA}.state_meta SET value = %s WHERE key = %s",
-                    (EXPECTED_SCHEMA_SURFACE_SHA256, _META_SURFACE_KEY),
-                )
-            else:
-                raise RuntimeError(
-                    "Postgres session store was initialized against a different "
-                    f"upstream schema surface (db={row[0]}, "
-                    f"build={EXPECTED_SCHEMA_SURFACE_SHA256}). Rebase drift — "
-                    "re-audit hermes_state_pg.py and migrate deliberately."
-                )
-
-    def _apply_version_data_migrations(self, conn, db_version: int) -> None:
-        """Row backfills for the version-gated steps this build can expand.
-
-        Mirrors the ``if current_version < N`` chain in
-        ``hermes_state.SessionDB._init_schema``, restricted to the steps whose
-        data actually lives in the Postgres store. Best-effort by design (same
-        as upstream): a failed analytics backfill must never keep the session
-        store from booting, because the alternative is another silent fallback
-        to the local SQLite file.
-        """
-        if db_version < 20:
-            try:
-                conn.execute(PG_V20_USAGE_BACKFILL_SQL)
-            except Exception:
-                logger.warning(
-                    "v20 session_model_usage backfill skipped on the Postgres "
-                    "session store; historical per-model analytics may be "
-                    "incomplete",
-                    exc_info=True,
-                )
-        # v21 (async_delegations) needs no backfill: AE-183 moved the durable
-        # delegation rows onto this store going forward, and the rows a
-        # pre-AE-183 build left in the node-local SQLite state.db are terminal
-        # or abandoned by the time that node is gone — migrating them would
-        # re-deliver stale completions into live chats.
-        # v22 (session_model_usage.task in the PRIMARY KEY) needs no rebuild
-        # here: Postgres never held a v20/v21 shape of that table — it is
-        # created at the terminal v22 shape by PG_SCHEMA_SQL.
+        if row[0] != EXPECTED_SCHEMA_SURFACE_SHA256:
+            raise RuntimeError(
+                "Postgres session store was initialized against a different "
+                f"upstream schema surface (db={row[0]}, "
+                f"build={EXPECTED_SCHEMA_SURFACE_SHA256}). Rebase drift — "
+                "re-audit hermes_state_pg.py and migrate deliberately."
+            )
 
     def _init_schema(self) -> None:  # pragma: no cover - safety net
         self._init_pg_schema()
 
+    @contextmanager
+    def _read_ctx(self):
+        """Hold one pooled connection for a complete logical read operation."""
+        with self._pool.connection() as raw:
+            with raw.transaction():
+                yield _TxnConn(raw)
+
     # ── Write executor ──────────────────────────────────────────────────
 
-    def _execute_write(self, fn: Callable[[Any], T]) -> T:
+    def _execute_write(
+        self,
+        fn: Callable[[Any], T],
+        patience_s: Optional[float] = None,
+    ) -> T:
         """One transaction per write closure, with deadlock retry.
 
         Replaces SQLite's BEGIN IMMEDIATE + busy-retry: Postgres MVCC makes
         writer convoys structurally impossible; only deadlocks/serialization
         failures are worth retrying.
         """
-        last_err: Optional[Exception] = None
-        for attempt in range(self._WRITE_MAX_RETRIES):
+        if patience_s is None:
+            patience_s = self._WRITE_PATIENCE_S
+        deadline = time.monotonic() + max(0.0, float(patience_s))
+
+        def _sleep_before_retry() -> bool:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            time.sleep(
+                min(
+                    remaining,
+                    random.uniform(
+                        self._WRITE_RETRY_MIN_S,
+                        self._WRITE_RETRY_MAX_S,
+                    ),
+                )
+            )
+            return True
+
+        while True:
             try:
                 with self._pool.connection() as raw:
                     with raw.transaction():
@@ -1120,35 +1844,55 @@ class PgSessionDB(SessionDB):
                 self._write_count += 1
                 return result
             except sqlite3.Error as exc:
-                if _is_retryable_pg_error(exc) and attempt < self._WRITE_MAX_RETRIES - 1:
-                    last_err = exc
-                    time.sleep(
-                        random.uniform(
-                            self._WRITE_RETRY_MIN_S, self._WRITE_RETRY_MAX_S
-                        )
-                    )
+                if _is_retryable_pg_error(exc) and _sleep_before_retry():
                     continue
                 raise
             except Exception as exc:
                 import psycopg
 
                 if isinstance(exc, psycopg.Error):
-                    raise _translate_exception(exc) from exc
+                    translated = _translate_exception(exc)
+                    if (
+                        _is_retryable_pg_error(translated)
+                        and _sleep_before_retry()
+                    ):
+                        continue
+                    raise translated from exc
                 raise
-        raise last_err or sqlite3.OperationalError(
-            "postgres write failed after max retries"
-        )
 
     # ── Lifecycle / SQLite maintenance obsoleted by Postgres ────────────
 
     def close(self) -> None:
         if self._closed:
             return
+        self._stop_token_writer()
+        hook, self._token_atexit_hook = self._token_atexit_hook, None
+        if hook is not None:
+            hermes_state.atexit.unregister(hook)
         self._closed = True
+        self._conn = None
         try:
             self._pool.close()
         except Exception:
             pass
+
+    @staticmethod
+    def _lock_holder_process_is_dead(holder: str) -> bool:
+        """Distributed Postgres leases recover by TTL, never local PID probes."""
+        return False
+
+    def _message_column_names(self, conn) -> List[str]:
+        """Return Postgres message columns in physical order, cached per handle."""
+        if self._message_columns_cache:
+            return self._message_columns_cache
+        rows = conn.execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_schema = ? AND table_name = 'messages' "
+            "ORDER BY ordinal_position",
+            (_SCHEMA,),
+        ).fetchall()
+        self._message_columns_cache = [str(row[0]) for row in rows]
+        return self._message_columns_cache
 
     def _try_wal_checkpoint(self) -> None:
         pass
@@ -1230,7 +1974,7 @@ class PgSessionDB(SessionDB):
             pending_op = None
         return " ".join(parts)
 
-    def search_messages(
+    def _search_messages_impl(
         self,
         query: str,
         source_filter: List[str] = None,
@@ -1240,6 +1984,7 @@ class PgSessionDB(SessionDB):
         offset: int = 0,
         sort: str = None,
         include_inactive: bool = False,
+        fields: Optional[Collection[str]] = None,
     ) -> List[Dict[str, Any]]:
         """Postgres port of :meth:`SessionDB.search_messages`.
 
@@ -1248,6 +1993,7 @@ class PgSessionDB(SessionDB):
         paths (ILIKE substring match has no 3-char minimum, so short-CJK
         queries take the same path as long ones).
         """
+        result_fields = self._search_message_fields(fields)
         if not query or not query.strip():
             return []
         sanitized = self._sanitize_fts5_query(query)
@@ -1375,62 +2121,54 @@ class PgSessionDB(SessionDB):
             for m in matches:
                 m.pop("_score", None)
 
-        # Surrounding context (1 message before/after), then strip content —
-        # same shape as the SQLite implementation.
-        for match in matches:
-            try:
-                rows = self._conn.execute(
-                    """WITH target AS (
-                           SELECT session_id, timestamp, id
-                           FROM messages
-                           WHERE id = ?
-                       )
-                       SELECT role, content FROM (
-                           SELECT m.id, m.timestamp, m.role, m.content
-                           FROM messages m
-                           JOIN target t ON t.session_id = m.session_id
-                           WHERE (m.timestamp < t.timestamp)
-                              OR (m.timestamp = t.timestamp AND m.id < t.id)
-                           ORDER BY m.timestamp DESC, m.id DESC
-                           LIMIT 1
-                       ) prev_msg
-                       UNION ALL
-                       SELECT role, content FROM messages WHERE id = ?
-                       UNION ALL
-                       SELECT role, content FROM (
-                           SELECT m.id, m.timestamp, m.role, m.content
-                           FROM messages m
-                           JOIN target t ON t.session_id = m.session_id
-                           WHERE (m.timestamp > t.timestamp)
-                              OR (m.timestamp = t.timestamp AND m.id > t.id)
-                           ORDER BY m.timestamp ASC, m.id ASC
-                           LIMIT 1
-                       ) next_msg""",
-                    (match["id"], match["id"]),
-                ).fetchall()
-                context_msgs = []
-                for r in rows:
-                    decoded = self._decode_content(r["content"])
-                    if isinstance(decoded, list):
-                        text_parts = [
-                            p.get("text", "")
-                            for p in decoded
-                            if isinstance(p, dict) and p.get("type") == "text"
-                        ]
-                        text = " ".join(t for t in text_parts if t).strip()
-                        preview = text or "[multimodal content]"
-                    elif isinstance(decoded, str):
-                        preview = decoded
-                    else:
-                        preview = ""
-                    context_msgs.append(
-                        {"role": r["role"], "content": preview[:200]}
-                    )
-                match["context"] = context_msgs
-            except Exception:
-                match["context"] = []
+        return self._finalize_search_matches(
+            matches,
+            result_fields=result_fields,
+        )
 
-        for match in matches:
-            match.pop("content", None)
-            match.pop("_search_text", None)
-        return matches
+
+def inspect_v22_migration_precondition(dsn: str) -> Dict[str, Any]:
+    """Read-only proof that *dsn* names the exact v22 migration source.
+
+    The apply path repeats this proof under the bootstrap advisory lock. This
+    separate snapshot exists so the migration command's default dry-run can
+    catch a wrong DSN without owning any create/repair behavior.
+    """
+    dsn = (dsn or "").strip()
+    if not dsn:
+        raise ValueError("Postgres migration preflight requires a DSN")
+    assert_schema_compat()
+
+    import psycopg
+    from psycopg import ClientCursor
+
+    with psycopg.connect(_normalize_dsn(dsn), autocommit=True) as conn:
+        conn.cursor_factory = ClientCursor
+        with conn.transaction():
+            conn.execute(
+                "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"
+            )
+            namespace = conn.execute(
+                "SELECT to_regnamespace(%s)", (_SCHEMA,)
+            ).fetchone()
+            if not namespace or namespace[0] is None:
+                raise RuntimeError(
+                    "Postgres v22→v26 migration requires an existing "
+                    "hermes_state schema; the selected database has none."
+                )
+            version_table = conn.execute(
+                "SELECT to_regclass(%s)", (f"{_SCHEMA}.schema_version",)
+            ).fetchone()
+            if not version_table or version_table[0] is None:
+                raise RuntimeError(
+                    "Postgres v22→v26 migration requires an existing "
+                    "hermes_state.schema_version table; the selected database "
+                    "does not have one."
+                )
+            PgSessionDB._assert_v22_migration_precondition(conn)
+
+    return {
+        "backend": "postgres",
+        "schema_version": 22,
+        "surface_marker": _V22_SCHEMA_SURFACE_SHA256,
+    }

@@ -226,6 +226,10 @@ class PgResponseStore:
         except Exception:
             pass
 
+    def storage_attestation(self) -> Dict[str, str]:
+        """Return a non-secret, machine-readable backend identity."""
+        return {"backend": "postgres"}
+
     def __len__(self) -> int:
         def _len():
             with self._pool.connection() as conn:

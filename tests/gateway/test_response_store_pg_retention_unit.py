@@ -172,6 +172,15 @@ def test_pg_response_store_keeps_more_than_constructor_max_size(monkeypatch):
         store.close()
 
 
+def test_pg_response_store_exposes_positive_backend_attestation(monkeypatch):
+    _install_fake_psycopg_modules(monkeypatch)
+    store = PgResponseStore("postgresql://fake")
+    try:
+        assert store.storage_attestation() == {"backend": "postgres"}
+    finally:
+        store.close()
+
+
 def test_pg_response_store_reinitializes_missing_schema_once(monkeypatch):
     _install_fake_psycopg_modules(monkeypatch)
     store = PgResponseStore("postgresql://fake", max_size=3)

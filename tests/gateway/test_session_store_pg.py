@@ -377,88 +377,246 @@ def test_boot_fails_on_persisted_surface_mismatch(pg_db):
         PgSessionDB(dsn=_DSN)
 
 
-# ── v19 → v22 in-place expand (AE-182) ─────────────────────────────────────
+# ── drained v22 → v26 explicit migration ────────────────────────────────────
 
 
-def _rewind_store_to_v19(conn):
-    """Make a live store look like the v19 database production actually has.
+_V26_ONLY_COLUMNS = {
+    "sessions": (
+        "system_prompt_hash",
+        "git_metadata_generation",
+        "title_source",
+        "last_activity_at",
+        "last_activity_description",
+        "last_activity_provenance",
+        "compression_ineffective_count",
+        "pinned",
+        "hidden",
+        "last_read_at",
+    ),
+    "messages": ("display_kind", "display_metadata"),
+    "async_delegations": ("origin_session_id",),
+}
+_V26_ONLY_INDEXES = (
+    "idx_messages_session_id",
+    "idx_messages_assistant_calls_by_session",
+    "idx_session_turn_leases_expires",
+    "idx_sessions_system_prompt_hash",
+    "idx_sessions_title_unique",
+)
+_V26_ONLY_TABLES = (
+    "gateway_hygiene_state",
+    "session_turn_leases",
+    "system_prompts",
+)
 
-    Drops the tables and columns the v19→v22 upstream steps added and restores
-    the v19 persisted markers, so the next boot exercises the real expand path
-    instead of a fresh CREATE.
-    """
-    conn.execute(f"DROP TABLE IF EXISTS {_SCHEMA}.session_model_usage")
-    conn.execute(f"DROP TABLE IF EXISTS {_SCHEMA}.async_delegations")
-    for table, column in (
-        ("sessions", "compression_fallback_streak"),
-        ("sessions", "profile_name"),
-        ("messages", "effect_disposition"),
-        ("messages", "api_content"),
-    ):
-        conn.execute(f"ALTER TABLE {_SCHEMA}.{table} DROP COLUMN IF EXISTS {column}")
-    conn.execute(f"UPDATE {_SCHEMA}.schema_version SET version = 19")
+
+def _rewind_store_to_v22(conn):
+    """Restore the exact audited Postgres catalog that production v22 uses."""
+    # v26 moved inline prompts into the content-addressed table. Rehydrate the
+    # predecessor column before dropping that table and its reference.
+    conn.execute(
+        f"UPDATE {_SCHEMA}.sessions AS session "
+        f"SET system_prompt = prompt.prompt "
+        f"FROM {_SCHEMA}.system_prompts AS prompt "
+        "WHERE session.system_prompt_hash = prompt.hash"
+    )
+    conn.execute(
+        f"ALTER TABLE {_SCHEMA}.sessions "
+        "DROP CONSTRAINT IF EXISTS sessions_system_prompt_hash_fkey"
+    )
+    for index in _V26_ONLY_INDEXES:
+        conn.execute(f"DROP INDEX IF EXISTS {_SCHEMA}.{index}")
+    for table, columns in _V26_ONLY_COLUMNS.items():
+        for column in columns:
+            conn.execute(
+                f"ALTER TABLE {_SCHEMA}.{table} DROP COLUMN IF EXISTS {column}"
+            )
+    for table in _V26_ONLY_TABLES:
+        conn.execute(f"DROP TABLE IF EXISTS {_SCHEMA}.{table}")
+    conn.execute(f"UPDATE {_SCHEMA}.schema_version SET version = 22")
     conn.execute(
         f"UPDATE {_SCHEMA}.state_meta SET value = %s "
         "WHERE key = 'pg_backend_schema_surface_sha256'",
-        (hermes_state_pg._V19_SURFACE_SHA256,),
+        (hermes_state_pg._V22_SCHEMA_SURFACE_SHA256,),
     )
 
 
-def test_v19_store_expands_in_place_and_keeps_its_rows(pg_db):
-    """The production case: an existing v19 store must widen, not be recreated."""
-    sid = pg_db.create_session("sess-v19", "webui", model="m1")
-    pg_db.append_message(sid, "user", "written before the expand")
-    pg_db.update_token_counts(sid, input_tokens=10, output_tokens=5)
+def _catalog_signature(conn):
+    """Stable catalog snapshot proving a rejected boot performed no DDL."""
+    columns = conn.execute(
+        "SELECT table_name, column_name, data_type, is_nullable, column_default "
+        "FROM information_schema.columns WHERE table_schema = %s "
+        "ORDER BY table_name, ordinal_position",
+        (_SCHEMA,),
+    ).fetchall()
+    indexes = conn.execute(
+        "SELECT indexname, indexdef FROM pg_indexes WHERE schemaname = %s "
+        "ORDER BY indexname",
+        (_SCHEMA,),
+    ).fetchall()
+    constraints = conn.execute(
+        "SELECT conrelid::regclass::text, conname, pg_get_constraintdef(oid) "
+        "FROM pg_constraint WHERE connamespace = %s::regnamespace "
+        "ORDER BY conrelid::regclass::text, conname",
+        (_SCHEMA,),
+    ).fetchall()
+    return (tuple(columns), tuple(indexes), tuple(constraints))
+
+
+def _run_v26_migration(*extra_args):
+    return subprocess.run(
+        [
+            sys.executable,
+            str(_REPO_ROOT / "scripts" / "migrate_pg_schema_v22_to_v26.py"),
+            "--dsn",
+            _DSN,
+            *extra_args,
+        ],
+        cwd=_REPO_ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
+def test_migration_mode_refuses_absent_schema_without_initializing_it():
+    _drop_schema()
+    with pytest.raises(RuntimeError, match="requires an existing hermes_state"):
+        PgSessionDB(dsn=_DSN, allow_schema_migration=True)
+    with psycopg.connect(_DSN, autocommit=True) as conn:
+        assert conn.execute(
+            "SELECT to_regnamespace(%s)", (_SCHEMA,)
+        ).fetchone()[0] is None
+
+
+def test_v22_requires_explicit_migration_and_preserves_rows(pg_db):
+    old = pg_db.create_session(
+        "sess-v22-old",
+        "webui",
+        model="m1",
+        system_prompt="shared legacy prompt",
+    )
+    new = pg_db.create_session(
+        "sess-v22-new",
+        "webui",
+        model="m1",
+        system_prompt="shared legacy prompt",
+    )
+    pg_db.append_message(old, "user", "written before the migration")
+    pg_db.update_token_counts(old, input_tokens=10, output_tokens=5)
     pg_db.close()
 
     with psycopg.connect(_DSN, autocommit=True) as conn:
-        _rewind_store_to_v19(conn)
+        _rewind_store_to_v22(conn)
+        # v22 had no title provenance/unique index. Exercise deterministic
+        # duplicate repair: the newest row keeps the title.
+        conn.execute(
+            f"UPDATE {_SCHEMA}.sessions SET started_at = %s, title = %s "
+            "WHERE id = %s",
+            (10.0, "duplicate", old),
+        )
+        conn.execute(
+            f"UPDATE {_SCHEMA}.sessions SET started_at = %s, title = %s "
+            "WHERE id = %s",
+            (20.0, "duplicate", new),
+        )
+        before = _catalog_signature(conn)
+
+    # Ordinary runtime boot is observation-only against v22.
+    with pytest.raises(RuntimeError, match="schema migration required"):
+        PgSessionDB(dsn=_DSN)
+    with psycopg.connect(_DSN, autocommit=True) as conn:
+        assert _catalog_signature(conn) == before
+
+    # Default CLI mode performs a real read-only source preflight.
+    dry_run = _run_v26_migration()
+    assert dry_run.returncode == 0, dry_run.stderr
+    assert "Dry run passed without database writes" in dry_run.stdout
+    with psycopg.connect(_DSN, autocommit=True) as conn:
+        assert _catalog_signature(conn) == before
+
+    applied = _run_v26_migration("--apply")
+    assert applied.returncode == 0, applied.stderr
+    assert "Migration complete: backend=postgres schema_version=26" in applied.stdout
 
     db = PgSessionDB(dsn=_DSN)
     try:
-        # Pre-existing rows survive.
-        assert db.get_messages(sid)[0]["content"] == "written before the expand"
-        # New surfaces exist and are writable.
-        db.append_message(sid, "assistant", "after", api_content="raw-bytes")
-        db.record_auxiliary_usage(
-            sid, "vision", model="gemini", input_tokens=7, output_tokens=3
+        assert db.get_messages(old)[0]["content"] == "written before the migration"
+        db.append_message(
+            old,
+            "assistant",
+            "written after the migration",
+            display_kind="internal_notification",
+            display_metadata={"source": "migration-test"},
         )
-        with psycopg.connect(_DSN, autocommit=True) as conn:
-            assert (
-                conn.execute(
-                    f"SELECT version FROM {_SCHEMA}.schema_version"
-                ).fetchone()[0]
-                == EXPECTED_SCHEMA_VERSION
-            )
-            assert (
-                conn.execute(
-                    f"SELECT value FROM {_SCHEMA}.state_meta "
-                    "WHERE key = 'pg_backend_schema_surface_sha256'"
-                ).fetchone()[0]
-                == hermes_state_pg.EXPECTED_SCHEMA_SURFACE_SHA256
-            )
-            # v20 backfill seeded the historical session's aggregate row.
-            rows = conn.execute(
-                f"SELECT task, input_tokens, output_tokens FROM "
-                f"{_SCHEMA}.session_model_usage WHERE session_id = %s "
-                "ORDER BY task",
-                (sid,),
-            ).fetchall()
-        by_task = {r[0]: (r[1], r[2]) for r in rows}
-        assert by_task[""][0] >= 10  # main-loop aggregate, backfilled
-        assert by_task["vision"] == (7, 3)  # aux call recorded post-expand
+        db.record_auxiliary_usage(
+            old, "vision", model="gemini", input_tokens=7, output_tokens=3
+        )
+        assert db.storage_attestation() == {
+            "backend": "postgres",
+            "schema_version": EXPECTED_SCHEMA_VERSION,
+            "surface_marker": hermes_state_pg.EXPECTED_SCHEMA_SURFACE_SHA256,
+        }
     finally:
         db.close()
 
+    with psycopg.connect(_DSN, autocommit=True) as conn:
+        assert conn.execute(
+            f"SELECT version FROM {_SCHEMA}.schema_version"
+        ).fetchone()[0] == EXPECTED_SCHEMA_VERSION
+        prompt_rows = conn.execute(
+            f"SELECT prompt FROM {_SCHEMA}.system_prompts ORDER BY hash"
+        ).fetchall()
+        assert prompt_rows == [("shared legacy prompt",)]
+        session_rows = conn.execute(
+            f"SELECT id, system_prompt, system_prompt_hash, title "
+            f"FROM {_SCHEMA}.sessions WHERE id IN (%s, %s) ORDER BY id",
+            (old, new),
+        ).fetchall()
+        by_id = {row[0]: row[1:] for row in session_rows}
+        assert by_id[old][0] is None
+        assert by_id[new][0] is None
+        assert by_id[old][1] == by_id[new][1]
+        assert by_id[old][2] is None
+        assert by_id[new][2] == "duplicate"
+        display = conn.execute(
+            f"SELECT display_kind, display_metadata FROM {_SCHEMA}.messages "
+            "WHERE session_id = %s ORDER BY id DESC LIMIT 1",
+            (old,),
+        ).fetchone()
+        assert display == (
+            "internal_notification",
+            '{"source": "migration-test"}',
+        )
 
-def test_expand_is_idempotent_across_reboots(pg_db):
+    # Migration mode is deliberately one-shot, not an idempotent ensure-current
+    # operation: replaying it against v26 must refuse a wrong/reused target.
+    replay = _run_v26_migration("--apply")
+    assert replay.returncode != 0
+    assert "requires schema_version 22 exactly" in replay.stderr
+
+
+def test_migration_preflight_rejects_partial_v22_without_widening(pg_db):
     pg_db.close()
     with psycopg.connect(_DSN, autocommit=True) as conn:
-        _rewind_store_to_v19(conn)
-    first = PgSessionDB(dsn=_DSN)
-    first.close()
-    second = PgSessionDB(dsn=_DSN)  # already at v22 — must not raise
-    second.close()
+        _rewind_store_to_v22(conn)
+        conn.execute(
+            f"ALTER TABLE {_SCHEMA}.sessions DROP COLUMN compression_fallback_streak"
+        )
+        before = _catalog_signature(conn)
+
+    dry_run = _run_v26_migration()
+    assert dry_run.returncode != 0
+    assert "v22 migration source catalog verification failed" in dry_run.stderr
+    applied = _run_v26_migration("--apply")
+    assert applied.returncode != 0
+    assert "v22 migration source catalog verification failed" in applied.stderr
+
+    with psycopg.connect(_DSN, autocommit=True) as conn:
+        assert _catalog_signature(conn) == before
+        assert conn.execute(
+            f"SELECT version FROM {_SCHEMA}.schema_version"
+        ).fetchone()[0] == 22
 
 
 def test_per_model_usage_accumulates_across_calls(pg_db):
