@@ -16,17 +16,17 @@ name: IdeaRoom GHCR Publish
 on:
   push:
     # No path filter on purpose: idearoom-agents derives its base-image tag
-    # from the reference/hermes-agent-dorvis submodule gitlink, so EVERY commit
-    # on main must publish a sha-<commit> image or a pin could 404. A no-op
-    # build with a warm gha cache is cheap -- the push step just tags existing
-    # blobs.
-    branches: [main]
+    # from the reference/hermes-agent-dorvis submodule gitlink, so every commit
+    # on the carried dorvis/runtime branch must publish a sha-<commit> image or
+    # a pin could 404. Main is retained as a second trusted integration branch;
+    # the publisher is idempotent when both branches reach the same commit.
+    branches: [dorvis/runtime, main]
   pull_request:
     # PR builds are validation-only (no push). Keep this unfiltered: the image
     # context includes runtime config, plugins, skills, shell scripts, the TUI,
     # and the web app in addition to Python. A hand-maintained path allowlist
     # silently loses coverage whenever that context grows.
-    branches: [main]
+    branches: [dorvis/runtime, main]
 # Key publishing work by the exact push commit so GitHub concurrency cannot
 # replace an already-pending main image. PR validation runs still collapse to
 # the latest commit for that pull request.
@@ -125,7 +125,8 @@ jobs:
     if: >-
       github.repository == 'idearoom/hermes-agent-dorvis' &&
       github.event_name == 'push' &&
-      github.ref == 'refs/heads/main'
+      (github.ref == 'refs/heads/dorvis/runtime' ||
+       github.ref == 'refs/heads/main')
     permissions:
       contents: read
       packages: write

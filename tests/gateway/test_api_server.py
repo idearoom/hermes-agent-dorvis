@@ -133,6 +133,55 @@ class TestResponseStore:
         assert store.get("resp_2") is not None
         assert len(store) == 3
 
+    def test_lru_never_evicts_an_active_owned_response(self):
+        store = ResponseStore(max_size=1)
+        assert store.claim(
+            "resp_active",
+            {"response": {"id": "resp_active", "status": "in_progress"}},
+            owner_id="owner-a",
+            owner_epoch="epoch-a",
+        )
+        store.put(
+            "resp_done_1",
+            {"response": {"id": "resp_done_1", "status": "completed"}},
+        )
+        assert store.get("resp_active") is not None
+        assert store.get("resp_done_1") is not None
+
+        store.put(
+            "resp_done_2",
+            {"response": {"id": "resp_done_2", "status": "completed"}},
+        )
+        assert store.get("resp_active") is not None
+        assert store.get("resp_done_1") is None
+        assert store.get("resp_done_2") is not None
+
+    def test_terminal_owned_transitions_participate_in_lru_eviction(self):
+        store = ResponseStore(max_size=1)
+        for response_id, conversation in (
+            ("resp_stream_1", "chat-1"),
+            ("resp_stream_2", "chat-2"),
+        ):
+            assert store.claim(
+                response_id,
+                {"response": {"id": response_id, "status": "in_progress"}},
+                owner_id="owner-a",
+                owner_epoch=f"epoch-{response_id}",
+                conversation=conversation,
+            )
+            assert store.transition(
+                response_id,
+                {"response": {"id": response_id, "status": "completed"}},
+                owner_id="owner-a",
+                owner_epoch=f"epoch-{response_id}",
+                terminal=True,
+            )
+
+        assert store.get("resp_stream_1") is None
+        assert store.get_conversation("chat-1") is None
+        assert store.get("resp_stream_2") is not None
+        assert store.get_conversation("chat-2") == "resp_stream_2"
+
 
     def test_delete_clears_conversation_mapping(self):
         """Deleting a response also removes conversation mappings that reference it."""
@@ -141,6 +190,65 @@ class TestResponseStore:
         store.set_conversation("chat-a", "resp_1")
         assert store.get_conversation("chat-a") == "resp_1"
         store.delete("resp_1")
+        assert store.get_conversation("chat-a") is None
+
+    def test_terminal_transition_is_monotonic_across_store_connections(self, tmp_path):
+        """A stale owner completion cannot overwrite an accepted cancel."""
+        db_path = str(tmp_path / "response-state.db")
+        canceller = ResponseStore(max_size=10, db_path=db_path)
+        stale_writer = ResponseStore(max_size=10, db_path=db_path)
+        owner_id = "gateway-owner-a"
+        owner_epoch = "response-epoch-1"
+        active = {
+            "response": {"id": "resp_race", "status": "in_progress"},
+            "conversation_history": [],
+        }
+        cancelled = {
+            "response": {"id": "resp_race", "status": "cancelled"},
+            "conversation_history": [],
+        }
+        completed = {
+            "response": {"id": "resp_race", "status": "completed"},
+            "conversation_history": [],
+        }
+        try:
+            assert canceller.claim(
+                "resp_race",
+                active,
+                owner_id=owner_id,
+                owner_epoch=owner_epoch,
+            )
+            assert canceller.transition(
+                "resp_race",
+                cancelled,
+                owner_id=owner_id,
+                owner_epoch=owner_epoch,
+                terminal=True,
+            )
+            assert not stale_writer.transition(
+                "resp_race",
+                completed,
+                owner_id=owner_id,
+                owner_epoch=owner_epoch,
+                terminal=True,
+            )
+            assert stale_writer.get("resp_race")["response"]["status"] == "cancelled"
+        finally:
+            canceller.close()
+            stale_writer.close()
+
+    def test_conversation_mapping_cannot_dangle_after_terminal_delete(self):
+        store = ResponseStore(max_size=10)
+        store.put(
+            "resp_terminal",
+            {"response": {"id": "resp_terminal", "status": "completed"}},
+        )
+        assert store.set_conversation("chat-a", "resp_terminal")
+        assert store.delete_terminal("resp_terminal") == "deleted"
+
+        # A stale mapping write racing behind DELETE must not recreate the
+        # reference after the response row is gone.
+        assert not store.set_conversation("chat-a", "resp_terminal")
         assert store.get_conversation("chat-a") is None
 
 
@@ -1583,6 +1691,30 @@ class TestChatCompletionsEndpoint:
             assert resp.status == 400
             data = await resp.json()
             assert "messages" in data["error"]["message"]
+
+    @pytest.mark.asyncio
+    async def test_session_stream_disconnect_uses_hard_interrupt(self, adapter):
+        """Compression state cannot mask an abandoned session stream stop."""
+
+        class _Agent:
+            def __init__(self):
+                self.hard_interrupt = MagicMock()
+                self.interrupt = MagicMock()
+
+        agent = _Agent()
+        adapter._active_run_agents["run-disconnected"] = agent
+        task = asyncio.create_task(asyncio.sleep(0))
+        await task
+
+        await adapter._drain_session_stream_task_on_disconnect(
+            "run-disconnected",
+            task,
+            interrupt_message="SSE client disconnected",
+            shield_wait=False,
+        )
+
+        agent.hard_interrupt.assert_called_once_with("SSE client disconnected")
+        agent.interrupt.assert_not_called()
 
 
     @pytest.mark.asyncio
@@ -4156,6 +4288,17 @@ class TestGetResponse:
 # ---------------------------------------------------------------------------
 
 
+class _DualInterruptAgent:
+    """Agent double that proves explicit stops prefer the hard-stop ABI."""
+
+    def __init__(self):
+        self.hard_interrupt = MagicMock()
+        self.interrupt = MagicMock()
+        self.session_prompt_tokens = 0
+        self.session_completion_tokens = 0
+        self.session_total_tokens = 0
+
+
 class TestCancelResponse:
     """Terminate an abandoned streaming response without destroying it.
 
@@ -4224,7 +4367,7 @@ class TestCancelResponse:
         """The acceptance case: a live turn is stopped, its record survives."""
         import gateway.platforms.api_server as api_mod
 
-        agent = MagicMock()
+        agent = _DualInterruptAgent()
         agent_ref = [agent, None]
         stream_q = api_mod.ThreadSafeAsyncQueue()
 
@@ -4256,9 +4399,13 @@ class TestCancelResponse:
                 assert body["id"] == response_id
                 assert body["object"] == "response"
                 assert body["status"] == "cancelled"
+                assert adapter._response_store.get_control(response_id)["terminal"] is True
 
                 # The agent loop was revoked, not merely detached from the stream.
-                agent.interrupt.assert_called_once()
+                agent.hard_interrupt.assert_called_once_with(
+                    "Cancelled via /v1/responses/{id}/cancel"
+                )
+                agent.interrupt.assert_not_called()
 
                 with pytest.raises(asyncio.CancelledError):
                     await writer
@@ -4278,6 +4425,171 @@ class TestCancelResponse:
         finally:
             patcher.stop()
             adapter._inflight_responses.pop(response_id, None)
+
+    @pytest.mark.asyncio
+    async def test_cancel_does_not_report_success_when_interrupt_routing_fails(
+        self, adapter
+    ):
+        agent = MagicMock()
+        agent.interrupt.side_effect = RuntimeError("interrupt channel unavailable")
+        agent_ref = [agent, None]
+        stream_q = ThreadSafeAsyncQueue()
+        release_owner = asyncio.Event()
+
+        async def _agent_coro():
+            await release_owner.wait()
+            return (
+                {"final_response": "still running", "messages": [], "api_calls": 1},
+                {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+            )
+
+        agent_task = asyncio.ensure_future(_agent_coro())
+        response_id = f"resp_{uuid.uuid4().hex[:28]}"
+        writer, patcher, written = self._start_stream(
+            adapter,
+            agent_ref=agent_ref,
+            stream_q=stream_q,
+            agent_task=agent_task,
+            response_id=response_id,
+        )
+        try:
+            await self._await_event(written, "response.created")
+            app = _create_app(adapter)
+            async with TestClient(TestServer(app)) as cli:
+                response = await cli.post(f"/v1/responses/{response_id}/cancel")
+                assert response.status == 503
+                assert (await response.json())["error"]["code"] == (
+                    "response_interrupt_unavailable"
+                )
+
+            assert adapter._response_store.get(response_id)["response"]["status"] == (
+                "in_progress"
+            )
+            assert not agent_task.cancelled()
+        finally:
+            release_owner.set()
+            await writer
+            patcher.stop()
+            adapter._inflight_responses.pop(response_id, None)
+
+    @pytest.mark.asyncio
+    async def test_accepted_cancel_suppresses_stale_owner_completion(self, adapter):
+        """The durable CAS governs both storage and the terminal SSE event."""
+        agent = MagicMock()
+        agent_ref = [agent, None]
+        stream_q = ThreadSafeAsyncQueue()
+        release_owner = asyncio.Event()
+
+        async def _agent_coro():
+            await release_owner.wait()
+            return (
+                {"final_response": "late completion", "messages": [], "api_calls": 1},
+                {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+            )
+
+        agent_task = asyncio.ensure_future(_agent_coro())
+        response_id = f"resp_{uuid.uuid4().hex[:28]}"
+        writer, patcher, written = self._start_stream(
+            adapter,
+            agent_ref=agent_ref,
+            stream_q=stream_q,
+            agent_task=agent_task,
+            response_id=response_id,
+        )
+        try:
+            await self._await_event(written, "response.created")
+            # Model an executor-backed run that cannot be cancelled by the
+            # asyncio wrapper: the interrupt succeeds, then the owner still
+            # returns a late result and attempts its terminal write.
+            adapter._inflight_responses[response_id]["task"] = MagicMock(
+                done=MagicMock(return_value=True)
+            )
+            app = _create_app(adapter)
+            async with TestClient(TestServer(app)) as cli:
+                response = await cli.post(f"/v1/responses/{response_id}/cancel")
+                assert response.status == 200
+
+            release_owner.set()
+            await writer
+            assert adapter._response_store.get(response_id)["response"]["status"] == (
+                "cancelled"
+            )
+            assert not any("response.completed" in payload for payload in written)
+        finally:
+            release_owner.set()
+            if not writer.done():
+                await writer
+            patcher.stop()
+            adapter._inflight_responses.pop(response_id, None)
+
+    @pytest.mark.asyncio
+    async def test_cancel_during_created_delivery_is_durably_terminal(self, adapter):
+        """The owner claim must exist before response.created becomes visible."""
+        import gateway.platforms.api_server as api_mod
+
+        created_write_started = asyncio.Event()
+        release_created_write = asyncio.Event()
+
+        class _BlockedCreatedStream:
+            async def prepare(self, _request):
+                return None
+
+            async def write(self, payload):
+                text = payload.decode() if isinstance(payload, bytes) else str(payload)
+                if "response.created" in text:
+                    created_write_started.set()
+                    await release_created_write.wait()
+
+        agent = MagicMock()
+        agent_ref = [agent, None]
+        stream_q = ThreadSafeAsyncQueue()
+
+        async def _agent_coro():
+            await asyncio.sleep(30)
+            return ({}, {})
+
+        agent_task = asyncio.ensure_future(_agent_coro())
+        agent_task.add_done_callback(lambda _fut: stream_q.put_nowait(None))
+        response_id = f"resp_{uuid.uuid4().hex[:28]}"
+        fake_request = MagicMock()
+        fake_request.headers = {}
+
+        with patch.object(
+            api_mod.web, "StreamResponse", return_value=_BlockedCreatedStream()
+        ):
+            writer = asyncio.create_task(
+                adapter._write_sse_responses(
+                    request=fake_request,
+                    response_id=response_id,
+                    model="hermes-agent",
+                    created_at=int(time.time()),
+                    stream_q=stream_q,
+                    agent_task=agent_task,
+                    agent_ref=agent_ref,
+                    conversation_history=[],
+                    user_message="cancel while created is flushing",
+                    instructions=None,
+                    conversation=None,
+                    store=True,
+                    session_id="session-created-race",
+                )
+            )
+            try:
+                await created_write_started.wait()
+                app = _create_app(adapter)
+                async with TestClient(TestServer(app)) as cli:
+                    response = await cli.post(f"/v1/responses/{response_id}/cancel")
+                    assert response.status == 200
+
+                assert adapter._response_store.get(response_id)["response"]["status"] == (
+                    "cancelled"
+                )
+                assert adapter._response_store.get_control(response_id)["terminal"] is True
+            finally:
+                release_created_write.set()
+                with pytest.raises(asyncio.CancelledError):
+                    await writer
+                adapter._inflight_responses.pop(response_id, None)
 
     @pytest.mark.asyncio
     async def test_cancelled_envelope_carries_usage_accrued_before_the_cancel(
@@ -4746,12 +5058,79 @@ class TestCancelResponse:
             assert body["error"]["code"] == "response_not_found"
 
     @pytest.mark.asyncio
-    async def test_cancel_orphaned_in_progress_record_marks_it_terminal(self, adapter):
-        """A record this process holds no stream for still becomes terminal.
+    async def test_sibling_adapter_cannot_report_cancellation_it_cannot_route(
+        self, adapter
+    ):
+        """A shared row is not proof that this process contained its owner.
 
-        Left by a gateway that restarted mid-turn: the executor thread is
-        already gone, so flipping the shared record is complete containment.
+        During a blue/green overlap, either ECS task can receive the cancel
+        request while only the task that started the response holds the live
+        agent handle.  The sibling must leave the row nonterminal and return a
+        retryable non-success response instead of claiming cancellation.
         """
+        agent = MagicMock()
+        agent_ref = [agent, None]
+        stream_q = ThreadSafeAsyncQueue()
+        release_owner = asyncio.Event()
+
+        async def _agent_coro():
+            await release_owner.wait()
+            return (
+                {"final_response": "owner completed", "messages": [], "api_calls": 1},
+                {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+            )
+
+        agent_task = asyncio.ensure_future(_agent_coro())
+        response_id = f"resp_{uuid.uuid4().hex[:28]}"
+        writer, patcher, written = self._start_stream(
+            adapter,
+            agent_ref=agent_ref,
+            stream_q=stream_q,
+            agent_task=agent_task,
+            response_id=response_id,
+        )
+        sibling = _make_adapter()
+        sibling._response_store.close()
+        sibling._response_store = adapter._response_store
+        try:
+            await self._await_event(written, "response.created")
+            app = _create_app(sibling)
+            async with TestClient(TestServer(app)) as cli:
+                delete_response = await cli.delete(f"/v1/responses/{response_id}")
+                assert delete_response.status == 409
+                assert (await delete_response.json())["error"]["code"] == (
+                    "response_not_terminal"
+                )
+
+                response = await cli.post(f"/v1/responses/{response_id}/cancel")
+                assert response.status == 503
+                assert (await response.json())["error"]["code"] == (
+                    "response_owner_unavailable"
+                )
+                assert response.headers["Retry-After"]
+
+            assert adapter._response_store.get(response_id)["response"]["status"] == (
+                "in_progress"
+            )
+            agent.interrupt.assert_not_called()
+
+            release_owner.set()
+            await writer
+            assert adapter._response_store.get(response_id)["response"]["status"] == (
+                "completed"
+            )
+        finally:
+            release_owner.set()
+            if not writer.done():
+                await writer
+            patcher.stop()
+            adapter._inflight_responses.pop(response_id, None)
+
+    @pytest.mark.asyncio
+    async def test_cancel_orphaned_in_progress_record_reports_owner_unavailable(
+        self, adapter
+    ):
+        """A durable row alone cannot prove that its executor was contained."""
         response_id = "resp_orphan"
         adapter._response_store.put(
             response_id,
@@ -4771,11 +5150,13 @@ class TestCancelResponse:
         app = _create_app(adapter)
         async with TestClient(TestServer(app)) as cli:
             resp = await cli.post(f"/v1/responses/{response_id}/cancel")
-            assert resp.status == 200
-            assert (await resp.json())["status"] == "cancelled"
+            assert resp.status == 503
+            assert (await resp.json())["error"]["code"] == (
+                "response_owner_unavailable"
+            )
 
         stored = adapter._response_store.get(response_id)
-        assert stored["response"]["status"] == "cancelled"
+        assert stored["response"]["status"] == "in_progress"
         assert stored["conversation_history"] == [{"role": "user", "content": "hi"}]
         assert stored["session_id"] == "sess-orphan"
 
@@ -4798,13 +5179,14 @@ class TestCancelResponse:
         agent_ref = [None, None]
         entry = {"agent_ref": agent_ref, "task": None, "cancelled": False}
 
-        assert adapter._interrupt_inflight_response(entry, "resp_early") is False
+        assert adapter._interrupt_inflight_response(entry, "resp_early") is True
         assert agent_ref[1]
 
     @pytest.mark.asyncio
     async def test_parked_interrupt_fires_when_the_agent_appears(self, adapter):
         """_run_agent honors the parked reason before running a single tool."""
         mock_agent = _make_api_agent()
+        mock_agent.interrupt.side_effect = RuntimeError("interrupt hook failed")
         agent_ref = [None, "Cancelled via /v1/responses/{id}/cancel"]
 
         with patch.object(adapter, "_create_agent", return_value=mock_agent):
@@ -4818,6 +5200,7 @@ class TestCancelResponse:
         mock_agent.interrupt.assert_called_once_with(
             "Cancelled via /v1/responses/{id}/cancel"
         )
+        mock_agent.run_conversation.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_single_slot_agent_ref_is_untouched(self, adapter):
@@ -4942,7 +5325,7 @@ class TestCancelResponse:
             async def write(self, payload):
                 raise RuntimeError("transport is closing")
 
-        agent = MagicMock()
+        agent = _DualInterruptAgent()
         agent_ref = [agent, None]
         stream_q = ThreadSafeAsyncQueue()
 
@@ -4976,7 +5359,8 @@ class TestCancelResponse:
             )
 
         assert adapter._response_store.get(response_id)["response"]["status"] == "incomplete"
-        agent.interrupt.assert_called_once()
+        agent.hard_interrupt.assert_called_once_with("SSE writer failed mid-stream")
+        agent.interrupt.assert_not_called()
         with pytest.raises(asyncio.CancelledError):
             await agent_task
         assert response_id not in adapter._inflight_responses
@@ -4986,6 +5370,125 @@ class TestCancelResponse:
             resp = await cli.post(f"/v1/responses/{response_id}/cancel")
             assert resp.status == 409
 
+    @pytest.mark.asyncio
+    async def test_prepare_failure_hard_stops_the_agent_task(self, adapter):
+        """Transport setup can fail after the executor has already started."""
+        import gateway.platforms.api_server as api_mod
+
+        class _PrepareFailure:
+            async def prepare(self, req):
+                raise RuntimeError("could not prepare stream")
+
+            async def write(self, payload):
+                raise AssertionError("an unprepared stream must not be written")
+
+        agent = _DualInterruptAgent()
+        agent_ref = [agent, None]
+        stream_q = ThreadSafeAsyncQueue()
+
+        async def _agent_coro():
+            await asyncio.sleep(30)
+
+        agent_task = asyncio.create_task(_agent_coro())
+        fake_request = MagicMock()
+        fake_request.headers = {}
+        try:
+            with (
+                patch.object(
+                    api_mod.web, "StreamResponse", return_value=_PrepareFailure()
+                ),
+                pytest.raises(RuntimeError, match="could not prepare stream"),
+            ):
+                await adapter._write_sse_responses(
+                    request=fake_request,
+                    response_id=f"resp_{uuid.uuid4().hex[:28]}",
+                    model="hermes-agent",
+                    created_at=int(time.time()),
+                    stream_q=stream_q,
+                    agent_task=agent_task,
+                    agent_ref=agent_ref,
+                    conversation_history=[],
+                    user_message="long running turn",
+                    instructions=None,
+                    conversation=None,
+                    store=True,
+                    session_id="session-prepare-failure",
+                )
+
+            agent.hard_interrupt.assert_called_once_with(
+                "SSE response setup failed"
+            )
+            agent.interrupt.assert_not_called()
+            with pytest.raises(asyncio.CancelledError):
+                await agent_task
+        finally:
+            if not agent_task.done():
+                agent_task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await agent_task
+
+    @pytest.mark.asyncio
+    async def test_store_failure_cannot_skip_agent_containment(self, adapter):
+        """Durable-store outages are best-effort only after hard containment."""
+        import gateway.platforms.api_server as api_mod
+
+        class _AlwaysFailingStore:
+            def claim(self, *args, **kwargs):
+                raise RuntimeError("response store unavailable")
+
+            def transition(self, *args, **kwargs):
+                raise RuntimeError("response store unavailable")
+
+        class _PreparedStream:
+            async def prepare(self, req):
+                pass
+
+            async def write(self, payload):
+                pass
+
+        agent = _DualInterruptAgent()
+        agent_ref = [agent, None]
+        stream_q = ThreadSafeAsyncQueue()
+
+        async def _agent_coro():
+            await asyncio.sleep(30)
+
+        agent_task = asyncio.create_task(_agent_coro())
+        fake_request = MagicMock()
+        fake_request.headers = {}
+        adapter._response_store = _AlwaysFailingStore()
+        try:
+            with patch.object(
+                api_mod.web, "StreamResponse", return_value=_PreparedStream()
+            ):
+                await adapter._write_sse_responses(
+                    request=fake_request,
+                    response_id=f"resp_{uuid.uuid4().hex[:28]}",
+                    model="hermes-agent",
+                    created_at=int(time.time()),
+                    stream_q=stream_q,
+                    agent_task=agent_task,
+                    agent_ref=agent_ref,
+                    conversation_history=[],
+                    user_message="long running turn",
+                    instructions=None,
+                    conversation=None,
+                    store=True,
+                    session_id="session-store-failure",
+                )
+
+            agent.hard_interrupt.assert_called_once_with(
+                "SSE writer failed mid-stream"
+            )
+            agent.interrupt.assert_not_called()
+            with pytest.raises(asyncio.CancelledError):
+                await agent_task
+        finally:
+            if not agent_task.done():
+                agent_task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await agent_task
+
 
 # ---------------------------------------------------------------------------
 # DELETE /v1/responses/{response_id}
@@ -4993,6 +5496,31 @@ class TestCancelResponse:
 
 
 class TestDeleteResponse:
+    @pytest.mark.asyncio
+    async def test_delete_active_response_requires_cancellation_first(self, adapter):
+        response_id = "resp_active_delete"
+        assert adapter._response_store.claim(
+            response_id,
+            {
+                "response": {
+                    "id": response_id,
+                    "object": "response",
+                    "status": "in_progress",
+                },
+                "conversation_history": [],
+            },
+            owner_id="owner-a",
+            owner_epoch="epoch-a",
+        )
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            response = await cli.delete(f"/v1/responses/{response_id}")
+            assert response.status == 409
+            assert (await response.json())["error"]["code"] == "response_not_terminal"
+
+        assert adapter._response_store.get(response_id) is not None
+
     @pytest.mark.asyncio
     async def test_delete_stored_response(self, adapter):
         """DELETE removes a stored response and returns confirmation."""
@@ -5004,11 +5532,16 @@ class TestDeleteResponse:
                 mock_run.return_value = (mock_result, {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0})
                 resp = await cli.post(
                     "/v1/responses",
-                    json={"model": "hermes-agent", "input": "Hi"},
+                    json={
+                        "model": "hermes-agent",
+                        "input": "Hi",
+                        "conversation": "delete-test",
+                    },
                 )
 
             data = await resp.json()
             response_id = data["id"]
+            assert adapter._response_store.get_conversation("delete-test") == response_id
 
             # Delete it
             resp2 = await cli.delete(f"/v1/responses/{response_id}")
@@ -5021,6 +5554,7 @@ class TestDeleteResponse:
             # Verify it's gone
             resp3 = await cli.get(f"/v1/responses/{response_id}")
             assert resp3.status == 404
+            assert adapter._response_store.get_conversation("delete-test") is None
 
 
 # ---------------------------------------------------------------------------

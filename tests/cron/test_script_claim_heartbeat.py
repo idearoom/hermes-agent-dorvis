@@ -403,6 +403,35 @@ def test_lost_fire_claim_stops_stale_delivery(monkeypatch):
     mark_run.assert_not_called()
 
 
+def test_lost_fire_claim_hard_stops_agent_even_when_stop_hook_fails():
+    """Ownership loss remains fatal while bypassing compression soft-stop masking."""
+    import cron.scheduler as scheduler
+
+    class _Agent:
+        def __init__(self):
+            self.hard_interrupt = MagicMock(side_effect=OSError("stop hook failed"))
+            self.interrupt = MagicMock()
+
+    agent = _Agent()
+    lost = threading.Event()
+    lost.set()
+
+    with pytest.raises(
+        RuntimeError,
+        match="lost its durable fire claim ownership",
+    ):
+        scheduler._abort_if_cron_fire_claim_lost(
+            agent=agent,
+            cancel_event=lost,
+            job_name="ownership-test",
+        )
+
+    agent.hard_interrupt.assert_called_once_with(
+        "Cron fire claim ownership was lost"
+    )
+    agent.interrupt.assert_not_called()
+
+
 def test_initially_lost_fire_claim_finishes_execution_without_running(monkeypatch):
     """A stale claimed snapshot rejected before body entry must close its ledger row."""
     import cron.scheduler as scheduler

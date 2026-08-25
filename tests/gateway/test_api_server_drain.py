@@ -384,6 +384,19 @@ class TestDrainKeepsInFlightWorking:
 
 
 class TestDrainForceTerminate:
+    def test_force_terminate_prefers_hard_interrupt(self, adapter):
+        class _DualInterruptAgent:
+            def __init__(self):
+                self.hard_interrupt = MagicMock()
+                self.interrupt = MagicMock()
+
+        agent = _DualInterruptAgent()
+        adapter._active_run_agents["run-hard-stop"] = agent
+
+        assert adapter._drain_force_terminate("drain cap reached") == 1
+        agent.hard_interrupt.assert_called_once_with("drain cap reached")
+        agent.interrupt.assert_not_called()
+
     @pytest.mark.asyncio
     async def test_force_terminate_run_emits_terminal_event_and_closes_stream(self, adapter):
         app = _create_app(adapter)

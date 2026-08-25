@@ -7,8 +7,9 @@ firecrawl-anydoc``, imports as ``anydoc``), coverage widens to legacy Office
 its Rust core. The stdlib extractors remain authoritative for their three
 formats so behavior is identical whether or not anydoc is present.
 Malformed documents raise :class:`ExtractionError`. Callers surface binary
-document failures; notebook JSON syntax failures may show only the same bounded
-byte snapshot as raw text.
+document failures; notebook JSON syntax failures and parsed notebooks with no
+renderable cell structure may show only the same bounded byte snapshot as raw
+text.
 """
 
 from __future__ import annotations
@@ -35,6 +36,7 @@ __all__ = [
     "EXTRACTABLE_EXTENSIONS",
     "ExtractionBusyError",
     "ExtractionError",
+    "NotebookFallbackError",
     "NotebookSyntaxError",
     "document_size_limit",
     "extract_document_bytes",
@@ -115,11 +117,13 @@ _XLSX_COVERAGE_NOTE = (
 # transport-sized copies cover terminal stdout/base64/decoded+temp overlap;
 # XML text uses the four-byte Unicode worst case; parsed notebook JSON gets a
 # 26x input allowance; output gets a second wide-string copy for final join.
-# Notebook JSON syntax failures take a separate bounded-raw fallback path:
-# they never retain a parsed notebook object, while six wide input-sized
-# copies conservatively cover decode, splitlines, page join, line numbering,
-# redaction, and serialization. Keeping the mutually exclusive paths explicit
-# prevents a parsed object and raw fallback from being counted as coexisting.
+# Notebook fallback-eligible failures take a separate bounded-raw path. Syntax
+# failures never retain a parsed object; semantic failures clear their complete
+# exception traceback before raw decoding, releasing the acyclic JSON graph.
+# Six wide input-sized copies conservatively cover decode, pagination, page
+# join, line numbering, redaction, and serialization. Keeping the mutually
+# exclusive paths explicit prevents a parsed object and raw fallback from being
+# counted as coexisting.
 ESTIMATED_OOXML_WORKING_SET_BYTES = (
     3 * MAX_DOCUMENT_BYTES
     + 4 * MAX_OOXML_MEMBER_BYTES
@@ -163,12 +167,24 @@ class ExtractionError(Exception):
     """Raised when a supported-looking document cannot be rendered as text."""
 
 
-class NotebookSyntaxError(ExtractionError):
+class NotebookFallbackError(ExtractionError):
+    """Notebook failure safe to expose through its bounded raw snapshot."""
+
+
+class NotebookSyntaxError(NotebookFallbackError):
     """Raised before notebook JSON has produced a parsed object graph."""
+
+
+class NotebookSemanticError(NotebookFallbackError):
+    """Raised after parsing when no structured notebook view can be rendered."""
 
 
 class ExtractionBusyError(ExtractionError):
     """Raised when the bounded native-reader capacity is already occupied."""
+
+
+class _XmlEventBudgetExceeded(ExtractionError):
+    """Internal signal that bounded OOXML content parsing must stop."""
 
 
 _native_read_slots = threading.BoundedSemaphore(MAX_CONCURRENT_NATIVE_READS)
@@ -571,6 +587,13 @@ class _BoundedText:
         self._parts: list[str] = []
         self._chars = 0
         self.truncated = False
+        self._truncation_reason: Optional[str] = None
+
+    def mark_truncated(self, reason: str) -> None:
+        """Stop content extraction and retain an accurate bounded-view note."""
+        if not self.truncated:
+            self.truncated = True
+            self._truncation_reason = reason
 
     def append(self, text: str) -> bool:
         """Append up to the budget; return False once parsing should stop."""
@@ -578,7 +601,9 @@ class _BoundedText:
             return False
         remaining = MAX_EXTRACTED_TEXT_CHARS - self._chars
         if remaining <= 0:
-            self.truncated = True
+            self.mark_truncated(
+                f"the {MAX_EXTRACTED_TEXT_CHARS:,}-character safety limit"
+            )
             return False
         if len(text) <= remaining:
             self._parts.append(text)
@@ -586,22 +611,40 @@ class _BoundedText:
             return True
         self._parts.append(text[:remaining])
         self._chars += remaining
-        self.truncated = True
+        self.mark_truncated(
+            f"the {MAX_EXTRACTED_TEXT_CHARS:,}-character safety limit"
+        )
         return False
 
-    def checkpoint(self) -> tuple[int, int, bool]:
-        return len(self._parts), self._chars, self.truncated
+    def checkpoint(self) -> tuple[int, int, bool, Optional[str]]:
+        return (
+            len(self._parts),
+            self._chars,
+            self.truncated,
+            self._truncation_reason,
+        )
 
-    def rollback(self, checkpoint: tuple[int, int, bool]) -> None:
-        part_count, self._chars, self.truncated = checkpoint
+    def rollback(
+        self,
+        checkpoint: tuple[int, int, bool, Optional[str]],
+    ) -> None:
+        (
+            part_count,
+            self._chars,
+            self.truncated,
+            self._truncation_reason,
+        ) = checkpoint
         del self._parts[part_count:]
 
     def render(self) -> str:
         text = "".join(self._parts)
         if self.truncated:
+            reason = self._truncation_reason or (
+                f"the {MAX_EXTRACTED_TEXT_CHARS:,}-character safety limit"
+            )
             notice = (
-                "\n[Extraction truncated at the "
-                f"{MAX_EXTRACTED_TEXT_CHARS:,}-character safety limit for "
+                "\n[Extraction truncated at "
+                f"{reason} for "
                 f"{self._document_type}. Split or convert the document to "
                 "inspect the remaining content.]\n"
             )
@@ -833,7 +876,7 @@ def _extract_notebook(path: str) -> str:
     except (OSError, ValueError) as exc:
         raise ExtractionError(f"Not a valid notebook: {exc}") from exc
     if not isinstance(nb, dict):
-        raise ExtractionError("Notebook root is not an object")
+        raise NotebookSemanticError("Notebook root is not an object")
 
     raw_cells = nb.get("cells")
     legacy_v3 = nb.get("nbformat") == 3 or not isinstance(raw_cells, list)
@@ -891,9 +934,9 @@ def _extract_notebook(path: str) -> str:
                 if not out.append(rendered.rstrip("\n") + "\n\n"):
                     break
     if not candidate_cells:
-        raise ExtractionError("Notebook contains no cells")
+        raise NotebookSemanticError("Notebook contains no cells")
     if not rendered_cells:
-        raise ExtractionError("Notebook contains no readable cells")
+        raise NotebookSemanticError("Notebook contains no readable cells")
     return out.render()
 
 
@@ -1173,7 +1216,7 @@ class _XmlEventBudget:
     def consume(self, member: str) -> None:
         self.events += 1
         if self.events > MAX_OOXML_XML_EVENTS:
-            raise ExtractionError(
+            raise _XmlEventBudgetExceeded(
                 f"{self.label} XML exceeds the extraction-wide budget of "
                 f"{MAX_OOXML_XML_EVENTS:,} events while parsing {member}"
             )
@@ -1249,9 +1292,10 @@ def _extract_docx(path: str) -> str:
                     continue
                 elements += 1
                 if elements > MAX_DOCX_XML_ELEMENTS:
-                    raise ExtractionError(
-                        f"DOCX XML has more than {MAX_DOCX_XML_ELEMENTS:,} elements"
+                    out.mark_truncated(
+                        f"the {MAX_DOCX_XML_ELEMENTS:,}-element DOCX body safety limit"
                     )
+                    break
                 if paragraph_depth:
                     if node.tag in text_tags:
                         text = node.text or ""
@@ -1269,6 +1313,10 @@ def _extract_docx(path: str) -> str:
                         if not out.append("\n"):
                             break
                 node.clear()
+    except _XmlEventBudgetExceeded:
+        out.mark_truncated(
+            f"the {MAX_OOXML_XML_EVENTS:,}-event XML parser safety limit"
+        )
     except ET.ParseError as exc:
         raise ExtractionError(f"Malformed XML in word/document.xml: {exc}") from exc
     if not has_text:
@@ -1335,6 +1383,14 @@ def _extract_xlsx(path: str) -> str:
                     out.append("(empty)\n")
                 if not out.truncated:
                     out.append("\n")
+            except _XmlEventBudgetExceeded:
+                # Workbook metadata, relationships, and shared strings are
+                # parsed before this content loop and remain fail-closed. A
+                # valid worksheet that merely exhausts the bounded parser view
+                # can still return the rows already rendered.
+                out.mark_truncated(
+                    f"the {MAX_OOXML_XML_EVENTS:,}-event XML parser safety limit"
+                )
             except ET.ParseError as exc:
                 out.rollback(checkpoint)
                 raise ExtractionError(

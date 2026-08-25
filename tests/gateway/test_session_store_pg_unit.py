@@ -513,6 +513,12 @@ class _CatalogConn:
         surface=None,
         prompt_rows=(),
         catalog_version=22,
+        wrong_index=None,
+        wrong_column=None,
+        extra_constraint=None,
+        wrong_constraint=None,
+        include_optional_index=False,
+        extra_index=None,
     ):
         self.executed = []
         self.version = version
@@ -520,6 +526,12 @@ class _CatalogConn:
         self.omit_column = omit_column
         self.prompt_rows = prompt_rows
         self.catalog_version = catalog_version
+        self.wrong_index = wrong_index
+        self.wrong_column = wrong_column
+        self.extra_constraint = extra_constraint
+        self.wrong_constraint = wrong_constraint
+        self.include_optional_index = include_optional_index
+        self.extra_index = extra_index
 
     def execute(self, sql, params=None):
         self.executed.append((sql, params))
@@ -529,44 +541,111 @@ class _CatalogConn:
             return _RowsResult([("hermes_state.schema_version",)])
         if "information_schema.columns" in sql:
             columns = (
-                hermes_state_pg._V22_REQUIRED_COLUMNS
+                hermes_state_pg._V22_REQUIRED_COLUMN_SPECS
                 if self.catalog_version == 22
-                else hermes_state_pg._REQUIRED_COLUMNS
+                else hermes_state_pg._REQUIRED_COLUMN_SPECS
             )
-            rows = [
-                (table, column)
-                for table, table_columns in columns.items()
-                for column in table_columns
-                if (table, column) != self.omit_column
-            ]
+            rows = []
+            for (table, column), expected in columns.items():
+                if (table, column) == self.omit_column:
+                    continue
+                values = {
+                    "data_type": expected.data_type,
+                    "nullable": expected.nullable,
+                    "default": expected.default,
+                    "identity_generation": expected.identity_generation,
+                }
+                if self.wrong_column and self.wrong_column[:2] == (table, column):
+                    values[self.wrong_column[2]] = self.wrong_column[3]
+                actual = hermes_state_pg._ColumnSpec(**values)
+                rows.append(
+                    (
+                        table,
+                        column,
+                        actual.data_type,
+                        "YES" if actual.nullable else "NO",
+                        actual.default,
+                        "YES" if actual.identity_generation is not None else "NO",
+                        actual.identity_generation,
+                    )
+                )
             return _RowsResult(rows)
-        if "FROM pg_indexes" in sql:
+        if "FROM pg_index AS index_catalog" in sql:
             indexes = (
-                hermes_state_pg._V22_REQUIRED_INDEXES
+                dict(hermes_state_pg._V22_REQUIRED_INDEX_SPECS)
                 if self.catalog_version == 22
-                else hermes_state_pg._REQUIRED_INDEXES
+                else dict(hermes_state_pg._REQUIRED_INDEX_SPECS)
             )
-            return _RowsResult(
-                (index,) for index in indexes
-            )
-        if "constraint_type = 'PRIMARY KEY'" in sql:
-            primary_keys = (
-                hermes_state_pg._V22_REQUIRED_PRIMARY_KEYS
+            if self.include_optional_index:
+                indexes.update(hermes_state_pg._OPTIONAL_INDEX_SPECS)
+            if self.extra_index is not None:
+                indexes[self.extra_index[0]] = self.extra_index[1]
+            rows = []
+            for name, expected in indexes.items():
+                actual = expected
+                if name == self.wrong_index:
+                    actual = hermes_state_pg._index_spec(
+                        "sessions",
+                        "started_at",
+                        opclasses=("float8_ops",),
+                    )
+                rows.append(
+                    (
+                        actual.table,
+                        name,
+                        actual.unique,
+                        True,
+                        True,
+                        True,
+                        actual.access_method,
+                        len(actual.keys),
+                        len(actual.keys),
+                        actual.keys,
+                        actual.options,
+                        actual.opclasses,
+                        actual.predicate,
+                        actual.expression,
+                    )
+                )
+            return _RowsResult(rows)
+        if "FROM pg_constraint AS constraint_catalog" in sql:
+            constraints = (
+                hermes_state_pg._V22_REQUIRED_CONSTRAINT_SPECS
                 if self.catalog_version == 22
-                else hermes_state_pg._REQUIRED_PRIMARY_KEYS
+                else hermes_state_pg._REQUIRED_CONSTRAINT_SPECS
             )
-            return _RowsResult(
-                (table, column, ordinal)
-                for table, columns in primary_keys.items()
-                for ordinal, column in enumerate(columns, start=1)
-            )
-        if "constraint_type = 'FOREIGN KEY'" in sql:
-            foreign_keys = (
-                hermes_state_pg._V22_REQUIRED_FOREIGN_KEYS
-                if self.catalog_version == 22
-                else hermes_state_pg._REQUIRED_FOREIGN_KEYS
-            )
-            return _RowsResult(foreign_keys)
+            rows = []
+            for (table, name), expected in constraints.items():
+                values = {
+                    field: getattr(expected, field)
+                    for field in expected.__dataclass_fields__
+                }
+                if self.wrong_constraint and self.wrong_constraint[0] == (
+                    table,
+                    name,
+                ):
+                    values[self.wrong_constraint[1]] = self.wrong_constraint[2]
+                spec = hermes_state_pg._ConstraintSpec(**values)
+                rows.append(
+                    (
+                        table,
+                        name,
+                        spec.kind,
+                        spec.deferrable,
+                        spec.initially_deferred,
+                        spec.validated,
+                        spec.columns,
+                        spec.referenced_schema,
+                        spec.referenced_table,
+                        spec.referenced_columns,
+                        spec.update_action or " ",
+                        spec.delete_action or " ",
+                        spec.match_type or " ",
+                    )
+                )
+            if self.extra_constraint is not None:
+                rows.append(self.extra_constraint)
+            return _RowsResult(rows)
         if "SELECT id, system_prompt" in sql:
             return _RowsResult(self.prompt_rows)
         if "COUNT(*), MIN(version)" in sql:
@@ -596,6 +675,129 @@ def test_catalog_verification_fails_when_a_v26_column_is_missing():
         PgSessionDB._verify_catalog(conn)
 
 
+def test_catalog_verification_rejects_same_named_wrong_unique_index():
+    conn = _CatalogConn(
+        catalog_version=26,
+        wrong_index="idx_sessions_title_unique",
+    )
+
+    with pytest.raises(RuntimeError, match="idx_sessions_title_unique"):
+        PgSessionDB._verify_catalog(conn)
+
+
+def test_catalog_verification_rejects_wrong_column_type():
+    conn = _CatalogConn(
+        catalog_version=26,
+        wrong_column=("sessions", "started_at", "data_type", "text"),
+    )
+
+    with pytest.raises(RuntimeError, match="sessions.started_at"):
+        PgSessionDB._verify_catalog(conn)
+
+
+def test_catalog_verification_rejects_wrong_column_nullability():
+    conn = _CatalogConn(
+        catalog_version=26,
+        wrong_column=("sessions", "source", "nullable", True),
+    )
+
+    with pytest.raises(RuntimeError, match="sessions.source"):
+        PgSessionDB._verify_catalog(conn)
+
+
+def test_catalog_verification_rejects_wrong_column_default():
+    conn = _CatalogConn(
+        catalog_version=26,
+        wrong_column=("sessions", "archived", "default", "1"),
+    )
+
+    with pytest.raises(RuntimeError, match="sessions.archived"):
+        PgSessionDB._verify_catalog(conn)
+
+
+def test_catalog_verification_rejects_missing_identity_semantics():
+    conn = _CatalogConn(
+        catalog_version=26,
+        wrong_column=(
+            "messages",
+            "id",
+            "identity_generation",
+            None,
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="messages.id"):
+        PgSessionDB._verify_catalog(conn)
+
+
+def test_catalog_verification_rejects_unexpected_constraint():
+    conn = _CatalogConn(
+        catalog_version=26,
+        extra_constraint=(
+            "sessions",
+            "sessions_source_check",
+            "c",
+            False,
+            False,
+            True,
+            ("source",),
+            None,
+            None,
+            (),
+            " ",
+            " ",
+            " ",
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="sessions_source_check"):
+        PgSessionDB._verify_catalog(conn)
+
+
+def test_catalog_verification_rejects_wrong_foreign_key_delete_action():
+    conn = _CatalogConn(
+        catalog_version=26,
+        wrong_constraint=(
+            (
+                "session_model_usage",
+                "session_model_usage_session_id_fkey",
+            ),
+            "delete_action",
+            "a",
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="session_model_usage_session_id_fkey"):
+        PgSessionDB._verify_catalog(conn)
+
+
+def test_catalog_verification_allows_only_the_optional_trigram_index():
+    PgSessionDB._verify_catalog(
+        _CatalogConn(catalog_version=26, include_optional_index=True)
+    )
+
+    conn = _CatalogConn(
+        catalog_version=26,
+        extra_index=(
+            "idx_unreviewed_sessions_source",
+            hermes_state_pg._index_spec("sessions", "source"),
+        ),
+    )
+    with pytest.raises(RuntimeError, match="idx_unreviewed_sessions_source"):
+        PgSessionDB._verify_catalog(conn)
+
+
+def test_catalog_verification_rejects_wrong_optional_trigram_index():
+    conn = _CatalogConn(
+        catalog_version=26,
+        include_optional_index=True,
+        wrong_index="idx_messages_search_trgm",
+    )
+
+    with pytest.raises(RuntimeError, match="idx_messages_search_trgm"):
+        PgSessionDB._verify_catalog(conn)
+
+
 def test_ordinary_boot_refuses_v22_without_running_migration_ddl():
     conn = _CatalogConn()
     db = PgSessionDB.__new__(PgSessionDB)
@@ -617,6 +819,65 @@ def test_explicit_v22_preflight_accepts_only_the_exact_catalog():
     conn = _CatalogConn()
 
     PgSessionDB._assert_v22_migration_precondition(conn)
+
+    assert not any(
+        sql.lstrip().startswith(("CREATE", "ALTER", "INSERT", "UPDATE", "DELETE"))
+        for sql, _ in conn.executed
+    )
+
+
+def test_explicit_v22_preflight_accepts_the_optional_trigram_index():
+    conn = _CatalogConn(include_optional_index=True)
+
+    PgSessionDB._assert_v22_migration_precondition(conn)
+
+    assert not any(
+        sql.lstrip().startswith(("CREATE", "ALTER", "INSERT", "UPDATE", "DELETE"))
+        for sql, _ in conn.executed
+    )
+
+
+@pytest.mark.parametrize(
+    ("catalog_drift", "match"),
+    [
+        (
+            {"wrong_column": ("sessions", "source", "nullable", True)},
+            "sessions.source",
+        ),
+        (
+            {"wrong_index": "idx_sessions_started"},
+            "idx_sessions_started",
+        ),
+        (
+            {
+                "extra_constraint": (
+                    "sessions",
+                    "sessions_source_check",
+                    "c",
+                    False,
+                    False,
+                    True,
+                    ("source",),
+                    None,
+                    None,
+                    (),
+                    " ",
+                    " ",
+                    " ",
+                )
+            },
+            "sessions_source_check",
+        ),
+    ],
+)
+def test_explicit_v22_preflight_rejects_semantic_catalog_drift(
+    catalog_drift,
+    match,
+):
+    conn = _CatalogConn(**catalog_drift)
+
+    with pytest.raises(RuntimeError, match=match):
+        PgSessionDB._assert_v22_migration_precondition(conn)
 
     assert not any(
         sql.lstrip().startswith(("CREATE", "ALTER", "INSERT", "UPDATE", "DELETE"))

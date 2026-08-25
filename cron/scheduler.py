@@ -714,15 +714,39 @@ def try_register_running_job(job_id: str) -> bool:
         # once ``pool.submit`` returns.
         _running_since[job_id] = time.time()
         _running_futures[job_id] = _FUTURE_PENDING
-        return True
+
+    # Registration makes the job visible before this blocking admission gate.
+    # The caller cannot dispatch/execute until ECS acknowledges protection.
+    # Do not hold _running_lock across the PUT: protection reconciliation
+    # evaluates get_running_job_ids() under its own transition lock.
+    try:
+        from gateway.drain_mode import require_task_protection_for_admission_sync
+
+        require_task_protection_for_admission_sync()
+    except Exception:
+        with _running_lock:
+            _running_job_ids.discard(job_id)
+            _running_since.pop(job_id, None)
+            _running_futures.pop(job_id, None)
+        raise
+    return True
 
 
 def release_running_job(job_id: str) -> None:
     """Remove ``job_id`` from the in-flight running set (idempotent)."""
+    removed = False
     with _running_lock:
+        removed = job_id in _running_job_ids
         _running_job_ids.discard(job_id)
         _running_since.pop(job_id, None)
         _running_futures.pop(job_id, None)
+    if removed:
+        try:
+            from gateway.drain_mode import notify_task_protection_work_changed
+
+            notify_task_protection_work_changed()
+        except Exception:
+            logger.debug("Could not wake task-protection release", exc_info=True)
 
 
 def _inflight_min_allowance_minutes() -> float:
@@ -4810,6 +4834,31 @@ class _BoundedCronSessionDB:
         return _bounded
 
 
+def _abort_if_cron_fire_claim_lost(
+    *,
+    agent,
+    cancel_event: Optional[_CancelEventLike],
+    job_name: str,
+) -> None:
+    """Hard-stop work whose durable fire-claim ownership was revoked."""
+    if cancel_event is None or not cancel_event.is_set():
+        return
+    if agent is not None:
+        try:
+            request_hard_interrupt(agent, "Cron fire claim ownership was lost")
+        except Exception:
+            # A broken stop hook must not replace the durable ownership error:
+            # callers use that error to suppress stale output and delivery.
+            logger.debug(
+                "Job '%s': hard interrupt failed after fire claim ownership loss",
+                job_name,
+                exc_info=True,
+            )
+    raise RuntimeError(
+        f"Cron job '{job_name}' lost its durable fire claim ownership"
+    )
+
+
 def run_job(
     job: dict,
     *,
@@ -5852,12 +5901,10 @@ def run_job(
         _last_claim_heartbeat = time.monotonic()
 
         def _abort_if_fire_claim_lost() -> None:
-            if cancel_event is None or not cancel_event.is_set():
-                return
-            if agent is not None and hasattr(agent, "interrupt"):
-                agent.interrupt("Cron fire claim ownership was lost")
-            raise RuntimeError(
-                f"Cron job '{job_name}' lost its durable fire claim ownership"
+            _abort_if_cron_fire_claim_lost(
+                agent=agent,
+                cancel_event=cancel_event,
+                job_name=job_name,
             )
 
         def _heartbeat_run_claim_if_due():
@@ -7255,7 +7302,20 @@ def tick(
                 )
                 _clear_run_claim_best_effort()
                 return None
-            if not try_register_running_job(job_id):
+            from gateway.drain_mode import TaskProtectionUnavailableError
+
+            try:
+                registered = try_register_running_job(job_id)
+            except TaskProtectionUnavailableError as admission_err:
+                _clear_run_claim_best_effort()
+                logger.warning(
+                    "Job '%s' not dispatched because ECS task protection is "
+                    "unavailable: %s",
+                    job.get("name", job_id),
+                    admission_err,
+                )
+                return None
+            if not registered:
                 logger.info("Job '%s' already running — skipping", job.get("name", job_id))
                 return None
             # Record the attempt before executor dispatch. Recovery classifies

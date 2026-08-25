@@ -10,7 +10,9 @@ Covers:
 """
 
 import asyncio
+import threading
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -21,8 +23,10 @@ from gateway.drain_mode import (
     EcsTaskProtection,
     drain_coordinator_loop,
     get_drain_mode,
+    get_task_protection,
     reset_drain_mode_for_tests,
     sigterm_begins_drain,
+    start_drain_mode_tasks,
     task_protection_loop,
 )
 
@@ -58,7 +62,7 @@ class TestDrainModeLatch:
         assert drain.reason == "sigterm"
         assert drain.draining is True
 
-    def test_active_runs_sums_sources_and_tolerates_failures(self):
+    def test_active_runs_sums_sources_and_fails_closed_on_counter_error(self):
         drain = DrainMode()
         drain.register_source("a", lambda: 2)
         drain.register_source("b", lambda: 3)
@@ -67,7 +71,7 @@ class TestDrainModeLatch:
             raise RuntimeError("boom")
 
         drain.register_source("broken", _broken)
-        assert drain.active_runs() == 5
+        assert drain.active_runs() == 6
 
     def test_register_source_replaces_by_name(self):
         drain = DrainMode()
@@ -392,6 +396,22 @@ class TestEcsTaskProtection:
             ),
         ]
 
+    def test_admission_refreshes_locally_protected_state_before_ecs_expiry(self):
+        calls = []
+        protection = EcsTaskProtection(
+            agent_uri="http://ecs-agent.local",
+            expires_minutes=1,
+            http_call=lambda _url, payload: calls.append(dict(payload)),
+        )
+        assert protection.ensure_protected_sync() is True
+        protection._last_set_monotonic -= 31.0
+
+        assert protection.ensure_protected_sync() is True
+        assert calls == [
+            {"ProtectionEnabled": True, "ExpiresInMinutes": 1},
+            {"ProtectionEnabled": True, "ExpiresInMinutes": 1},
+        ]
+
     def test_failure_is_loud_but_never_raises(self, caplog):
         def _boom(url, payload):
             raise OSError("connection refused")
@@ -405,6 +425,36 @@ class TestEcsTaskProtection:
         assert any(
             "task-protection PUT failed" in r.getMessage() for r in caplog.records
         )
+
+    def test_ambiguous_release_forces_next_admission_to_reprotect(self):
+        """A lost release response cannot leave a stale protected belief.
+
+        The ECS agent may apply ``ProtectionEnabled=false`` and then lose the
+        HTTP response.  The client must treat every failed mutation as unknown
+        (therefore locally unprotected), or the next admission can reuse the
+        preceding SET acknowledgement while ECS has already released it.
+        """
+        calls = []
+
+        def _apply_then_maybe_lose_response(_url, payload):
+            calls.append(dict(payload))
+            if payload == {"ProtectionEnabled": False}:
+                raise TimeoutError("release response lost after apply")
+
+        protection = EcsTaskProtection(
+            agent_uri="http://ecs-agent.local",
+            http_call=_apply_then_maybe_lose_response,
+        )
+        assert protection.ensure_protected_sync() is True
+        assert protection.set_protection_sync(False) is False
+
+        assert protection.protected is False
+        assert protection.ensure_protected_sync() is True
+        assert calls == [
+            {"ProtectionEnabled": True, "ExpiresInMinutes": 15},
+            {"ProtectionEnabled": False},
+            {"ProtectionEnabled": True, "ExpiresInMinutes": 15},
+        ]
 
     @pytest.mark.asyncio
     async def test_protection_loop_set_renew_release_ordering(self):
@@ -486,6 +536,110 @@ class TestEcsTaskProtection:
         )
         assert protection.protected is False  # failed, but loop kept running
 
+    @pytest.mark.asyncio
+    async def test_work_change_notification_releases_without_poll_delay(self):
+        state = {"active": 1}
+        drain = DrainMode()
+        drain.register_source("work", lambda: state["active"])
+        calls = []
+        protection = EcsTaskProtection(
+            agent_uri="http://ecs-agent.local",
+            http_call=lambda _url, payload: calls.append(dict(payload)),
+        )
+        loop_task = asyncio.create_task(
+            task_protection_loop(
+                drain,
+                protection,
+                check_interval=60.0,
+                renew_seconds=300.0,
+            )
+        )
+        try:
+            for _ in range(100):
+                if protection.protected:
+                    break
+                await asyncio.sleep(0.01)
+            assert protection.protected
+
+            state["active"] = 0
+            drain_mode.notify_task_protection_work_changed()
+            for _ in range(100):
+                if not protection.protected:
+                    break
+                await asyncio.sleep(0.01)
+            assert not protection.protected, (
+                "release waited for the 60-second polling interval"
+            )
+            assert calls[-1] == {"ProtectionEnabled": False}
+        finally:
+            loop_task.cancel()
+            await asyncio.gather(loop_task, return_exceptions=True)
+
+    @pytest.mark.asyncio
+    async def test_reconcile_reads_active_work_on_the_event_loop_thread(self):
+        """Async-owned work registries must never be sampled by a worker."""
+        event_loop_thread = threading.get_ident()
+        callback_threads = []
+        calls = []
+        protection = EcsTaskProtection(
+            agent_uri="http://ecs-agent.local",
+            http_call=lambda _url, payload: calls.append(dict(payload)),
+        )
+        assert protection.set_protection_sync(True)
+
+        def _active_count():
+            callback_threads.append(threading.get_ident())
+            return 1
+
+        assert await protection.reconcile(_active_count, renew_seconds=300.0)
+
+        assert calls == [
+            {"ProtectionEnabled": True, "ExpiresInMinutes": 15}
+        ]
+        assert protection.protected is True
+        assert callback_threads == [event_loop_thread]
+
+    def test_stale_idle_snapshot_cannot_release_after_new_admission(self):
+        """An admission that wins the transition lock fences an idle snapshot."""
+        calls = []
+        protection = EcsTaskProtection(
+            agent_uri="http://ecs-agent.local",
+            http_call=lambda _url, payload: calls.append(dict(payload)),
+        )
+        assert protection.ensure_protected_sync()
+
+        observed_admission_epoch = protection.admission_epoch
+        assert protection.ensure_protected_sync()
+        assert protection.reconcile_sync(
+            0,
+            renew_seconds=300.0,
+            observed_admission_epoch=observed_admission_epoch,
+        )
+
+        assert calls == [
+            {"ProtectionEnabled": True, "ExpiresInMinutes": 15}
+        ]
+        assert protection.protected is True
+
+    def test_admission_gate_refuses_every_source_after_drain_begins(
+        self, monkeypatch
+    ):
+        """Cron/internal admissions cannot repopulate work during final settle."""
+        calls = []
+        protection = EcsTaskProtection(
+            agent_uri="http://ecs-agent.local",
+            http_call=lambda _url, payload: calls.append(dict(payload)),
+        )
+        monkeypatch.setattr(drain_mode, "_task_protection", protection)
+        assert drain_mode.ensure_task_protection_for_admission_sync()
+
+        get_drain_mode().begin("test")
+
+        assert not drain_mode.ensure_task_protection_for_admission_sync()
+        assert calls == [
+            {"ProtectionEnabled": True, "ExpiresInMinutes": 15}
+        ]
+
 
 # ---------------------------------------------------------------------------
 # Global accessor
@@ -498,12 +652,45 @@ class TestGlobalAccessor:
 
     def test_reset_replaces_instance(self):
         first = get_drain_mode()
+        first_protection = get_task_protection()
         first.begin("test")
         second = reset_drain_mode_for_tests()
         assert second is not first
         assert get_drain_mode() is second
+        assert get_task_protection() is not first_protection
         assert second.draining is False
 
     def test_refusal_contract_constants(self):
         assert DRAIN_REFUSAL_ERROR_CODE == "gateway_draining"
         assert drain_mode.DRAIN_REFUSAL_STATUS == 503
+
+
+class TestRunnerSourceRegistration:
+    @pytest.mark.asyncio
+    async def test_start_registers_non_api_relay_and_cron_work(self):
+        state = {"relay": 2, "cron": 1}
+        forced = []
+
+        async def _stop():
+            return None
+
+        runner = SimpleNamespace(
+            _background_tasks=set(),
+            _running_agent_count=lambda: state["relay"],
+            _active_cron_job_count=lambda: state["cron"],
+            _drain_mode_force_terminate=lambda reason: forced.append(reason) or 3,
+            stop=_stop,
+        )
+        tasks = start_drain_mode_tasks(runner)
+        try:
+            drain = get_drain_mode()
+            assert drain.active_runs() == 3
+            assert drain.force_terminate_all("hard cap") == 3
+            assert forced == ["hard cap"]
+
+            state.update(relay=0, cron=0)
+            assert drain.active_runs() == 0
+        finally:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)

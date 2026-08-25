@@ -50,6 +50,33 @@ class TestActiveCronJobCount:
         runner, _adapter = make_restart_runner()
         assert runner._active_cron_job_count() == 0
 
+    def test_drain_cap_force_reaches_relay_and_cron_work(self, monkeypatch):
+        import cron.scheduler as sched
+        import tools.process_registry as process_registry_module
+
+        runner, _adapter = make_restart_runner()
+        relay_agent = MagicMock()
+        runner._running_agents = {"relay-session": relay_agent}
+        sched._running_job_ids.add("cron-job")
+        killed = []
+        marked = []
+
+        monkeypatch.setattr(
+            process_registry_module.process_registry,
+            "kill_all",
+            lambda: killed.append(True) or 1,
+        )
+        monkeypatch.setattr(
+            sched,
+            "mark_running_jobs_interrupted",
+            lambda reason: marked.append(reason) or ["cron-job"],
+        )
+
+        assert runner._drain_mode_force_terminate("drain cap") == 2
+        relay_agent.interrupt.assert_called_once_with("drain cap")
+        assert killed == [True]
+        assert marked == ["drain cap"]
+
 
 class TestDrainWaitsForCronWork:
 
@@ -115,4 +142,3 @@ class TestKillToolSubprocessesMarksCronInterrupted:
 
         assert marked_calls, "mark_running_jobs_interrupted was never called during shutdown"
         assert any(result == ["job-1"] for _reason, result in marked_calls)
-

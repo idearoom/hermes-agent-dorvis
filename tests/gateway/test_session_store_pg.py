@@ -380,6 +380,18 @@ def test_boot_fails_on_persisted_surface_mismatch(pg_db):
         PgSessionDB(dsn=_DSN)
 
 
+def test_boot_rejects_same_named_wrong_unique_index(pg_db):
+    with psycopg.connect(_DSN, autocommit=True) as conn:
+        conn.execute(f"DROP INDEX {_SCHEMA}.idx_sessions_title_unique")
+        conn.execute(
+            f"CREATE INDEX idx_sessions_title_unique "
+            f"ON {_SCHEMA}.sessions(started_at)"
+        )
+
+    with pytest.raises(RuntimeError, match="idx_sessions_title_unique"):
+        PgSessionDB(dsn=_DSN)
+
+
 # ── drained v22 → v26 explicit migration ────────────────────────────────────
 
 
@@ -576,6 +588,30 @@ def test_migration_preflight_rejects_partial_v22_without_widening():
     applied = _run_v26_migration("--apply")
     assert applied.returncode != 0
     assert "v22 migration source catalog verification failed" in applied.stderr
+
+    with psycopg.connect(_DSN, autocommit=True) as conn:
+        assert _catalog_signature(conn) == before
+        assert conn.execute(
+            f"SELECT version FROM {_SCHEMA}.schema_version"
+        ).fetchone()[0] == 22
+
+
+def test_migration_preflight_rejects_same_named_wrong_v22_index():
+    _drop_schema()
+    with psycopg.connect(_DSN, autocommit=True) as conn:
+        _create_frozen_v22_store(conn)
+        conn.execute(f"DROP INDEX {_SCHEMA}.idx_sessions_started")
+        conn.execute(
+            f"CREATE INDEX idx_sessions_started ON {_SCHEMA}.sessions(source)"
+        )
+        before = _catalog_signature(conn)
+
+    dry_run = _run_v26_migration()
+    assert dry_run.returncode != 0
+    assert "idx_sessions_started" in dry_run.stderr
+    applied = _run_v26_migration("--apply")
+    assert applied.returncode != 0
+    assert "idx_sessions_started" in applied.stderr
 
     with psycopg.connect(_DSN, autocommit=True) as conn:
         assert _catalog_signature(conn) == before

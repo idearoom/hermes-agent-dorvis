@@ -1195,7 +1195,7 @@ class TestDocxExtraction(unittest.TestCase):
         with self.assertRaisesRegex(ExtractionError, "maximum nesting depth"):
             extract_document_text(p)
 
-    def test_empty_element_stress_hits_document_element_bound(self):
+    def test_document_element_bound_returns_bounded_body_prefix(self):
         from tools import read_extract
 
         p = os.path.join(self.tmp, "many-empty-elements.docx")
@@ -1208,8 +1208,11 @@ class TestDocxExtraction(unittest.TestCase):
             ),
         )
         with mock.patch.object(read_extract, "MAX_DOCX_XML_ELEMENTS", 1_000):
-            with self.assertRaisesRegex(ExtractionError, "more than 1,000 elements"):
-                extract_document_text(p)
+            text = extract_document_text(p)
+
+        self.assertIn("start", text)
+        self.assertIn("Extraction truncated", text)
+        self.assertIn("1,000-element DOCX body safety limit", text)
 
     def test_encrypted_member_is_rejected_before_member_read(self):
         p = os.path.join(self.tmp, "encrypted.docx")
@@ -2139,49 +2142,42 @@ class TestReadFileToolIntegration(unittest.TestCase):
         self.assertIn("offset=4", result["hint"])
         self.assertIn("bounded raw snapshot", result["note"])
 
-    def test_valid_but_unreadable_notebook_does_not_use_raw_fallback(self):
-        from tools import file_tools
-        from tools.file_operations import ReadResult
+    def test_semantically_unreadable_notebooks_use_bounded_raw_fallback(self):
+        cases = (
+            ("root", [], "Notebook root is not an object"),
+            (
+                "no-cells",
+                {"metadata": {}, "nbformat": 4},
+                "Notebook contains no cells",
+            ),
+            (
+                "no-readable-cells",
+                {
+                    "cells": [{}],
+                    "metadata": {},
+                    "nbformat": 4,
+                    "nbformat_minor": 5,
+                },
+                "Notebook contains no readable cells",
+            ),
+        )
 
-        payload = json.dumps({
-            "cells": [{}],
-            "metadata": {},
-            "nbformat": 4,
-            "nbformat_minor": 5,
-        }).encode("utf-8")
+        for name, notebook, reason in cases:
+            with self.subTest(case=name):
+                path = os.path.join(self.tmp, f"{name}.ipynb")
+                with open(path, "w", encoding="utf-8") as fh:
+                    json.dump(notebook, fh)
 
-        class FakeFileOps:
-            env = object()
-
-            def read_file_bytes(self, path, max_bytes=None):
-                return ReadResult(
-                    base64_content=base64.b64encode(payload).decode("ascii"),
-                    file_size=len(payload),
-                    is_binary=False,
+                result = json.loads(
+                    read_file_tool(path, task_id=f"semantic-fallback-{name}")
                 )
 
-            def read_file(self, path, offset, limit):
-                raise AssertionError("post-parse notebook must not be re-read")
-
-            @staticmethod
-            def _add_line_numbers(content, start_line=1):
-                raise AssertionError("post-parse notebook must not paginate raw JSON")
-
-        with mock.patch.object(file_tools, "_get_file_ops", return_value=FakeFileOps()), \
-                mock.patch.object(
-                    file_tools,
-                    "_resolve_path_for_task",
-                    return_value=file_tools.PurePosixPath(
-                        "/workspace/unreadable.ipynb"
-                    ),
-                ):
-            result = json.loads(
-                read_file_tool("/workspace/unreadable.ipynb", task_id="remote")
-            )
-
-        self.assertIn("error", result)
-        self.assertIn("contains no readable cells", result["error"])
-        self.assertNotIn("raw_notebook_fallback", result)
+                self.assertNotIn("error", result)
+                self.assertTrue(result.get("raw_notebook_fallback"))
+                self.assertFalse(result.get("extracted_document", False))
+                self.assertIn(reason, result["note"])
+                self.assertIn("bounded raw snapshot", result["note"])
+                self.assertTrue(result["content"])
 
     def test_busy_native_reader_rejects_before_backend_transport(self):
         from tools import file_tools, read_extract

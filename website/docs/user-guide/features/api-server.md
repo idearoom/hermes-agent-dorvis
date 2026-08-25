@@ -202,7 +202,11 @@ retrievable with status `cancelled` so `GET /v1/responses/{id}` and
 
 Returns `200` with the cancelled response object, `409` when the response has
 already reached a terminal state (a repeated cancel lands here), or `404` for
-an unknown id.
+an unknown id. A retryable `503` means the request reached a sibling gateway
+that can read the shared row but cannot route an interrupt to its owner, or
+that the owning gateway could not acknowledge and durably commit the cancel.
+The stored response remains nonterminal in those cases; retry instead of
+assuming containment.
 
 The cancelled envelope carries the usage the run accrued before it was stopped,
 so an abandoned turn's spend is still visible. Token counts are committed when
@@ -221,7 +225,9 @@ does not mint its id until the run has already finished.
 
 ### DELETE /v1/responses/\{id\}
 
-Delete a stored response.
+Delete a terminal stored response. An active response returns `409`; cancel it
+successfully before deleting it. Terminal deletion atomically removes any
+conversation mapping that points at the response.
 
 ### GET /v1/models
 

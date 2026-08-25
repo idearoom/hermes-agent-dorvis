@@ -47,6 +47,117 @@ class TestPersistentPool:
 class TestRunningJobGuard:
     """_running_job_ids prevents double-dispatch of active jobs."""
 
+    def test_running_registration_waits_for_task_protection_ack(self, monkeypatch):
+        """Cron work is protected before a pool/manual caller may run it."""
+        from gateway import drain_mode
+        from gateway.drain_mode import EcsTaskProtection, reset_drain_mode_for_tests
+        import cron.scheduler as sched
+
+        reset_drain_mode_for_tests()
+        sched._running_job_ids.clear()
+        put_started = threading.Event()
+        allow_ack = threading.Event()
+        registration_returned = threading.Event()
+        result = []
+
+        def _delayed_put(_url, _payload):
+            put_started.set()
+            assert allow_ack.wait(5.0), "test never released the ECS PUT"
+
+        monkeypatch.setattr(
+            drain_mode,
+            "_task_protection",
+            EcsTaskProtection(
+                agent_uri="http://ecs-agent.local",
+                http_call=_delayed_put,
+            ),
+        )
+
+        def _register():
+            result.append(sched.try_register_running_job("protected-job"))
+            registration_returned.set()
+
+        worker = threading.Thread(target=_register, daemon=True)
+        try:
+            worker.start()
+            assert put_started.wait(2.0)
+            assert "protected-job" in sched.get_running_job_ids()
+            assert not registration_returned.is_set(), (
+                "cron registration returned before task protection acknowledgement"
+            )
+            allow_ack.set()
+            worker.join(2.0)
+            assert result == [True]
+        finally:
+            allow_ack.set()
+            worker.join(2.0)
+            sched.release_running_job("protected-job")
+            reset_drain_mode_for_tests()
+
+    def test_failed_task_protection_rolls_back_cron_registration(self, monkeypatch):
+        from gateway import drain_mode
+        from gateway.drain_mode import EcsTaskProtection, reset_drain_mode_for_tests
+        import cron.scheduler as sched
+
+        reset_drain_mode_for_tests()
+        sched._running_job_ids.clear()
+
+        def _failed_put(_url, _payload):
+            raise OSError("ECS agent unavailable")
+
+        monkeypatch.setattr(
+            drain_mode,
+            "_task_protection",
+            EcsTaskProtection(
+                agent_uri="http://ecs-agent.local",
+                http_call=_failed_put,
+            ),
+        )
+        try:
+            with pytest.raises(RuntimeError, match="task protection"):
+                sched.try_register_running_job("unprotected-job")
+            assert "unprotected-job" not in sched.get_running_job_ids()
+        finally:
+            sched._running_job_ids.discard("unprotected-job")
+            reset_drain_mode_for_tests()
+
+    def test_tick_skips_job_when_task_protection_is_unavailable(
+        self, monkeypatch, caplog
+    ):
+        """One failed ECS admission must not abort the scheduler tick."""
+        import cron.scheduler as sched
+        from gateway.drain_mode import TaskProtectionUnavailableError
+
+        job = {
+            "id": "unprotected-job",
+            "name": "unprotected-job",
+            "prompt": "test",
+            "schedule": {"kind": "interval", "minutes": 5},
+            "enabled": True,
+            "next_run_at": "2020-01-01T00:00:00",
+            "deliver": "local",
+        }
+        execution_calls = []
+
+        monkeypatch.setattr(sched, "get_due_jobs", lambda: [job])
+        monkeypatch.setattr(sched, "advance_next_runs", lambda _ids: None)
+        monkeypatch.setattr(
+            sched,
+            "try_register_running_job",
+            lambda _job_id: (_ for _ in ()).throw(
+                TaskProtectionUnavailableError("ECS acknowledgement failed")
+            ),
+        )
+        monkeypatch.setattr(
+            sched,
+            "create_execution",
+            lambda *_a, **_kw: execution_calls.append(True),
+        )
+
+        assert sched.tick(verbose=False) == 0
+        assert execution_calls == []
+        assert "task protection is unavailable" in caplog.text
+
     def test_running_set_prevents_double_dispatch(self, tmp_path, monkeypatch):
         """A job already in _running_job_ids is skipped on the next tick."""
         import cron.scheduler as sched

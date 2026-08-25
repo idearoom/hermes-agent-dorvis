@@ -10675,20 +10675,60 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return snapshot, timed_out
 
     def _interrupt_running_agents(self, reason: str) -> None:
-        for session_key, agent in list(self._running_agents.items()):
-            if agent is _AGENT_PENDING_SENTINEL:
-                continue
-            try:
-                request_hard_interrupt(agent, reason)
-                logger.debug("Interrupted running agent for session %s during shutdown", session_key)
-            except Exception as e:
-                logger.debug("Failed interrupting agent during shutdown: %s", e)
+        self._interrupt_relay_agents(reason)
         # API-server / desk turns are adapter-owned and never enter
-        # _running_agents, so the loop above cannot see them even though
+        # _running_agents, so the relay loop cannot see them even though
         # _drain_active_agents() waited for them (#63529).
         interrupted_api = self._interrupt_api_server_runs(reason)
         if interrupted_api:
             logger.debug("Interrupted %d api_server run(s) during shutdown", interrupted_api)
+
+    def _interrupt_relay_agents(self, reason: str) -> int:
+        """Interrupt only relay/session agents and return accepted signals."""
+        interrupted = 0
+        for session_key, agent in list(self._running_agents.items()):
+            if agent is _AGENT_PENDING_SENTINEL:
+                continue
+            try:
+                if request_hard_interrupt(agent, reason):
+                    interrupted += 1
+                logger.debug("Interrupted running agent for session %s during shutdown", session_key)
+            except Exception as e:
+                logger.debug("Failed interrupting agent during shutdown: %s", e)
+        return interrupted
+
+    def _drain_mode_force_terminate(self, reason: str) -> int:
+        """Force the runner-owned (relay + cron) half of drain work.
+
+        API work has its own DrainMode source/terminator. Cron agents are
+        thread-pool owned and expose no agent registry, so at the hard drain
+        cap we kill their registered tool subprocesses and fence their
+        terminal writes as interrupted, matching the existing forced-shutdown
+        contract.
+        """
+        interrupted = self._interrupt_relay_agents(reason)
+        try:
+            from cron.scheduler import (
+                get_running_job_ids,
+                mark_running_jobs_interrupted,
+            )
+
+            cron_ids = get_running_job_ids()
+            if cron_ids:
+                try:
+                    from tools.process_registry import process_registry
+
+                    process_registry.kill_all()
+                except Exception:
+                    logger.debug(
+                        "Drain cap could not kill cron tool subprocesses",
+                        exc_info=True,
+                    )
+                marked = mark_running_jobs_interrupted(reason)
+                interrupted += len(set(marked) | set(cron_ids))
+        except Exception:
+            logger.debug("Drain cap could not interrupt cron work", exc_info=True)
+        return interrupted
 
     async def _notify_interrupted_cron_jobs(self, job_ids) -> int:
         """Tell the owner of each just-interrupted cron job that its run died.
@@ -11882,6 +11922,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         returns.
         """
         try:
+            from gateway.drain_mode import ensure_task_protection_for_admission
+
+            if not await ensure_task_protection_for_admission():
+                logger.error(
+                    "Startup resume for %s was not started because ECS task "
+                    "protection could not be acknowledged; resume_pending is retained",
+                    session_key,
+                )
+                return
             await adapter.handle_message(event)
             session_tasks = getattr(adapter, "_session_tasks", {})
             task = session_tasks.get(session_key) if isinstance(session_tasks, dict) else None
@@ -13366,8 +13415,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         # AE-117 drain mode (parent-repo ADR 0177): start the drain
         # coordinator (refuse-new/finish-in-flight/self-exit-at-zero) and the
-        # ECS task scale-in protection manager. Both are no-ops until a drain
-        # begins / when ECS_AGENT_URI is absent.
+        # ECS task scale-in protection manager. The coordinator idles until a
+        # drain begins; protection reconciles admitted API, relay, and cron
+        # work continuously and is a no-op when ECS_AGENT_URI is absent.
         try:
             from gateway.drain_mode import start_drain_mode_tasks
             start_drain_mode_tasks(self)
@@ -18005,6 +18055,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _claim_state.turn.agent = _AGENT_PENDING_SENTINEL
         _claim_state.turn.started_ts = time.time()
         self._persist_active_agents()
+
+        # The sentinel makes this 0 -> 1 transition visible before the await.
+        # Do not enter agent setup until the ECS agent has acknowledged scale-
+        # in protection; otherwise a just-admitted relay turn can run for the
+        # whole protection-loop polling interval (or be drained as idle).
+        try:
+            from gateway.drain_mode import ensure_task_protection_for_admission
+
+            _task_protected = await ensure_task_protection_for_admission()
+        except BaseException:
+            self._release_running_agent_state(_quick_key)
+            raise
+        if not _task_protected:
+            self._release_running_agent_state(_quick_key)
+            logger.error(
+                "Refusing new relay turn for session %s because ECS task "
+                "protection could not be acknowledged",
+                _quick_key,
+            )
+            return (
+                "⏳ This agent could not reserve a protected execution slot. "
+                "Please resend in a moment."
+            )
         _run_generation = self._begin_session_run_generation(_quick_key)
 
         try:
@@ -26448,6 +26521,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # between lifecycle transitions.  Preserves gateway_state (see
         # _persist_active_agents).
         self._persist_active_agents()
+        try:
+            from gateway.drain_mode import notify_task_protection_work_changed
+
+            notify_task_protection_work_changed()
+        except Exception:
+            logger.debug("Could not wake task-protection release", exc_info=True)
         return True
 
     def _release_turn_lease(self, session_key: str, run_generation: int) -> bool:

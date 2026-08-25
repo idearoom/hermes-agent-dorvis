@@ -6,7 +6,7 @@ Exposes an HTTP server with endpoints:
 - POST /v1/responses               — OpenAI Responses API format (stateful via previous_response_id; X-Hermes-Session-Key supported)
 - GET  /v1/responses/{response_id} — Retrieve a stored response
 - POST /v1/responses/{response_id}/cancel — Terminate an in-flight response, preserving its envelope
-- DELETE /v1/responses/{response_id} — Delete a stored response
+- DELETE /v1/responses/{response_id} — Delete a terminal stored response
 - GET  /v1/models                  — lists hermes-agent and any configured model_routes aliases
 - GET  /v1/capabilities            — machine-readable API capabilities for external UIs
 - GET  /api/sessions               — list client-visible Hermes sessions
@@ -1133,6 +1133,21 @@ def check_api_server_requirements() -> bool:
     return AIOHTTP_AVAILABLE
 
 
+_RESPONSE_TERMINAL_STATUSES = frozenset(
+    {"completed", "failed", "cancelled", "canceled", "incomplete"}
+)
+
+
+def _response_record_is_terminal(data: Dict[str, Any]) -> bool:
+    """Infer lifecycle state for compatibility writes without ownership."""
+    response = data.get("response") if isinstance(data, dict) else None
+    if not isinstance(response, dict) or not response.get("status"):
+        # Historical callers only persisted completed records and did not
+        # carry lifecycle metadata.  Preserve their delete behavior.
+        return True
+    return str(response.get("status")) in _RESPONSE_TERMINAL_STATUSES
+
+
 class ResponseStore:
     """
     SQLite-backed LRU store for Responses API state.
@@ -1147,6 +1162,7 @@ class ResponseStore:
 
     def __init__(self, max_size: int = MAX_STORED_RESPONSES, db_path: str = None):
         self._max_size = max_size
+        self._lock = threading.RLock()
         if db_path is None:
             try:
                 from hermes_cli.config import get_hermes_home
@@ -1169,9 +1185,37 @@ class ResponseStore:
             """CREATE TABLE IF NOT EXISTS responses (
                 response_id TEXT PRIMARY KEY,
                 data TEXT NOT NULL,
-                accessed_at REAL NOT NULL
+                accessed_at REAL NOT NULL,
+                owner_id TEXT,
+                owner_epoch TEXT,
+                terminal INTEGER NOT NULL DEFAULT 0
             )"""
         )
+        response_columns = {
+            row[1] for row in self._conn.execute("PRAGMA table_info(responses)")
+        }
+        for column, ddl in (
+            ("owner_id", "TEXT"),
+            ("owner_epoch", "TEXT"),
+            ("terminal", "INTEGER NOT NULL DEFAULT 0"),
+        ):
+            if column not in response_columns:
+                self._conn.execute(f"ALTER TABLE responses ADD COLUMN {column} {ddl}")
+        # Existing databases predate the lifecycle column.  Backfill from the
+        # envelope once; the local store is capped and this migration avoids a
+        # JSON1 dependency in embedded SQLite builds.
+        for existing_id, existing_data in self._conn.execute(
+            "SELECT response_id, data FROM responses WHERE terminal = 0"
+        ).fetchall():
+            try:
+                existing_record = json.loads(existing_data)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if _response_record_is_terminal(existing_record):
+                self._conn.execute(
+                    "UPDATE responses SET terminal = 1 WHERE response_id = ?",
+                    (existing_id,),
+                )
         self._conn.execute(
             """CREATE TABLE IF NOT EXISTS conversations (
                 name TEXT PRIMARY KEY,
@@ -1185,6 +1229,142 @@ class ResponseStore:
         # rather than after every commit — chmod-on-every-write is wasted
         # syscalls on a hot path.
         self._tighten_file_permissions()
+
+    def claim(
+        self,
+        response_id: str,
+        data: Dict[str, Any],
+        *,
+        owner_id: str,
+        owner_epoch: str,
+        conversation: Optional[str] = None,
+        terminal: bool = False,
+    ) -> bool:
+        """Atomically create an owned streaming response and its mapping."""
+        with self._lock, self._conn:
+            cursor = self._conn.execute(
+                """INSERT OR IGNORE INTO responses
+                   (response_id, data, accessed_at, owner_id, owner_epoch, terminal)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (
+                    response_id,
+                    json.dumps(data, default=str),
+                    time.time(),
+                    owner_id,
+                    owner_epoch,
+                    int(terminal),
+                ),
+            )
+            if cursor.rowcount != 1:
+                return False
+            if conversation:
+                self._conn.execute(
+                    "INSERT OR REPLACE INTO conversations (name, response_id) VALUES (?, ?)",
+                    (conversation, response_id),
+                )
+            if terminal:
+                self._evict_terminal_overflow_locked()
+            return True
+
+    def get_control(self, response_id: str) -> Optional[Dict[str, Any]]:
+        """Return durable ownership and terminal state without response data."""
+        with self._lock:
+            row = self._conn.execute(
+                """SELECT owner_id, owner_epoch, terminal
+                   FROM responses WHERE response_id = ?""",
+                (response_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "owner_id": row[0],
+            "owner_epoch": row[1],
+            "terminal": bool(row[2]),
+        }
+
+    def transition(
+        self,
+        response_id: str,
+        data: Dict[str, Any],
+        *,
+        owner_id: str,
+        owner_epoch: str,
+        terminal: bool,
+    ) -> bool:
+        """Owner/epoch CAS from nonterminal to the supplied next snapshot.
+
+        Once ``terminal`` is true no later writer can update the row.  The
+        update-only operation also cannot resurrect a response deleted after
+        reaching a terminal state.
+        """
+        with self._lock, self._conn:
+            cursor = self._conn.execute(
+                """UPDATE responses
+                   SET data = ?, accessed_at = ?, terminal = ?
+                   WHERE response_id = ?
+                     AND owner_id = ?
+                     AND owner_epoch = ?
+                     AND terminal = 0""",
+                (
+                    json.dumps(data, default=str),
+                    time.time(),
+                    int(terminal),
+                    response_id,
+                    owner_id,
+                    owner_epoch,
+                ),
+            )
+            updated = cursor.rowcount == 1
+            if updated and terminal:
+                self._evict_terminal_overflow_locked()
+            return updated
+
+    def _evict_terminal_overflow_locked(self) -> None:
+        """Bound terminal rows while preserving every active owned response."""
+        terminal_count = self._conn.execute(
+            "SELECT COUNT(*) FROM responses WHERE terminal = 1"
+        ).fetchone()[0]
+        if terminal_count <= self._max_size:
+            return
+        evict_ids = [
+            row[0]
+            for row in self._conn.execute(
+                """SELECT response_id FROM responses
+                   WHERE terminal = 1
+                   ORDER BY accessed_at ASC LIMIT ?""",
+                (terminal_count - self._max_size,),
+            ).fetchall()
+        ]
+        if not evict_ids:
+            return
+        placeholders = ",".join("?" for _ in evict_ids)
+        self._conn.execute(
+            f"DELETE FROM conversations WHERE response_id IN ({placeholders})",
+            evict_ids,
+        )
+        self._conn.execute(
+            f"DELETE FROM responses WHERE response_id IN ({placeholders})",
+            evict_ids,
+        )
+
+    def delete_terminal(self, response_id: str) -> str:
+        """Atomically delete only a terminal response and its mappings."""
+        with self._lock, self._conn:
+            row = self._conn.execute(
+                "SELECT terminal FROM responses WHERE response_id = ?",
+                (response_id,),
+            ).fetchone()
+            if row is None:
+                return "not_found"
+            if not bool(row[0]):
+                return "active"
+            self._conn.execute(
+                "DELETE FROM conversations WHERE response_id = ?", (response_id,)
+            )
+            self._conn.execute(
+                "DELETE FROM responses WHERE response_id = ?", (response_id,)
+            )
+            return "deleted"
 
     def _tighten_file_permissions(self) -> None:
         """Force owner-only permissions on the DB and SQLite sidecars."""
@@ -1207,87 +1387,78 @@ class ResponseStore:
 
     def get(self, response_id: str) -> Optional[Dict[str, Any]]:
         """Retrieve a stored response by ID (updates access time for LRU)."""
-        row = self._conn.execute(
-            "SELECT data FROM responses WHERE response_id = ?", (response_id,)
-        ).fetchone()
-        if row is None:
-            return None
-        self._conn.execute(
-            "UPDATE responses SET accessed_at = ? WHERE response_id = ?",
-            (time.time(), response_id),
-        )
-        self._conn.commit()
-        try:
-            return json.loads(row[0])
-        except (json.JSONDecodeError, TypeError):
-            logger.warning(
-                "Corrupted JSON in response store for id=%s, evicting entry",
-                response_id,
-            )
+        with self._lock, self._conn:
+            row = self._conn.execute(
+                "SELECT data FROM responses WHERE response_id = ?", (response_id,)
+            ).fetchone()
+            if row is None:
+                return None
             self._conn.execute(
-                "DELETE FROM responses WHERE response_id = ?",
-                (response_id,),
+                "UPDATE responses SET accessed_at = ? WHERE response_id = ?",
+                (time.time(), response_id),
             )
-            self._conn.commit()
-            return None
+            try:
+                return json.loads(row[0])
+            except (json.JSONDecodeError, TypeError):
+                logger.warning(
+                    "Corrupted JSON in response store for id=%s, evicting entry",
+                    response_id,
+                )
+                self._conn.execute(
+                    "DELETE FROM conversations WHERE response_id = ?",
+                    (response_id,),
+                )
+                self._conn.execute(
+                    "DELETE FROM responses WHERE response_id = ?",
+                    (response_id,),
+                )
+                return None
 
     def put(self, response_id: str, data: Dict[str, Any]) -> None:
         """Store a response, evicting the oldest if at capacity."""
-        self._conn.execute(
-            "INSERT OR REPLACE INTO responses (response_id, data, accessed_at) VALUES (?, ?, ?)",
-            (response_id, json.dumps(data, default=str), time.time()),
-        )
-        # Evict oldest entries beyond max_size
-        count = self._conn.execute("SELECT COUNT(*) FROM responses").fetchone()[0]
-        if count > self._max_size:
-            # Collect IDs that will be evicted
-            evict_ids = [
-                row[0]
-                for row in self._conn.execute(
-                    "SELECT response_id FROM responses ORDER BY accessed_at ASC LIMIT ?",
-                    (count - self._max_size,),
-                ).fetchall()
-            ]
-            if evict_ids:
-                placeholders = ",".join("?" for _ in evict_ids)
-                # Clear conversation mappings pointing to evicted responses
-                self._conn.execute(
-                    f"DELETE FROM conversations WHERE response_id IN ({placeholders})",
-                    evict_ids,
-                )
-                # Delete evicted responses
-                self._conn.execute(
-                    f"DELETE FROM responses WHERE response_id IN ({placeholders})",
-                    evict_ids,
-                )
-        self._conn.commit()
+        with self._lock, self._conn:
+            self._conn.execute(
+                """INSERT OR REPLACE INTO responses
+                   (response_id, data, accessed_at, owner_id, owner_epoch, terminal)
+                   VALUES (?, ?, ?, NULL, NULL, ?)""",
+                (
+                    response_id,
+                    json.dumps(data, default=str),
+                    time.time(),
+                    int(_response_record_is_terminal(data)),
+                ),
+            )
+            self._evict_terminal_overflow_locked()
 
     def delete(self, response_id: str) -> bool:
         """Remove a response from the store. Returns True if found and deleted."""
-        # Clear conversation mappings pointing to this response
-        self._conn.execute(
-            "DELETE FROM conversations WHERE response_id = ?", (response_id,)
-        )
-        cursor = self._conn.execute(
-            "DELETE FROM responses WHERE response_id = ?", (response_id,)
-        )
-        self._conn.commit()
-        return cursor.rowcount > 0
+        with self._lock, self._conn:
+            # Clear conversation mappings pointing to this response
+            self._conn.execute(
+                "DELETE FROM conversations WHERE response_id = ?", (response_id,)
+            )
+            cursor = self._conn.execute(
+                "DELETE FROM responses WHERE response_id = ?", (response_id,)
+            )
+            return cursor.rowcount > 0
 
     def get_conversation(self, name: str) -> Optional[str]:
         """Get the latest response_id for a conversation name."""
-        row = self._conn.execute(
-            "SELECT response_id FROM conversations WHERE name = ?", (name,)
-        ).fetchone()
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT response_id FROM conversations WHERE name = ?", (name,)
+            ).fetchone()
         return row[0] if row else None
 
-    def set_conversation(self, name: str, response_id: str) -> None:
-        """Map a conversation name to its latest response_id."""
-        self._conn.execute(
-            "INSERT OR REPLACE INTO conversations (name, response_id) VALUES (?, ?)",
-            (name, response_id),
-        )
-        self._conn.commit()
+    def set_conversation(self, name: str, response_id: str) -> bool:
+        """Map a name only while the referenced response still exists."""
+        with self._lock, self._conn:
+            cursor = self._conn.execute(
+                """INSERT OR REPLACE INTO conversations (name, response_id)
+                   SELECT ?, response_id FROM responses WHERE response_id = ?""",
+                (name, response_id),
+            )
+            return cursor.rowcount == 1
 
     def close(self) -> None:
         """Close the database connection."""
@@ -1301,7 +1472,8 @@ class ResponseStore:
         return {"backend": "sqlite"}
 
     def __len__(self) -> int:
-        row = self._conn.execute("SELECT COUNT(*) FROM responses").fetchone()
+        with self._lock:
+            row = self._conn.execute("SELECT COUNT(*) FROM responses").fetchone()
         return row[0] if row else 0
 
 
@@ -1486,6 +1658,26 @@ _api_agent_request_reservation: ContextVar[Optional[dict[str, bool]]] = ContextV
 )
 
 
+async def _ensure_admitted_task_protection() -> bool:
+    """Wait for ECS protection acknowledgement before agent work executes."""
+    from gateway.drain_mode import ensure_task_protection_for_admission
+
+    return await ensure_task_protection_for_admission()
+
+
+def _task_protection_unavailable_response():
+    """Retryable refusal when ECS cannot protect a newly admitted turn."""
+    return web.json_response(
+        _openai_error(
+            "Gateway could not protect this task for agent execution; retry shortly.",
+            err_type="unavailable_error",
+            code="task_protection_unavailable",
+        ),
+        status=503,
+        headers={"Retry-After": "2"},
+    )
+
+
 def _admit_api_agent_request(handler):
     """Reserve an authenticated API turn before its handler first awaits.
 
@@ -1508,11 +1700,16 @@ def _admit_api_agent_request(handler):
         token = _api_agent_request_reservation.set(reservation)
         self._pending_agent_requests += 1
         try:
+            if not await _ensure_admitted_task_protection():
+                return _task_protection_unavailable_response()
             return await handler(self, request, *args, **kwargs)
         finally:
             if reservation["active"]:
                 reservation["active"] = False
                 self._pending_agent_requests = max(0, self._pending_agent_requests - 1)
+                from gateway.drain_mode import notify_task_protection_work_changed
+
+                notify_task_protection_work_changed()
             _api_agent_request_reservation.reset(token)
 
     return _wrapped
@@ -1523,6 +1720,9 @@ def _release_pending_api_work(adapter, reservation: dict[str, bool]) -> None:
     if reservation["active"]:
         reservation["active"] = False
         adapter._pending_agent_requests = max(0, adapter._pending_agent_requests - 1)
+        from gateway.drain_mode import notify_task_protection_work_changed
+
+        notify_task_protection_work_changed()
 
 
 @contextmanager
@@ -1800,14 +2000,18 @@ class APIServerAdapter(BasePlatformAdapter):
         self._runner: Optional["web.AppRunner"] = None
         self._site: Optional["web.TCPSite"] = None
         self._response_store = make_response_store()
+        # A fresh token per gateway process/adapter.  Streaming responses also
+        # carry a per-response epoch; both are persisted so a sibling ECS task
+        # can distinguish a row it can read from a run it can actually stop.
+        self._response_owner_id = uuid.uuid4().hex
         # Streaming /v1/responses turns still owned by this process, keyed by
         # response_id, for POST /v1/responses/{id}/cancel. The value is the
         # same mutable dict the SSE writer holds, so the cancel handler and
         # the writer agree on whether a terminal `cancelled` snapshot was
         # already persisted. Registration is per-process: a cancel that lands
         # on a different gateway task (only possible during a blue/green
-        # deploy overlap, ADR 0177) can mark the shared stored envelope
-        # terminal but cannot reach the other task's executor thread.
+        # deploy overlap, ADR 0177) returns retryable 503 and leaves the row
+        # unchanged because it cannot acknowledge an owner-thread interrupt.
         self._inflight_responses: Dict[str, Dict[str, Any]] = {}
         # Active run streams: run_id -> asyncio.Queue of SSE event dicts
         self._run_streams: Dict[str, "asyncio.Queue[Optional[Dict]]"] = {}
@@ -1893,7 +2097,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 + sum(not task.done() for task in self._active_run_tasks.values())
             )
         except Exception:
-            return 0
+            # A transient/counting failure is not evidence of idleness. Keep
+            # drain/protection fail-closed until the next successful sample.
+            logger.error("Could not snapshot API active work", exc_info=True)
+            return 1
 
     def interrupt_active_runs(self, reason: str) -> int:
         """Cooperatively interrupt every adapter-owned agent during shutdown.
@@ -4759,7 +4966,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     await task
             return
         with suppress(Exception):
-            agent.interrupt(interrupt_message)
+            request_hard_interrupt(agent, interrupt_message)
         if not task.done():
             with suppress(Exception):
                 await (asyncio.shield(task) if shield_wait else task)
@@ -5175,8 +5382,9 @@ class APIServerAdapter(BasePlatformAdapter):
         """Write real streaming SSE from agent's stream_delta_callback queue.
 
         If the client disconnects mid-stream (network drop, browser tab close),
-        the agent is interrupted via ``agent.interrupt()`` so it stops making
-        LLM API calls, and the asyncio task wrapper is cancelled.
+        the agent receives a hard interrupt so compression cannot defer the
+        stop; this prevents further LLM or tool calls before the asyncio task
+        wrapper is cancelled.
         """
         sse_headers = {
             "Content-Type": "text/event-stream",
@@ -5400,11 +5608,12 @@ class APIServerAdapter(BasePlatformAdapter):
           — Hermes extension: compaction lifecycle mid-turn so clients can
           show a live "compacting" indicator (see ``_emit_compression_event``)
 
-        If the client disconnects mid-stream, ``agent.interrupt()`` is
-        called so the agent stops issuing upstream LLM calls, then the
-        asyncio task is cancelled.  When ``store=True`` an initial
-        ``in_progress`` snapshot is persisted immediately after
-        ``response.created`` and disconnects update it to an
+        If the client disconnects mid-stream, a hard interrupt is requested
+        so the agent stops issuing upstream LLM calls even while ordinary
+        interrupts are masked, then the asyncio task is cancelled.  When
+        ``store=True`` an initial
+        ``in_progress`` snapshot is durably claimed before
+        ``response.created`` is exposed, and disconnects update it to an
         ``incomplete`` snapshot so GET /v1/responses/{id} and
         ``previous_response_id`` chaining still have something to
         recover from.
@@ -5423,7 +5632,7 @@ class APIServerAdapter(BasePlatformAdapter):
         if gateway_session_key:
             sse_headers["X-Hermes-Session-Key"] = gateway_session_key
         response = web.StreamResponse(status=200, headers=sse_headers)
-        await response.prepare(request)
+        response_prepared = False
 
         # State accumulated during the stream
         final_text_parts: List[str] = []
@@ -5474,27 +5683,94 @@ class APIServerAdapter(BasePlatformAdapter):
         result: Optional[Dict[str, Any]] = None
         usage: Dict[str, Any] = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
         terminal_snapshot_persisted = False
+        response_claimed = False
+        response_owner_epoch = uuid.uuid4().hex
         response_session_id = session_id
+        containment_usage: Optional[Dict[str, Any]] = None
+
+        async def _contain_agent_task(
+            reason: str,
+            *,
+            reap_source: Optional[str] = None,
+        ) -> None:
+            """Hard-stop executor work before any best-effort unwind work.
+
+            Cancelling the asyncio wrapper cannot stop provider or tool work
+            already running in its executor thread.  Park the reason for an
+            agent still being constructed, prefer the hard-stop ABI once the
+            object exists, and only then cancel/await the wrapper.  Snapshot
+            usage first because ``_run_agent`` clears ``agent_ref`` while it
+            unwinds.
+            """
+            nonlocal containment_usage
+            agent = agent_ref[0] if agent_ref else None
+            if containment_usage is None and agent is not None:
+                containment_usage = _interrupted_usage_snapshot(agent)
+            if agent is None and isinstance(agent_ref, list) and len(agent_ref) > 1:
+                agent_ref[1] = reason
+            elif agent is not None:
+                try:
+                    request_hard_interrupt(agent, reason)
+                except Exception:
+                    logger.debug(
+                        "[api_server] hard interrupt failed for response %s",
+                        response_id,
+                        exc_info=True,
+                    )
+                if reap_source is not None:
+                    _reap_disconnected_agent_processes(
+                        agent, source=reap_source
+                    )
+            if not agent_task.done():
+                agent_task.cancel()
+            try:
+                await agent_task
+            except (asyncio.CancelledError, Exception):
+                pass
 
         def _persist_response_snapshot(
             response_env: Dict[str, Any],
             *,
             conversation_history_snapshot: Optional[List[Dict[str, Any]]] = None,
             session_id_snapshot: Optional[str] = None,
-        ) -> None:
+        ) -> bool:
+            nonlocal response_claimed
             if not store:
-                return
+                return True
             if conversation_history_snapshot is None:
                 conversation_history_snapshot = list(conversation_history)
                 conversation_history_snapshot.append({"role": "user", "content": user_message})
-            self._response_store.put(response_id, {
+            record = {
                 "response": response_env,
                 "conversation_history": conversation_history_snapshot,
                 "instructions": instructions,
                 "session_id": session_id_snapshot or response_session_id,
-            })
-            if conversation:
-                self._response_store.set_conversation(conversation, response_id)
+            }
+            if not response_claimed:
+                terminal = str(response_env.get("status") or "") in (
+                    self._TERMINAL_RESPONSE_STATUSES
+                )
+                response_claimed = self._response_store.claim(
+                    response_id,
+                    record,
+                    owner_id=self._response_owner_id,
+                    owner_epoch=response_owner_epoch,
+                    conversation=conversation,
+                    terminal=terminal,
+                )
+                if not response_claimed:
+                    raise RuntimeError(
+                        f"Response id is already claimed: {response_id}"
+                    )
+                return True
+            return self._response_store.transition(
+                response_id,
+                record,
+                owner_id=self._response_owner_id,
+                owner_epoch=response_owner_epoch,
+                terminal=str(response_env.get("status") or "")
+                in self._TERMINAL_RESPONSE_STATUSES,
+            )
 
         def _best_known_usage() -> Dict[str, Any]:
             """Usage for an envelope written while the agent may still be running.
@@ -5511,6 +5787,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 for key in ("input_tokens", "output_tokens", "total_tokens")
             ):
                 return usage
+            if containment_usage:
+                return containment_usage
             live_agent = agent_ref[0] if agent_ref else None
             return (
                 _interrupted_usage_snapshot(live_agent)
@@ -5564,8 +5842,8 @@ class APIServerAdapter(BasePlatformAdapter):
             """
             if terminal_snapshot_persisted:
                 return
-            _mark_terminal()
             if not store:
+                _mark_terminal()
                 return
             incomplete_text = "".join(final_text_parts) or final_response_text
             incomplete_items: List[Dict[str, Any]] = list(emitted_items)
@@ -5582,12 +5860,29 @@ class APIServerAdapter(BasePlatformAdapter):
             incomplete_history.append({"role": "user", "content": user_message})
             if incomplete_text:
                 incomplete_history.append({"role": "assistant", "content": incomplete_text})
-            _persist_response_snapshot(
+            persisted = _persist_response_snapshot(
                 incomplete_env,
                 conversation_history_snapshot=incomplete_history,
             )
+            _mark_terminal()
+            if not persisted:
+                logger.info(
+                    "[api_server] skipped stale incomplete transition for %s",
+                    response_id,
+                )
 
-        def _persist_cancelled_snapshot(reason: str) -> Dict[str, Any]:
+        def _persist_incomplete_best_effort() -> None:
+            """Keep store outages from bypassing executor containment."""
+            try:
+                _persist_incomplete_if_needed()
+            except Exception:
+                logger.error(
+                    "[api_server] failed to persist incomplete response %s",
+                    response_id,
+                    exc_info=True,
+                )
+
+        def _persist_cancelled_snapshot(reason: str) -> Optional[Dict[str, Any]]:
             """Write the terminal ``cancelled`` envelope and return it.
 
             Called by ``_handle_cancel_response`` on the event loop rather
@@ -5613,10 +5908,12 @@ class APIServerAdapter(BasePlatformAdapter):
             cancelled_history.append({"role": "user", "content": user_message})
             if cancelled_text:
                 cancelled_history.append({"role": "assistant", "content": cancelled_text})
-            _persist_response_snapshot(
+            persisted = _persist_response_snapshot(
                 cancelled_env,
                 conversation_history_snapshot=cancelled_history,
             )
+            if not persisted:
+                return None
             _mark_terminal()
             return cancelled_env
 
@@ -5631,18 +5928,26 @@ class APIServerAdapter(BasePlatformAdapter):
             "persist_cancelled": _persist_cancelled_snapshot,
             "cancelled": False,
             "terminal": False,
+            "owner_id": self._response_owner_id,
+            "owner_epoch": response_owner_epoch,
         }
         self._inflight_responses[response_id] = cancel_entry
 
         try:
+            await response.prepare(request)
+            response_prepared = True
             # response.created — initial envelope, status=in_progress
             created_env = _envelope("in_progress")
             created_env["output"] = []
+            # Claim ownership before the id becomes visible on the wire.  A
+            # client can issue /cancel as soon as response.created arrives;
+            # publishing first leaves a window where cancellation has no
+            # nonterminal row to CAS.
+            _persist_response_snapshot(created_env)
             await _write_event("response.created", {
                 "type": "response.created",
                 "response": created_env,
             })
-            _persist_response_snapshot(created_env)
             last_activity = time.monotonic()
 
             async def _open_message_item() -> None:
@@ -6010,16 +6315,22 @@ class APIServerAdapter(BasePlatformAdapter):
                         "role": "assistant",
                         "content": final_response_text or _redact_api_error_text(agent_error),
                     })
-                _persist_response_snapshot(
+                failed_persisted = _persist_response_snapshot(
                     failed_env,
                     conversation_history_snapshot=_failed_history,
                 )
                 _mark_terminal()
-                await _write_event("response.failed", {
-                    "type": "response.failed",
-                    "response": failed_env,
-                    "error": failed_env["error"],
-                })
+                if failed_persisted:
+                    await _write_event("response.failed", {
+                        "type": "response.failed",
+                        "response": failed_env,
+                        "error": failed_env["error"],
+                    })
+                else:
+                    logger.info(
+                        "[api_server] suppressed stale failed terminal for %s",
+                        response_id,
+                    )
             else:
                 completed_env = _envelope("completed")
                 completed_env["output"] = final_items
@@ -6035,56 +6346,50 @@ class APIServerAdapter(BasePlatformAdapter):
                 # here we only propagate a compression-rotated session_id so
                 # previous_response_id chaining resumes the child session.
                 _result_sid = result.get("session_id") if isinstance(result, dict) else None
-                _persist_response_snapshot(
+                completed_persisted = _persist_response_snapshot(
                     completed_env,
                     conversation_history_snapshot=full_history,
                     session_id_snapshot=_result_sid if isinstance(_result_sid, str) and _result_sid else None,
                 )
                 _mark_terminal()
-                await _write_event("response.completed", {
-                    "type": "response.completed",
-                    "response": completed_env,
-                })
+                if completed_persisted:
+                    await _write_event("response.completed", {
+                        "type": "response.completed",
+                        "response": completed_env,
+                    })
+                else:
+                    logger.info(
+                        "[api_server] suppressed stale completed terminal for %s",
+                        response_id,
+                    )
 
         except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError):
-            _persist_incomplete_if_needed()
-            # Client disconnected — interrupt the agent so it stops
-            # making upstream LLM calls, then cancel the task.
-            agent = agent_ref[0] if agent_ref else None
-            if agent is not None:
-                try:
-                    request_hard_interrupt(agent, "SSE client disconnected")
-                except Exception:
-                    pass
-                _reap_disconnected_agent_processes(agent)
-            if not agent_task.done():
-                agent_task.cancel()
-                try:
-                    await agent_task
-                except (asyncio.CancelledError, Exception):
-                    pass
+            reason = (
+                "SSE client disconnected"
+                if response_prepared
+                else "SSE response setup failed"
+            )
+            await _contain_agent_task(
+                reason,
+                reap_source=(
+                    "api_server_sse_disconnected" if response_prepared else None
+                ),
+            )
+            if not response_prepared:
+                raise
+            _persist_incomplete_best_effort()
             logger.info("SSE client disconnected; interrupted agent task %s", response_id)
         except asyncio.CancelledError:
             # Server-side cancellation (e.g. shutdown, request timeout) —
             # persist an incomplete snapshot so GET /v1/responses/{id} and
             # previous_response_id chaining still work, then re-raise so the
             # runtime's cancellation semantics are respected.
-            _persist_incomplete_if_needed()
-            agent = agent_ref[0] if agent_ref else None
-            if agent is not None:
-                try:
-                    request_hard_interrupt(agent, "SSE task cancelled")
-                except Exception:
-                    pass
-                # Same abandonment as a client disconnect: the run will never
-                # be resumed, so reap the background processes it created
-                # (#76115). Epoch-gated; no-op when the turn already
-                # finished and cleared its markers.
-                _reap_disconnected_agent_processes(
-                    agent, source="api_server_sse_cancelled"
-                )
-            if not agent_task.done():
-                agent_task.cancel()
+            await _contain_agent_task(
+                "SSE task cancelled",
+                reap_source="api_server_sse_cancelled",
+            )
+            if response_prepared:
+                _persist_incomplete_best_effort()
             logger.info("SSE task cancelled; persisted incomplete snapshot for %s", response_id)
             raise
         except Exception as _exc:
@@ -6093,21 +6398,20 @@ class APIServerAdapter(BasePlatformAdapter):
             # event and properly terminate the SSE stream so the client doesn't
             # get a TransferEncodingError from incomplete chunked encoding.
             import traceback as _tb
-            _persist_incomplete_if_needed()
             # This unwind abandons the turn without the client having
             # disconnected, so nothing else will stop the executor thread.
             # The other two unwinds already interrupt here; leaving this one
             # out strands a running agent behind an ``incomplete`` record,
             # which POST /v1/responses/{id}/cancel reads as already terminal
             # — it would answer 409 for a run still executing tools.
-            agent = agent_ref[0] if agent_ref else None
-            if agent is not None:
-                try:
-                    agent.interrupt("SSE writer failed mid-stream")
-                except Exception:
-                    pass
-            if not agent_task.done():
-                agent_task.cancel()
+            await _contain_agent_task(
+                "SSE writer failed mid-stream"
+                if response_prepared
+                else "SSE response setup failed"
+            )
+            if not response_prepared:
+                raise
+            _persist_incomplete_best_effort()
             agent_error = _redact_api_error_text(_tb.format_exc())
             try:
                 failed_env = _envelope("failed")
@@ -6343,22 +6647,48 @@ class APIServerAdapter(BasePlatformAdapter):
             model_name = body.get("model", self._model_name)
             created_at = int(time.time())
 
-            return await self._write_sse_responses(
-                request=request,
-                response_id=response_id,
-                model=model_name,
-                created_at=created_at,
-                stream_q=_stream_q,
-                agent_task=agent_task,
-                agent_ref=agent_ref,
-                conversation_history=conversation_history,
-                user_message=user_message,
-                instructions=effective_instructions,
-                conversation=conversation,
-                store=store,
-                session_id=session_id,
-                gateway_session_key=gateway_session_key,
-            )
+            try:
+                return await self._write_sse_responses(
+                    request=request,
+                    response_id=response_id,
+                    model=model_name,
+                    created_at=created_at,
+                    stream_q=_stream_q,
+                    agent_task=agent_task,
+                    agent_ref=agent_ref,
+                    conversation_history=conversation_history,
+                    user_message=user_message,
+                    instructions=effective_instructions,
+                    conversation=conversation,
+                    store=store,
+                    session_id=session_id,
+                    gateway_session_key=gateway_session_key,
+                )
+            except BaseException:
+                # Backstop failures before the writer installs its lifecycle
+                # guard (for example header/response construction).  The
+                # writer's own unwind normally reaches this point with the
+                # task already done, so this remains idempotent.
+                if not agent_task.done():
+                    agent = agent_ref[0]
+                    if agent is None:
+                        agent_ref[1] = "Responses SSE writer failed before setup"
+                    else:
+                        try:
+                            request_hard_interrupt(
+                                agent, "Responses SSE writer failed before setup"
+                            )
+                        except Exception:
+                            logger.debug(
+                                "[api_server] failed to contain Responses SSE setup",
+                                exc_info=True,
+                            )
+                    agent_task.cancel()
+                    try:
+                        await agent_task
+                    except (asyncio.CancelledError, Exception):
+                        pass
+                raise
 
         async def _compute_response():
             return await self._run_agent(
@@ -6481,9 +6811,7 @@ class APIServerAdapter(BasePlatformAdapter):
     # A response whose record already reached one of these can no longer be
     # cancelled — including ``incomplete``, which is the snapshot a detected
     # SSE disconnect leaves behind after it has already interrupted the agent.
-    _TERMINAL_RESPONSE_STATUSES = frozenset(
-        {"completed", "failed", "cancelled", "canceled", "incomplete"}
-    )
+    _TERMINAL_RESPONSE_STATUSES = _RESPONSE_TERMINAL_STATUSES
 
     async def _handle_get_response(self, request: "web.Request") -> "web.Response":
         """GET /v1/responses/{response_id} — retrieve a stored response."""
@@ -6514,6 +6842,8 @@ class APIServerAdapter(BasePlatformAdapter):
         - ``409`` when the response already reached a terminal state; a
           repeated cancel lands here, which is the idempotent answer.
         - ``404`` (OpenAI error body) for an id this gateway never stored.
+        - retryable ``503`` when this gateway does not own the executor, or
+          cannot acknowledge its interrupt / durable state transition.
         """
         auth_err = self._check_auth(request)
         if auth_err:
@@ -6547,27 +6877,81 @@ class APIServerAdapter(BasePlatformAdapter):
                 status=409,
             )
 
-        cancelled_env: Optional[Dict[str, Any]] = None
-        interrupted = False
-        if entry is not None:
-            entry["cancelled"] = True
-            persist_cancelled = entry.get("persist_cancelled")
-            if callable(persist_cancelled):
-                try:
-                    cancelled_env = persist_cancelled("cancelled")
-                except Exception:
-                    logger.error(
-                        "[api_server] failed to persist cancelled snapshot for %s",
-                        response_id,
-                        exc_info=True,
-                    )
-            interrupted = self._interrupt_inflight_response(entry, response_id)
-            task = entry.get("task")
-            if task is not None and not task.done():
-                task.cancel()
+        if entry is None:
+            control = self._response_store.get_control(response_id)
+            logger.warning(
+                "[api_server] refusing unrouteable cancellation for response %s "
+                "(durable owner=%s epoch=%s)",
+                response_id,
+                (control or {}).get("owner_id"),
+                (control or {}).get("owner_epoch"),
+            )
+            return web.json_response(
+                _openai_error(
+                    "The response is active on another gateway owner; retry "
+                    "cancellation against that owner.",
+                    err_type="unavailable_error",
+                    code="response_owner_unavailable",
+                ),
+                status=503,
+                headers={"Retry-After": "2"},
+            )
 
+        interrupted = self._interrupt_inflight_response(entry, response_id)
+        if not interrupted:
+            return web.json_response(
+                _openai_error(
+                    "The owning gateway could not acknowledge the response "
+                    "interrupt; retry shortly.",
+                    err_type="unavailable_error",
+                    code="response_interrupt_unavailable",
+                ),
+                status=503,
+                headers={"Retry-After": "2"},
+            )
+
+        cancelled_env: Optional[Dict[str, Any]] = None
+        persist_cancelled = entry.get("persist_cancelled")
+        if callable(persist_cancelled):
+            try:
+                cancelled_env = persist_cancelled("cancelled")
+            except Exception:
+                logger.error(
+                    "[api_server] failed to persist cancelled snapshot for %s",
+                    response_id,
+                    exc_info=True,
+                )
         if cancelled_env is None:
-            cancelled_env = self._mark_stored_response_cancelled(response_id, stored)
+            current = self._response_store.get(response_id)
+            current_response = current.get("response") if isinstance(current, dict) else None
+            current_status = (
+                str(current_response.get("status") or "")
+                if isinstance(current_response, dict)
+                else ""
+            )
+            if current_status in self._TERMINAL_RESPONSE_STATUSES:
+                return web.json_response(
+                    _openai_error(
+                        f"Response is already terminal and cannot be cancelled: {response_id}",
+                        code="response_already_terminal",
+                    ),
+                    status=409,
+                )
+            return web.json_response(
+                _openai_error(
+                    "The interrupt was acknowledged, but the cancellation "
+                    "state could not be committed; retry shortly.",
+                    err_type="unavailable_error",
+                    code="response_state_unavailable",
+                ),
+                status=503,
+                headers={"Retry-After": "2"},
+            )
+
+        entry["cancelled"] = True
+        task = entry.get("task")
+        if task is not None and not task.done():
+            task.cancel()
 
         logger.info(
             "[api_server] cancelled response %s (agent interrupted=%s, in-flight here=%s)",
@@ -6583,8 +6967,9 @@ class APIServerAdapter(BasePlatformAdapter):
         """Revoke further tool execution for a registered in-flight response.
 
         The agent runs on an executor thread, so cancelling its asyncio
-        wrapper only detaches the stream — ``agent.interrupt`` is the call
-        that breaks the tool-calling loop and aborts in-flight tool work.
+        wrapper only detaches the stream — the hard-interrupt compatibility
+        path breaks the tool-calling loop and aborts in-flight tool work even
+        while ordinary interrupts are masked.
         The agent object appears partway through ``_run_agent``'s executor
         body, so the reason is parked in the ref's pending-interrupt slot
         *before* reading it: a cancel that arrives during agent construction
@@ -6598,10 +6983,12 @@ class APIServerAdapter(BasePlatformAdapter):
             agent_ref[1] = reason
         agent = agent_ref[0]
         if agent is None:
-            return False
+            # The owning executor reads this exact slot before it starts the
+            # agent loop.  Parking the reason is a routed, acknowledged local
+            # interrupt even though the agent object does not exist yet.
+            return len(agent_ref) > 1
         try:
-            agent.interrupt(reason)
-            return True
+            return request_hard_interrupt(agent, reason)
         except Exception:
             logger.debug(
                 "[api_server] interrupt failed while cancelling response %s",
@@ -6610,42 +6997,24 @@ class APIServerAdapter(BasePlatformAdapter):
             )
             return False
 
-    def _mark_stored_response_cancelled(
-        self, response_id: str, stored: Optional[Dict[str, Any]]
-    ) -> Dict[str, Any]:
-        """Flip a stored envelope to ``cancelled`` without discarding it.
-
-        The fallback for responses this process holds no stream for — a
-        record left in_progress by a gateway that has since restarted, or by
-        a sibling task during a blue/green overlap. Marking the shared record
-        terminal is all this path can honestly do; it does not reach another
-        process's executor thread.
-        """
-        if isinstance(stored, dict) and isinstance(stored.get("response"), dict):
-            cancelled_env = dict(stored["response"])
-            cancelled_env["status"] = "cancelled"
-            cancelled_env["incomplete_details"] = {"reason": "cancelled"}
-            record = dict(stored)
-            record["response"] = cancelled_env
-            self._response_store.put(response_id, record)
-            return cancelled_env
-        return {
-            "id": response_id,
-            "object": "response",
-            "status": "cancelled",
-            "incomplete_details": {"reason": "cancelled"},
-        }
-
     async def _handle_delete_response(self, request: "web.Request") -> "web.Response":
-        """DELETE /v1/responses/{response_id} — delete a stored response."""
+        """DELETE a terminal response; active turns must be cancelled first."""
         auth_err = self._check_auth(request)
         if auth_err:
             return auth_err
 
         response_id = request.match_info["response_id"]
-        deleted = self._response_store.delete(response_id)
-        if not deleted:
+        delete_result = self._response_store.delete_terminal(response_id)
+        if delete_result == "not_found":
             return web.json_response(_openai_error(f"Response not found: {response_id}"), status=404)
+        if delete_result == "active":
+            return web.json_response(
+                _openai_error(
+                    "Response is still active; cancel it before deleting it.",
+                    code="response_not_terminal",
+                ),
+                status=409,
+            )
 
         return web.json_response({
             "id": response_id,
@@ -6948,6 +7317,8 @@ class APIServerAdapter(BasePlatformAdapter):
             return draining
 
         with _reserve_pending_api_work(self) as reservation:
+            if not await _ensure_admitted_task_protection():
+                return _task_protection_unavailable_response()
             try:
                 body = await request.json()
             except Exception:
@@ -7465,8 +7836,9 @@ class APIServerAdapter(BasePlatformAdapter):
         """Interrupt every in-flight run so its stream ends cleanly.
 
         Called by the drain coordinator at the drain cap. Reuses the same
-        interrupt path as POST /v1/runs/{run_id}/stop: ``agent.interrupt``
-        breaks the executor-thread conversation loop, and the existing
+        interrupt path as POST /v1/runs/{run_id}/stop: a hard interrupt
+        breaks the executor-thread conversation loop even during compression,
+        and the existing
         completion/cancellation handling emits the normal terminal events
         (``run.cancelled``/``run.failed``/terminal envelope) plus the SSE
         close sentinel — clients see a definite end, not a hang.
@@ -7474,8 +7846,8 @@ class APIServerAdapter(BasePlatformAdapter):
         interrupted = 0
         for run_id, agent in list(self._active_run_agents.items()):
             try:
-                agent.interrupt(reason)
-                interrupted += 1
+                if request_hard_interrupt(agent, reason):
+                    interrupted += 1
             except Exception:
                 logger.debug(
                     "[api_server] drain force-terminate: interrupt failed for run %s",
@@ -7486,8 +7858,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 task.cancel()
         for key, agent in list(self._inflight_run_agents.items()):
             try:
-                agent.interrupt(reason)
-                interrupted += 1
+                if request_hard_interrupt(agent, reason):
+                    interrupted += 1
             except Exception:
                 logger.debug(
                     "[api_server] drain force-terminate: interrupt failed for "
@@ -7728,6 +8100,23 @@ class APIServerAdapter(BasePlatformAdapter):
                                     "Pending interrupt failed on agent startup",
                                     exc_info=True,
                                 )
+                            # Cancellation was durably accepted before this
+                            # agent existed.  Never enter the conversation/tool
+                            # loop, even if the agent's best-effort interrupt
+                            # hook raises during construction.
+                            return (
+                                {
+                                    "final_response": "",
+                                    "messages": [],
+                                    "api_calls": 0,
+                                    "tools": [],
+                                },
+                                {
+                                    "input_tokens": 0,
+                                    "output_tokens": 0,
+                                    "total_tokens": 0,
+                                },
+                            )
                     # Track executor-backed agents for drain-cap interruption.
                     agent_key = id(agent)
                     self._inflight_run_agents[agent_key] = agent
@@ -7882,12 +8271,15 @@ class APIServerAdapter(BasePlatformAdapter):
                             agent_ref[0] = None
                         clear_session_vars(tokens)
 
-        self._activate_admitted_request()
         self._inflight_agent_runs += 1
+        self._activate_admitted_request()
         try:
             return await loop.run_in_executor(None, _run)
         finally:
             self._inflight_agent_runs -= 1
+            from gateway.drain_mode import notify_task_protection_work_changed
+
+            notify_task_protection_work_changed()
 
     # ------------------------------------------------------------------
     # /v1/runs — structured event streaming
@@ -8402,10 +8794,13 @@ class APIServerAdapter(BasePlatformAdapter):
                 self._active_run_tasks.pop(run_id, None)
                 self._run_approval_sessions.pop(run_id, None)
                 self._stopping_run_ids.discard(run_id)
+                from gateway.drain_mode import notify_task_protection_work_changed
 
-        self._activate_admitted_request()
+                notify_task_protection_work_changed()
+
         task = asyncio.create_task(_run_and_close())
         self._active_run_tasks[run_id] = task
+        self._activate_admitted_request()
         try:
             self._background_tasks.add(task)
         except TypeError:

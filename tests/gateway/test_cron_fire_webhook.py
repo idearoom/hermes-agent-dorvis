@@ -17,6 +17,8 @@ from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
 from gateway.config import PlatformConfig
+from gateway import drain_mode
+from gateway.drain_mode import EcsTaskProtection, reset_drain_mode_for_tests
 from gateway.platforms.api_server import APIServerAdapter, cors_middleware
 
 _MOD = "gateway.platforms.api_server"
@@ -136,6 +138,49 @@ async def test_admission_failure_is_retryable_and_never_dispatches(adapter, monk
     assert response.status == 503
     assert provider.fired == []
     assert adapter.active_agent_work_count() == 0
+
+
+@pytest.mark.asyncio
+async def test_task_protection_failure_refuses_before_cron_admission(
+    adapter, monkeypatch
+):
+    provider = _SpyProvider()
+
+    def _failed_put(_url, _payload):
+        raise OSError("ECS agent unavailable")
+
+    reset_drain_mode_for_tests()
+    monkeypatch.setattr(
+        drain_mode,
+        "_task_protection",
+        EcsTaskProtection(
+            agent_uri="http://ecs-agent.local",
+            http_call=_failed_put,
+        ),
+    )
+    monkeypatch.setattr("cron.scheduler_provider.resolve_cron_scheduler", lambda: provider)
+    monkeypatch.setattr(
+        "plugins.cron_providers.chronos.verify.get_fire_verifier",
+        lambda: (lambda **kw: {"purpose": "cron_fire"}),
+    )
+
+    try:
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            response = await cli.post(
+                "/api/cron/fire",
+                headers={"Authorization": "Bearer good"},
+                json={"job_id": "never-admitted"},
+            )
+            payload = await response.json()
+
+        assert response.status == 503
+        assert payload["error"]["code"] == "task_protection_unavailable"
+        assert provider.claimed == []
+        assert provider.fired == []
+        assert adapter.active_agent_work_count() == 0
+    finally:
+        reset_drain_mode_for_tests()
 
 
 @pytest.mark.asyncio

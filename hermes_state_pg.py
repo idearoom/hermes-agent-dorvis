@@ -52,6 +52,7 @@ import threading
 import time
 from collections import deque
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Collection, Dict, List, Optional, TypeVar
 
@@ -729,6 +730,285 @@ _V22_REQUIRED_COLUMNS: Dict[str, frozenset[str]] = {
     ),
 }
 
+@dataclass(frozen=True)
+class _ColumnSpec:
+    """Semantic shape exposed by ``information_schema.columns``."""
+
+    data_type: str
+    nullable: bool
+    default: Optional[str] = None
+    identity_generation: Optional[str] = None
+
+
+_BIGINT_COLUMNS = frozenset(
+    {
+        ("schema_version", "version"),
+        *(
+            ("sessions", column)
+            for column in (
+                "expiry_finalized",
+                "message_count",
+                "tool_call_count",
+                "input_tokens",
+                "output_tokens",
+                "cache_read_tokens",
+                "cache_write_tokens",
+                "reasoning_tokens",
+                "git_metadata_generation",
+                "api_call_count",
+                "compression_fallback_streak",
+                "compression_ineffective_count",
+                "rewind_count",
+                "archived",
+                "pinned",
+                "hidden",
+            )
+        ),
+        *(
+            ("messages", column)
+            for column in ("id", "token_count", "observed", "active", "compacted")
+        ),
+        *(
+            ("session_model_usage", column)
+            for column in (
+                "api_call_count",
+                "input_tokens",
+                "output_tokens",
+                "cache_read_tokens",
+                "cache_write_tokens",
+                "reasoning_tokens",
+            )
+        ),
+        ("async_delegations", "delivery_attempts"),
+        ("async_delegations", "owner_pid"),
+        ("async_delegations", "owner_started_at"),
+        ("gateway_hygiene_state", "failure_streak"),
+        ("telegram_dm_topic_mode", "enabled"),
+        ("telegram_dm_topic_mode", "has_topics_enabled"),
+        ("telegram_dm_topic_mode", "allows_users_to_create_topics"),
+    }
+)
+
+_DOUBLE_PRECISION_COLUMNS = frozenset(
+    {
+        *(
+            ("sessions", column)
+            for column in (
+                "started_at",
+                "ended_at",
+                "estimated_cost_usd",
+                "actual_cost_usd",
+                "last_activity_at",
+                "compression_failure_cooldown_until",
+                "last_read_at",
+            )
+        ),
+        ("messages", "timestamp"),
+        *(
+            ("session_model_usage", column)
+            for column in (
+                "estimated_cost_usd",
+                "actual_cost_usd",
+                "first_seen",
+                "last_seen",
+            )
+        ),
+        *(
+            ("async_delegations", column)
+            for column in (
+                "dispatched_at",
+                "completed_at",
+                "updated_at",
+                "delivered_at",
+                "delivery_claimed_at",
+            )
+        ),
+        ("gateway_routing", "updated_at"),
+        ("compression_locks", "acquired_at"),
+        ("compression_locks", "expires_at"),
+        ("session_turn_leases", "acquired_at"),
+        ("session_turn_leases", "expires_at"),
+        ("telegram_dm_topic_mode", "activated_at"),
+        ("telegram_dm_topic_mode", "updated_at"),
+        ("telegram_dm_topic_mode", "capability_checked_at"),
+        ("telegram_dm_topic_bindings", "linked_at"),
+        ("telegram_dm_topic_bindings", "updated_at"),
+    }
+)
+
+_NOT_NULL_COLUMNS = frozenset(
+    {
+        ("schema_version", "version"),
+        ("system_prompts", "hash"),
+        ("system_prompts", "prompt"),
+        *(
+            ("sessions", column)
+            for column in (
+                "id",
+                "source",
+                "started_at",
+                "git_metadata_generation",
+                "compression_fallback_streak",
+                "compression_ineffective_count",
+                "rewind_count",
+                "archived",
+                "pinned",
+                "hidden",
+            )
+        ),
+        *(
+            ("messages", column)
+            for column in ("id", "session_id", "role", "timestamp", "active", "compacted")
+        ),
+        *(
+            ("session_model_usage", column)
+            for column in (
+                "session_id",
+                "model",
+                "billing_provider",
+                "billing_base_url",
+                "billing_mode",
+                "task",
+                "api_call_count",
+                "input_tokens",
+                "output_tokens",
+                "cache_read_tokens",
+                "cache_write_tokens",
+                "reasoning_tokens",
+                "estimated_cost_usd",
+                "actual_cost_usd",
+            )
+        ),
+        *(
+            ("async_delegations", column)
+            for column in (
+                "delegation_id",
+                "origin_session",
+                "origin_ui_session_id",
+                "state",
+                "dispatched_at",
+                "updated_at",
+                "delivery_state",
+                "delivery_attempts",
+                "origin_session_id",
+            )
+        ),
+        ("state_meta", "key"),
+        *(
+            ("gateway_routing", column)
+            for column in ("scope", "session_key", "entry_json", "updated_at")
+        ),
+        ("gateway_hygiene_state", "session_key"),
+        ("gateway_hygiene_state", "failure_streak"),
+        *(
+            ("compression_locks", column)
+            for column in ("session_id", "holder", "acquired_at", "expires_at")
+        ),
+        *(
+            ("session_turn_leases", column)
+            for column in ("conversation_id", "holder", "acquired_at", "expires_at")
+        ),
+        *(
+            ("telegram_dm_topic_mode", column)
+            for column in ("chat_id", "user_id", "enabled", "activated_at", "updated_at")
+        ),
+        *(
+            ("telegram_dm_topic_bindings", column)
+            for column in (
+                "chat_id",
+                "thread_id",
+                "user_id",
+                "session_key",
+                "session_id",
+                "managed_mode",
+                "linked_at",
+                "updated_at",
+            )
+        ),
+    }
+)
+
+_COLUMN_DEFAULTS: Dict[tuple[str, str], str] = {
+    **{
+        ("sessions", column): "0"
+        for column in (
+            "expiry_finalized",
+            "message_count",
+            "tool_call_count",
+            "input_tokens",
+            "output_tokens",
+            "cache_read_tokens",
+            "cache_write_tokens",
+            "reasoning_tokens",
+            "git_metadata_generation",
+            "api_call_count",
+            "compression_fallback_streak",
+            "compression_ineffective_count",
+            "rewind_count",
+            "archived",
+            "pinned",
+            "hidden",
+        )
+    },
+    ("messages", "observed"): "0",
+    ("messages", "active"): "1",
+    ("messages", "compacted"): "0",
+    **{
+        ("session_model_usage", column): "''::text"
+        for column in ("billing_provider", "billing_base_url", "billing_mode", "task")
+    },
+    **{
+        ("session_model_usage", column): "0"
+        for column in (
+            "api_call_count",
+            "input_tokens",
+            "output_tokens",
+            "cache_read_tokens",
+            "cache_write_tokens",
+            "reasoning_tokens",
+            "estimated_cost_usd",
+            "actual_cost_usd",
+        )
+    },
+    ("async_delegations", "origin_ui_session_id"): "''::text",
+    ("async_delegations", "delivery_state"): "'pending'::text",
+    ("async_delegations", "delivery_attempts"): "0",
+    ("async_delegations", "origin_session_id"): "''::text",
+    ("gateway_routing", "scope"): "''::text",
+    ("gateway_hygiene_state", "failure_streak"): "0",
+    ("telegram_dm_topic_mode", "enabled"): "1",
+    ("telegram_dm_topic_bindings", "managed_mode"): "'auto'::text",
+}
+
+
+def _column_specs(
+    required_columns: Dict[str, frozenset[str]],
+) -> Dict[tuple[str, str], _ColumnSpec]:
+    specs: Dict[tuple[str, str], _ColumnSpec] = {}
+    for table, columns in required_columns.items():
+        for column in columns:
+            key = (table, column)
+            if key in _BIGINT_COLUMNS:
+                data_type = "bigint"
+            elif key in _DOUBLE_PRECISION_COLUMNS:
+                data_type = "double precision"
+            else:
+                data_type = "text"
+            specs[key] = _ColumnSpec(
+                data_type=data_type,
+                nullable=key not in _NOT_NULL_COLUMNS,
+                default=_COLUMN_DEFAULTS.get(key),
+                identity_generation=(
+                    "BY DEFAULT" if key == ("messages", "id") else None
+                ),
+            )
+    return specs
+
+
+_REQUIRED_COLUMN_SPECS = _column_specs(_REQUIRED_COLUMNS)
+_V22_REQUIRED_COLUMN_SPECS = _column_specs(_V22_REQUIRED_COLUMNS)
+
+
 _REQUIRED_INDEXES = frozenset(
     {
         "idx_telegram_dm_topic_bindings_session",
@@ -780,6 +1060,165 @@ _V22_REQUIRED_INDEXES = frozenset(
     }
 )
 
+
+@dataclass(frozen=True)
+class _IndexSpec:
+    """Semantic shape of one non-primary Postgres index."""
+
+    table: str
+    unique: bool
+    access_method: str
+    keys: tuple[str, ...]
+    options: tuple[int, ...]
+    opclasses: tuple[str, ...]
+    predicate: Optional[str] = None
+    expression: Optional[str] = None
+
+
+def _index_spec(
+    table: str,
+    *keys: str,
+    unique: bool = False,
+    access_method: str = "btree",
+    descending: Collection[int] = (),
+    opclasses: Optional[tuple[str, ...]] = None,
+    predicate: Optional[str] = None,
+    expression: Optional[str] = None,
+) -> _IndexSpec:
+    descending_positions = set(descending)
+    return _IndexSpec(
+        table=table,
+        unique=unique,
+        access_method=access_method,
+        keys=tuple(keys),
+        # pg_index.indoption uses bit 0 for DESC and bit 1 for NULLS FIRST.
+        # Postgres's default for DESC is NULLS FIRST, hence 3.
+        options=tuple(
+            3 if position in descending_positions else 0
+            for position in range(len(keys))
+        ),
+        opclasses=opclasses or tuple("text_ops" for _ in keys),
+        predicate=predicate,
+        expression=expression,
+    )
+
+
+_SEARCH_TEXT_CATALOG_EXPRESSION = (
+    '"left"((((COALESCE(content, \'\'::text) || \' \'::text) || '
+    "COALESCE(tool_name, ''::text)) || ' '::text) || "
+    "COALESCE(tool_calls, ''::text), 500000)"
+)
+_SEARCH_TSV_CATALOG_EXPRESSION = (
+    "to_tsvector('simple'::regconfig, "
+    f"{_SEARCH_TEXT_CATALOG_EXPRESSION})"
+)
+
+_REQUIRED_INDEX_SPECS: Dict[str, _IndexSpec] = {
+    "idx_telegram_dm_topic_bindings_session": _index_spec(
+        "telegram_dm_topic_bindings", "session_id", unique=True
+    ),
+    "idx_telegram_dm_topic_bindings_user": _index_spec(
+        "telegram_dm_topic_bindings", "user_id", "chat_id"
+    ),
+    "idx_sessions_source": _index_spec("sessions", "source"),
+    "idx_sessions_source_id": _index_spec("sessions", "source", "id"),
+    "idx_sessions_parent": _index_spec("sessions", "parent_session_id"),
+    "idx_sessions_started": _index_spec(
+        "sessions",
+        "started_at",
+        descending=(0,),
+        opclasses=("float8_ops",),
+    ),
+    "idx_messages_session": _index_spec(
+        "messages", "session_id", '"timestamp"',
+        opclasses=("text_ops", "float8_ops"),
+    ),
+    "idx_messages_session_id": _index_spec(
+        "messages", "session_id", "id",
+        opclasses=("text_ops", "int8_ops"),
+    ),
+    "idx_messages_assistant_calls_by_session": _index_spec(
+        "messages",
+        "session_id",
+        predicate="role = 'assistant'::text AND tool_calls IS NOT NULL",
+    ),
+    "idx_compression_locks_expires": _index_spec(
+        "compression_locks", "expires_at", opclasses=("float8_ops",)
+    ),
+    "idx_session_turn_leases_expires": _index_spec(
+        "session_turn_leases", "expires_at", opclasses=("float8_ops",)
+    ),
+    "idx_session_model_usage_session": _index_spec(
+        "session_model_usage", "session_id"
+    ),
+    "idx_session_model_usage_model": _index_spec(
+        "session_model_usage", "model"
+    ),
+    "idx_async_delegations_delivery": _index_spec(
+        "async_delegations", "delivery_state", "completed_at",
+        opclasses=("text_ops", "float8_ops"),
+    ),
+    "idx_messages_session_active": _index_spec(
+        "messages", "session_id", "active", '"timestamp"',
+        opclasses=("text_ops", "int8_ops", "float8_ops"),
+    ),
+    "idx_messages_active_null": _index_spec(
+        "messages", "active", opclasses=("int8_ops",),
+        predicate="active IS NULL",
+    ),
+    "idx_sessions_session_key": _index_spec(
+        "sessions", "session_key", "started_at", descending=(1,),
+        opclasses=("text_ops", "float8_ops"),
+    ),
+    "idx_sessions_gateway_peer": _index_spec(
+        "sessions", "source", "user_id", "chat_id", "chat_type",
+        "thread_id", "started_at", descending=(5,),
+        opclasses=(
+            "text_ops", "text_ops", "text_ops", "text_ops", "text_ops",
+            "float8_ops",
+        ),
+    ),
+    "idx_sessions_handoff_state": _index_spec(
+        "sessions", "handoff_state", "started_at",
+        opclasses=("text_ops", "float8_ops"),
+    ),
+    "idx_sessions_system_prompt_hash": _index_spec(
+        "sessions", "system_prompt_hash"
+    ),
+    "idx_sessions_title_unique": _index_spec(
+        "sessions", "title", unique=True, predicate="title IS NOT NULL"
+    ),
+    "idx_messages_platform_msg_id": _index_spec(
+        "messages", "session_id", "platform_message_id",
+        predicate="platform_message_id IS NOT NULL",
+    ),
+    "idx_messages_search_tsv": _index_spec(
+        "messages",
+        _SEARCH_TSV_CATALOG_EXPRESSION,
+        access_method="gin",
+        opclasses=("tsvector_ops",),
+        expression=_SEARCH_TSV_CATALOG_EXPRESSION,
+    ),
+}
+
+_V22_REQUIRED_INDEX_SPECS = {
+    name: spec
+    for name, spec in _REQUIRED_INDEX_SPECS.items()
+    if name in _V22_REQUIRED_INDEXES
+}
+
+# pg_trgm is best-effort. Its absence is valid, but if the name exists it must
+# still be the audited expression GIN index rather than a same-named decoy.
+_OPTIONAL_INDEX_SPECS = {
+    "idx_messages_search_trgm": _index_spec(
+        "messages",
+        _SEARCH_TEXT_CATALOG_EXPRESSION,
+        access_method="gin",
+        opclasses=("gin_trgm_ops",),
+        expression=_SEARCH_TEXT_CATALOG_EXPRESSION,
+    )
+}
+
 _REQUIRED_PRIMARY_KEYS = {
     "system_prompts": ("hash",),
     "sessions": ("id",),
@@ -804,46 +1243,113 @@ _V22_REQUIRED_PRIMARY_KEYS = {
     if table in _V22_REQUIRED_COLUMNS
 }
 
-_REQUIRED_FOREIGN_KEYS = frozenset(
-    {
-        ("sessions", "parent_session_id", "sessions", "id", "YES", "NO"),
-        (
-            "sessions", "system_prompt_hash", "system_prompts", "hash",
-            "YES", "NO",
-        ),
-        ("messages", "session_id", "sessions", "id", "YES", "NO"),
-        (
-            "session_model_usage", "session_id", "sessions", "id",
-            "YES", "NO",
-        ),
-        (
-            "telegram_dm_topic_bindings", "session_id", "sessions", "id",
-            "YES", "NO",
-        ),
-    }
-)
+@dataclass(frozen=True)
+class _ConstraintSpec:
+    """Semantic shape of a table constraint from ``pg_constraint``."""
 
-_V22_REQUIRED_FOREIGN_KEYS = frozenset(
-    {
-        ("sessions", "parent_session_id", "sessions", "id", "YES", "NO"),
-        ("messages", "session_id", "sessions", "id", "YES", "NO"),
+    kind: str
+    columns: tuple[str, ...]
+    referenced_schema: Optional[str] = None
+    referenced_table: Optional[str] = None
+    referenced_columns: tuple[str, ...] = ()
+    update_action: Optional[str] = None
+    delete_action: Optional[str] = None
+    match_type: Optional[str] = None
+    deferrable: bool = False
+    initially_deferred: bool = False
+    validated: bool = True
+
+
+def _constraint_specs(
+    primary_keys: Dict[str, tuple[str, ...]],
+    *,
+    include_system_prompt: bool,
+) -> Dict[tuple[str, str], _ConstraintSpec]:
+    specs = {
+        (table, f"{table}_pkey"): _ConstraintSpec("p", columns)
+        for table, columns in primary_keys.items()
+    }
+    foreign_keys = {
+        (
+            "sessions",
+            "sessions_parent_session_id_fkey",
+        ): _ConstraintSpec(
+            "f",
+            ("parent_session_id",),
+            referenced_schema=_SCHEMA,
+            referenced_table="sessions",
+            referenced_columns=("id",),
+            update_action="a",
+            delete_action="a",
+            match_type="s",
+            deferrable=True,
+        ),
+        ("messages", "messages_session_id_fkey"): _ConstraintSpec(
+            "f",
+            ("session_id",),
+            referenced_schema=_SCHEMA,
+            referenced_table="sessions",
+            referenced_columns=("id",),
+            update_action="a",
+            delete_action="a",
+            match_type="s",
+            deferrable=True,
+        ),
         (
             "session_model_usage",
-            "session_id",
-            "sessions",
-            "id",
-            "YES",
-            "NO",
+            "session_model_usage_session_id_fkey",
+        ): _ConstraintSpec(
+            "f",
+            ("session_id",),
+            referenced_schema=_SCHEMA,
+            referenced_table="sessions",
+            referenced_columns=("id",),
+            update_action="a",
+            delete_action="c",
+            match_type="s",
+            deferrable=True,
         ),
         (
             "telegram_dm_topic_bindings",
-            "session_id",
-            "sessions",
-            "id",
-            "YES",
-            "NO",
+            "telegram_dm_topic_bindings_session_id_fkey",
+        ): _ConstraintSpec(
+            "f",
+            ("session_id",),
+            referenced_schema=_SCHEMA,
+            referenced_table="sessions",
+            referenced_columns=("id",),
+            update_action="a",
+            delete_action="c",
+            match_type="s",
+            deferrable=True,
         ),
     }
+    if include_system_prompt:
+        foreign_keys[(
+            "sessions",
+            "sessions_system_prompt_hash_fkey",
+        )] = _ConstraintSpec(
+            "f",
+            ("system_prompt_hash",),
+            referenced_schema=_SCHEMA,
+            referenced_table="system_prompts",
+            referenced_columns=("hash",),
+            update_action="a",
+            delete_action="a",
+            match_type="s",
+            deferrable=True,
+        )
+    specs.update(foreign_keys)
+    return specs
+
+
+_REQUIRED_CONSTRAINT_SPECS = _constraint_specs(
+    _REQUIRED_PRIMARY_KEYS,
+    include_system_prompt=True,
+)
+_V22_REQUIRED_CONSTRAINT_SPECS = _constraint_specs(
+    _V22_REQUIRED_PRIMARY_KEYS,
+    include_system_prompt=False,
 )
 
 # Best-effort statements: run after PG_SCHEMA_SQL, failures downgrade
@@ -1595,10 +2101,9 @@ class PgSessionDB(SessionDB):
             )
         PgSessionDB._verify_catalog_shape(
             conn,
-            required_columns=_V22_REQUIRED_COLUMNS,
-            required_indexes=_V22_REQUIRED_INDEXES,
-            required_primary_keys=_V22_REQUIRED_PRIMARY_KEYS,
-            required_foreign_keys=_V22_REQUIRED_FOREIGN_KEYS,
+            required_column_specs=_V22_REQUIRED_COLUMN_SPECS,
+            required_index_specs=_V22_REQUIRED_INDEX_SPECS,
+            required_constraint_specs=_V22_REQUIRED_CONSTRAINT_SPECS,
             label="v22 migration source",
             exact_relations=True,
         )
@@ -1629,13 +2134,12 @@ class PgSessionDB(SessionDB):
 
     @staticmethod
     def _verify_catalog(conn) -> None:
-        """Prove every required v26 table/column/index/FK exists."""
+        """Prove the live store has the exact audited v26 semantics."""
         PgSessionDB._verify_catalog_shape(
             conn,
-            required_columns=_REQUIRED_COLUMNS,
-            required_indexes=_REQUIRED_INDEXES,
-            required_primary_keys=_REQUIRED_PRIMARY_KEYS,
-            required_foreign_keys=_REQUIRED_FOREIGN_KEYS,
+            required_column_specs=_REQUIRED_COLUMN_SPECS,
+            required_index_specs=_REQUIRED_INDEX_SPECS,
+            required_constraint_specs=_REQUIRED_CONSTRAINT_SPECS,
             label="v26",
             exact_relations=True,
         )
@@ -1644,24 +2148,64 @@ class PgSessionDB(SessionDB):
     def _verify_catalog_shape(
         conn,
         *,
-        required_columns: Dict[str, frozenset[str]],
-        required_indexes: frozenset[str],
-        required_primary_keys: Dict[str, tuple[str, ...]],
-        required_foreign_keys: frozenset[tuple[str, ...]],
+        required_column_specs: Dict[tuple[str, str], _ColumnSpec],
+        required_index_specs: Dict[str, _IndexSpec],
+        required_constraint_specs: Dict[tuple[str, str], _ConstraintSpec],
         label: str,
         exact_relations: bool,
     ) -> None:
-        """Verify a named Postgres catalog surface without mutating it."""
+        """Verify one named Postgres catalog contract without mutating it."""
         column_rows = conn.execute(
-            "SELECT table_name, column_name FROM information_schema.columns "
+            "SELECT table_name, column_name, data_type, is_nullable, "
+            "column_default, is_identity, identity_generation "
+            "FROM information_schema.columns "
             "WHERE table_schema = %s",
             (_SCHEMA,),
         ).fetchall()
+        actual_column_specs: Dict[tuple[str, str], _ColumnSpec] = {}
+        malformed_identity_columns: List[str] = []
+        for (
+            table,
+            column,
+            data_type,
+            is_nullable,
+            column_default,
+            is_identity,
+            identity_generation,
+        ) in column_rows:
+            key = (str(table), str(column))
+            normalized_default = (
+                " ".join(str(column_default).split())
+                if column_default is not None
+                else None
+            )
+            normalized_identity = (
+                str(identity_generation)
+                if identity_generation is not None
+                else None
+            )
+            if (str(is_identity) == "YES") != (normalized_identity is not None):
+                malformed_identity_columns.append(f"{key[0]}.{key[1]}")
+            actual_column_specs[key] = _ColumnSpec(
+                data_type=str(data_type),
+                nullable=str(is_nullable) == "YES",
+                default=normalized_default,
+                identity_generation=normalized_identity,
+            )
+
+        required_columns: Dict[str, set[str]] = {}
+        for table, column in required_column_specs:
+            required_columns.setdefault(table, set()).add(column)
         actual_columns: Dict[str, set[str]] = {}
-        for table, column in column_rows:
-            actual_columns.setdefault(str(table), set()).add(str(column))
+        for table, column in actual_column_specs:
+            actual_columns.setdefault(table, set()).add(column)
 
         problems: List[str] = []
+        if malformed_identity_columns:
+            problems.append(
+                "columns with inconsistent identity metadata "
+                f"{sorted(malformed_identity_columns)}"
+            )
         if exact_relations:
             expected_tables = set(required_columns)
             actual_tables = set(actual_columns)
@@ -1675,7 +2219,7 @@ class PgSessionDB(SessionDB):
 
         for table, required in required_columns.items():
             actual = actual_columns.get(table, set())
-            missing = required.difference(actual_columns.get(table, set()))
+            missing = required.difference(actual)
             if missing:
                 problems.append(f"{table} missing columns {sorted(missing)}")
             if exact_relations:
@@ -1684,79 +2228,220 @@ class PgSessionDB(SessionDB):
                     problems.append(
                         f"{table} has unexpected columns {sorted(unexpected)}"
                     )
-
-        index_rows = conn.execute(
-            "SELECT indexname FROM pg_indexes WHERE schemaname = %s",
-            (_SCHEMA,),
-        ).fetchall()
-        actual_indexes = {str(row[0]) for row in index_rows}
-        missing_indexes = required_indexes.difference(actual_indexes)
-        if missing_indexes:
-            problems.append(f"missing indexes {sorted(missing_indexes)}")
-
-        primary_key_rows = conn.execute(
-            "SELECT constraint_table.table_name, constraint_column.column_name, "
-            "constraint_column.ordinal_position "
-            "FROM information_schema.table_constraints AS constraint_table "
-            "JOIN information_schema.key_column_usage AS constraint_column "
-            "ON constraint_column.constraint_schema = constraint_table.constraint_schema "
-            "AND constraint_column.constraint_name = constraint_table.constraint_name "
-            "WHERE constraint_table.constraint_schema = %s "
-            "AND constraint_table.constraint_type = 'PRIMARY KEY' "
-            "ORDER BY constraint_table.table_name, constraint_column.ordinal_position",
-            (_SCHEMA,),
-        ).fetchall()
-        actual_primary_keys: Dict[str, List[tuple[int, str]]] = {}
-        for table, column, ordinal in primary_key_rows:
-            actual_primary_keys.setdefault(str(table), []).append(
-                (int(ordinal), str(column))
-            )
-        normalized_primary_keys = {
-            table: tuple(column for _, column in sorted(columns))
-            for table, columns in actual_primary_keys.items()
-        }
-        for table, expected_key_columns in required_primary_keys.items():
-            if normalized_primary_keys.get(table) != expected_key_columns:
+        for key, expected in required_column_specs.items():
+            actual = actual_column_specs.get(key)
+            if actual is not None and actual != expected:
                 problems.append(
-                    f"{table} primary key is "
-                    f"{normalized_primary_keys.get(table)}, "
-                    f"expected {expected_key_columns}"
+                    f"column {key[0]}.{key[1]} is {actual!r}, "
+                    f"expected {expected!r}"
                 )
 
-        foreign_key_rows = conn.execute(
-            "SELECT constraint_table.table_name, constraint_column.column_name, "
-            "referenced_table.table_name, referenced_column.column_name, "
-            "constraint_table.is_deferrable, constraint_table.initially_deferred "
-            "FROM information_schema.table_constraints AS constraint_table "
-            "JOIN information_schema.key_column_usage AS constraint_column "
-            "ON constraint_column.constraint_schema = constraint_table.constraint_schema "
-            "AND constraint_column.constraint_name = constraint_table.constraint_name "
-            "JOIN information_schema.referential_constraints AS reference_constraint "
-            "ON reference_constraint.constraint_schema = constraint_table.constraint_schema "
-            "AND reference_constraint.constraint_name = constraint_table.constraint_name "
-            "JOIN information_schema.key_column_usage AS referenced_column "
-            "ON referenced_column.constraint_schema = "
-            "reference_constraint.unique_constraint_schema "
-            "AND referenced_column.constraint_name = "
-            "reference_constraint.unique_constraint_name "
-            "AND referenced_column.ordinal_position = constraint_column.position_in_unique_constraint "
-            "JOIN information_schema.table_constraints AS referenced_table "
-            "ON referenced_table.constraint_schema = referenced_column.constraint_schema "
-            "AND referenced_table.constraint_name = referenced_column.constraint_name "
-            "WHERE constraint_table.constraint_schema = %s "
-            "AND constraint_table.constraint_type = 'FOREIGN KEY'",
+        index_rows = conn.execute(
+            "SELECT table_class.relname, index_class.relname, "
+            "index_catalog.indisunique, index_catalog.indisvalid, "
+            "index_catalog.indisready, index_catalog.indislive, "
+            "access_method.amname, index_catalog.indnatts, "
+            "index_catalog.indnkeyatts, "
+            "ARRAY(SELECT pg_get_indexdef(index_catalog.indexrelid, "
+            "position, TRUE) FROM generate_series("
+            "1, index_catalog.indnkeyatts) AS position ORDER BY position), "
+            "index_catalog.indoption::smallint[], "
+            "ARRAY(SELECT operator_class.opcname FROM "
+            "unnest(index_catalog.indclass::oid[]) WITH ORDINALITY "
+            "AS indexed_class(operator_class_oid, position) "
+            "JOIN pg_opclass AS operator_class "
+            "ON operator_class.oid = indexed_class.operator_class_oid "
+            "ORDER BY indexed_class.position), "
+            "pg_get_expr(index_catalog.indpred, index_catalog.indrelid, TRUE), "
+            "pg_get_expr(index_catalog.indexprs, index_catalog.indrelid, TRUE) "
+            "FROM pg_index AS index_catalog "
+            "JOIN pg_class AS index_class "
+            "ON index_class.oid = index_catalog.indexrelid "
+            "JOIN pg_class AS table_class "
+            "ON table_class.oid = index_catalog.indrelid "
+            "JOIN pg_namespace AS table_schema "
+            "ON table_schema.oid = table_class.relnamespace "
+            "JOIN pg_am AS access_method "
+            "ON access_method.oid = index_class.relam "
+            "WHERE table_schema.nspname = %s "
+            "AND NOT index_catalog.indisprimary",
             (_SCHEMA,),
         ).fetchall()
-        actual_foreign_keys = {
-            tuple(str(value) for value in row) for row in foreign_key_rows
-        }
-        missing_foreign_keys = required_foreign_keys.difference(
-            actual_foreign_keys
-        )
-        if missing_foreign_keys:
-            problems.append(
-                f"missing foreign keys {sorted(missing_foreign_keys)}"
+
+        def _catalog_expression(value) -> Optional[str]:
+            if value is None:
+                return None
+            return " ".join(str(value).split())
+
+        actual_indexes: Dict[str, _IndexSpec] = {}
+        invalid_indexes: List[str] = []
+        included_column_indexes: List[str] = []
+        for row in index_rows:
+            (
+                table,
+                index_name,
+                unique,
+                valid,
+                ready,
+                live,
+                access_method,
+                attribute_count,
+                key_count,
+                keys,
+                options,
+                opclasses,
+                predicate,
+                expression,
+            ) = row
+            name = str(index_name)
+            if not (bool(valid) and bool(ready) and bool(live)):
+                invalid_indexes.append(name)
+            if int(attribute_count) != int(key_count):
+                included_column_indexes.append(name)
+            actual_indexes[name] = _IndexSpec(
+                table=str(table),
+                unique=bool(unique),
+                access_method=str(access_method),
+                keys=tuple(_catalog_expression(key) or "" for key in keys),
+                options=tuple(int(option) for option in options),
+                opclasses=tuple(str(opclass) for opclass in opclasses),
+                predicate=_catalog_expression(predicate),
+                expression=_catalog_expression(expression),
             )
+
+        allowed_index_names = set(required_index_specs).union(
+            _OPTIONAL_INDEX_SPECS
+        )
+        actual_index_names = set(actual_indexes)
+        missing_indexes = set(required_index_specs).difference(actual_index_names)
+        unexpected_indexes = actual_index_names.difference(allowed_index_names)
+        if missing_indexes:
+            problems.append(f"missing indexes {sorted(missing_indexes)}")
+        if unexpected_indexes:
+            problems.append(f"unexpected indexes {sorted(unexpected_indexes)}")
+        if invalid_indexes:
+            problems.append(f"invalid indexes {sorted(invalid_indexes)}")
+        if included_column_indexes:
+            problems.append(
+                "indexes with unexpected included columns "
+                f"{sorted(included_column_indexes)}"
+            )
+        expected_present_indexes = dict(required_index_specs)
+        for name, spec in _OPTIONAL_INDEX_SPECS.items():
+            if name in actual_indexes:
+                expected_present_indexes[name] = spec
+        for name, expected in expected_present_indexes.items():
+            actual = actual_indexes.get(name)
+            if actual is not None and actual != expected:
+                problems.append(
+                    f"index {name} is {actual!r}, expected {expected!r}"
+                )
+
+        constraint_rows = conn.execute(
+            "SELECT table_class.relname, constraint_catalog.conname, "
+            "constraint_catalog.contype, constraint_catalog.condeferrable, "
+            "constraint_catalog.condeferred, constraint_catalog.convalidated, "
+            "ARRAY(SELECT column_attribute.attname FROM "
+            "unnest(constraint_catalog.conkey) WITH ORDINALITY "
+            "AS constrained_column(attribute_number, position) "
+            "JOIN pg_attribute AS column_attribute "
+            "ON column_attribute.attrelid = constraint_catalog.conrelid "
+            "AND column_attribute.attnum = constrained_column.attribute_number "
+            "ORDER BY constrained_column.position), "
+            "referenced_schema.nspname, referenced_table.relname, "
+            "ARRAY(SELECT referenced_attribute.attname FROM "
+            "unnest(constraint_catalog.confkey) WITH ORDINALITY "
+            "AS referenced_column(attribute_number, position) "
+            "JOIN pg_attribute AS referenced_attribute "
+            "ON referenced_attribute.attrelid = constraint_catalog.confrelid "
+            "AND referenced_attribute.attnum = referenced_column.attribute_number "
+            "ORDER BY referenced_column.position), "
+            "constraint_catalog.confupdtype::text, "
+            "constraint_catalog.confdeltype::text, "
+            "constraint_catalog.confmatchtype::text "
+            "FROM pg_constraint AS constraint_catalog "
+            "JOIN pg_class AS table_class "
+            "ON table_class.oid = constraint_catalog.conrelid "
+            "JOIN pg_namespace AS table_schema "
+            "ON table_schema.oid = table_class.relnamespace "
+            "LEFT JOIN pg_class AS referenced_table "
+            "ON referenced_table.oid = constraint_catalog.confrelid "
+            "LEFT JOIN pg_namespace AS referenced_schema "
+            "ON referenced_schema.oid = referenced_table.relnamespace "
+            "WHERE table_schema.nspname = %s",
+            (_SCHEMA,),
+        ).fetchall()
+        actual_constraint_specs: Dict[
+            tuple[str, str], _ConstraintSpec
+        ] = {}
+        for (
+            table,
+            constraint_name,
+            kind,
+            deferrable,
+            initially_deferred,
+            validated,
+            columns,
+            referenced_schema,
+            referenced_table,
+            referenced_columns,
+            update_action,
+            delete_action,
+            match_type,
+        ) in constraint_rows:
+            normalized_kind = str(kind)
+            key = (str(table), str(constraint_name))
+            actual_constraint_specs[key] = _ConstraintSpec(
+                kind=normalized_kind,
+                columns=tuple(str(column) for column in (columns or ())),
+                referenced_schema=(
+                    str(referenced_schema)
+                    if referenced_schema is not None
+                    else None
+                ),
+                referenced_table=(
+                    str(referenced_table)
+                    if referenced_table is not None
+                    else None
+                ),
+                referenced_columns=tuple(
+                    str(column) for column in (referenced_columns or ())
+                ),
+                update_action=(
+                    str(update_action) if normalized_kind == "f" else None
+                ),
+                delete_action=(
+                    str(delete_action) if normalized_kind == "f" else None
+                ),
+                match_type=(
+                    str(match_type) if normalized_kind == "f" else None
+                ),
+                deferrable=bool(deferrable),
+                initially_deferred=bool(initially_deferred),
+                validated=bool(validated),
+            )
+
+        actual_constraint_names = set(actual_constraint_specs)
+        required_constraint_names = set(required_constraint_specs)
+        missing_constraints = required_constraint_names.difference(
+            actual_constraint_names
+        )
+        unexpected_constraints = actual_constraint_names.difference(
+            required_constraint_names
+        )
+        if missing_constraints:
+            problems.append(f"missing constraints {sorted(missing_constraints)}")
+        if unexpected_constraints:
+            problems.append(
+                f"unexpected constraints {sorted(unexpected_constraints)}"
+            )
+        for key, expected in required_constraint_specs.items():
+            actual = actual_constraint_specs.get(key)
+            if actual is not None and actual != expected:
+                problems.append(
+                    f"constraint {key[0]}.{key[1]} is {actual!r}, "
+                    f"expected {expected!r}"
+                )
 
         if problems:
             raise RuntimeError(

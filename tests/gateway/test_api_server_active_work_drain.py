@@ -8,6 +8,7 @@ turns once the gateway starts draining.
 """
 
 import asyncio
+import json
 import threading
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -17,7 +18,9 @@ from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
 from gateway.config import Platform, PlatformConfig
-from gateway.platforms.api_server import APIServerAdapter
+from gateway import drain_mode
+from gateway.drain_mode import EcsTaskProtection
+from gateway.platforms.api_server import APIServerAdapter, _admit_api_agent_request
 from gateway.run import _INTERRUPT_REASON_GATEWAY_SHUTDOWN
 from hermes_state import SessionDB
 from tests.gateway.restart_test_helpers import make_restart_runner
@@ -62,6 +65,27 @@ def _make_admission_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_post("/v1/responses", adapter._handle_responses)
     app.router.add_post("/v1/runs", adapter._handle_runs)
     return app
+
+
+class _AdmissionProbe:
+    """Small real-decorator harness for the pre-handler admission boundary."""
+
+    def __init__(self, handler_started: asyncio.Event):
+        self._handler_started = handler_started
+        self._pending_agent_requests = 0
+
+    @staticmethod
+    def _check_auth(_request):
+        return None
+
+    @staticmethod
+    def _draining_response():
+        return None
+
+    @_admit_api_agent_request
+    async def handle(self, _request):
+        self._handler_started.set()
+        return "handler-result"
 
 
 class TestActiveApiRunCount:
@@ -130,6 +154,7 @@ class TestDrainWaitsForApiWork:
         original_create_task = asyncio.create_task
         task_started = asyncio.Event()
         allow_task = asyncio.Event()
+        transfer_task_counts = []
 
         def delayed_create_task(coro):
             async def delayed():
@@ -145,9 +170,21 @@ class TestDrainWaitsForApiWork:
         mock_agent.session_completion_tokens = 0
         mock_agent.session_total_tokens = 0
 
+        original_activate = api._activate_admitted_request
+
+        def observe_transfer():
+            transfer_task_counts.append(
+                sum(not task.done() for task in api._active_run_tasks.values())
+            )
+            original_activate()
+
         with patch(
             "gateway.platforms.api_server.asyncio.create_task",
             side_effect=delayed_create_task,
+        ), patch.object(
+            api,
+            "_activate_admitted_request",
+            side_effect=observe_transfer,
         ), patch.object(api, "_create_agent", return_value=mock_agent):
             async with TestClient(TestServer(app)) as client:
                 response = await client.post("/v1/runs", json={"input": "hello"})
@@ -164,6 +201,7 @@ class TestDrainWaitsForApiWork:
                 _snapshot, timed_out = await drain_task
 
         assert timed_out is False
+        assert transfer_task_counts == [1]
 
     @pytest.mark.asyncio
     async def test_drain_times_out_if_api_run_outlives_the_window(self):
@@ -211,6 +249,99 @@ class TestDrainWaitsForApiWork:
 
 
 class TestDrainAdmission:
+    @pytest.mark.asyncio
+    async def test_admission_waits_for_task_protection_ack_before_handler_body(
+        self, monkeypatch
+    ):
+        """The 0 -> 1 transition is protected before agent code can run."""
+        put_started = threading.Event()
+        allow_ack = threading.Event()
+        handler_started = asyncio.Event()
+
+        def _delayed_put(_url, _payload):
+            put_started.set()
+            assert allow_ack.wait(5.0), "test never released the ECS PUT"
+
+        protection = EcsTaskProtection(
+            agent_uri="http://ecs-agent.local",
+            http_call=_delayed_put,
+        )
+        monkeypatch.setattr(drain_mode, "_task_protection", protection, raising=False)
+        probe = _AdmissionProbe(handler_started)
+
+        request_task = asyncio.create_task(probe.handle(object()))
+        assert await asyncio.to_thread(put_started.wait, 2.0)
+        assert probe._pending_agent_requests == 1
+        assert not handler_started.is_set(), (
+            "handler entered before ECS acknowledged task protection"
+        )
+
+        allow_ack.set()
+        assert await asyncio.wait_for(request_task, timeout=2.0) == "handler-result"
+        assert handler_started.is_set()
+        assert probe._pending_agent_requests == 0
+
+    @pytest.mark.asyncio
+    async def test_failed_task_protection_refuses_without_entering_handler(
+        self, monkeypatch
+    ):
+        handler_started = asyncio.Event()
+
+        def _failed_put(_url, _payload):
+            raise OSError("ECS agent unavailable")
+
+        protection = EcsTaskProtection(
+            agent_uri="http://ecs-agent.local",
+            http_call=_failed_put,
+        )
+        monkeypatch.setattr(drain_mode, "_task_protection", protection, raising=False)
+        probe = _AdmissionProbe(handler_started)
+
+        response = await probe.handle(object())
+
+        assert response.status == 503
+        assert response.headers["Retry-After"]
+        assert json.loads(response.text)["error"]["code"] == (
+            "task_protection_unavailable"
+        )
+        assert not handler_started.is_set()
+        assert probe._pending_agent_requests == 0
+
+    @pytest.mark.asyncio
+    async def test_concurrent_first_admissions_share_one_protection_put(
+        self, monkeypatch
+    ):
+        put_started = threading.Event()
+        allow_ack = threading.Event()
+        calls = []
+
+        def _delayed_put(_url, payload):
+            calls.append(dict(payload))
+            put_started.set()
+            assert allow_ack.wait(5.0), "test never released the ECS PUT"
+
+        protection = EcsTaskProtection(
+            agent_uri="http://ecs-agent.local",
+            http_call=_delayed_put,
+        )
+        monkeypatch.setattr(drain_mode, "_task_protection", protection, raising=False)
+        first = _AdmissionProbe(asyncio.Event())
+        second = _AdmissionProbe(asyncio.Event())
+
+        tasks = [
+            asyncio.create_task(first.handle(object())),
+            asyncio.create_task(second.handle(object())),
+        ]
+        assert await asyncio.to_thread(put_started.wait, 2.0)
+        assert not first._handler_started.is_set()
+        assert not second._handler_started.is_set()
+        allow_ack.set()
+
+        assert await asyncio.gather(*tasks) == ["handler-result", "handler-result"]
+        assert calls == [
+            {"ProtectionEnabled": True, "ExpiresInMinutes": 15}
+        ]
+
     @pytest.mark.asyncio
     async def test_drain_refuses_every_agent_start_endpoint(self):
         adapter = APIServerAdapter(PlatformConfig(enabled=True))
@@ -349,6 +480,43 @@ class TestRunAgentRegistersForShutdownInterrupt:
 
         assert list(observed["during"].values()) == [agent]
         assert adapter._shutdown_interruptible_agents == {}
+
+    @pytest.mark.asyncio
+    async def test_run_agent_registers_before_releasing_pending_admission(self):
+        """The pending -> running transfer has no protection-visible zero gap."""
+        adapter = APIServerAdapter(PlatformConfig(enabled=True))
+        agent = MagicMock()
+        agent.session_id = None
+        agent.session_prompt_tokens = 0
+        agent.session_completion_tokens = 0
+        agent.session_total_tokens = 0
+        agent._last_compaction_in_place = False
+        agent.run_conversation.return_value = {
+            "final_response": "done",
+            "messages": [],
+            "api_calls": 0,
+            "tools": [],
+        }
+        running_counts = []
+
+        def _observe_transfer():
+            running_counts.append(adapter._inflight_agent_runs)
+
+        with (
+            patch.object(adapter, "_create_agent", return_value=agent),
+            patch.object(
+                adapter,
+                "_activate_admitted_request",
+                side_effect=_observe_transfer,
+            ),
+        ):
+            await adapter._run_agent(
+                user_message="hello",
+                conversation_history=[],
+                session_id="s1",
+            )
+
+        assert running_counts == [1]
 
     @pytest.mark.asyncio
     async def test_agent_is_unregistered_when_the_turn_raises(self):
@@ -605,4 +773,3 @@ class TestShutdownSettleWindow:
             _INTERRUPT_REASON_GATEWAY_SHUTDOWN,
             _INTERRUPT_REASON_GATEWAY_SHUTDOWN,
         ]
-

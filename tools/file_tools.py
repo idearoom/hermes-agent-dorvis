@@ -134,6 +134,33 @@ def _truncate_to_char_budget(content: str, max_chars: int) -> tuple[str, int, bo
 
 
 _EXTRACTED_LINE_CONTINUATION_PREFIX = "↳ "
+_SPLITLINE_BOUNDARIES = frozenset(
+    "\n\r\v\f\x1c\x1d\x1e\x85\u2028\u2029"
+)
+
+
+def _logical_line_bounds(text: str):
+    """Yield ``str.splitlines()``-equivalent slices without a line list."""
+    start = 0
+    cursor = 0
+    text_length = len(text)
+    while cursor < text_length:
+        character = text[cursor]
+        if character not in _SPLITLINE_BOUNDARIES:
+            cursor += 1
+            continue
+        yield start, cursor
+        if (
+            character == "\r"
+            and cursor + 1 < text_length
+            and text[cursor + 1] == "\n"
+        ):
+            cursor += 1
+        cursor += 1
+        start = cursor
+    # Like splitlines(), a terminal boundary does not add another empty line.
+    if start < text_length:
+        yield start, text_length
 
 
 def _document_page_lines(
@@ -158,9 +185,9 @@ def _document_page_lines(
     line limit cannot turn a two-million-character extraction into a second
     multi-million-object allocation.
     """
-    logical_lines = text.splitlines()
     selected: list[str] = []
     display_line = 0
+    logical_total_lines = 0
     wrapped_logical_lines = 0
     end_line = offset + limit - 1
     continuation_prefix = _EXTRACTED_LINE_CONTINUATION_PREFIX
@@ -170,33 +197,47 @@ def _document_page_lines(
         continuation_prefix = ""
     continuation_width = max(1, max_line_length - len(continuation_prefix))
 
-    for logical_line in logical_lines:
-        if len(logical_line) <= max_line_length:
-            segments = (logical_line,)
+    for logical_start, logical_end in _logical_line_bounds(text):
+        logical_total_lines += 1
+        logical_length = logical_end - logical_start
+        if logical_length <= max_line_length:
+            segment_count = 1
         else:
             wrapped_logical_lines += 1
+            remaining = logical_length - max_line_length
+            segment_count = 1 + (
+                remaining + continuation_width - 1
+            ) // continuation_width
 
-            def _segments():
-                yield logical_line[:max_line_length]
-                cursor = max_line_length
-                while cursor < len(logical_line):
-                    yield (
-                        continuation_prefix
-                        + logical_line[cursor:cursor + continuation_width]
-                    )
-                    cursor += continuation_width
-
-            segments = _segments()
-
-        for segment in segments:
-            display_line += 1
-            if offset <= display_line <= end_line:
-                selected.append(segment)
+        first_display_line = display_line + 1
+        last_display_line = display_line + segment_count
+        selected_start = max(offset, first_display_line)
+        selected_end = min(end_line, last_display_line)
+        for selected_line in range(selected_start, selected_end + 1):
+            segment_index = selected_line - first_display_line
+            if segment_index == 0:
+                segment_start = logical_start
+                segment_end = min(
+                    logical_start + max_line_length,
+                    logical_end,
+                )
+                selected.append(text[segment_start:segment_end])
+                continue
+            segment_start = (
+                logical_start
+                + max_line_length
+                + (segment_index - 1) * continuation_width
+            )
+            segment_end = min(segment_start + continuation_width, logical_end)
+            selected.append(
+                continuation_prefix + text[segment_start:segment_end]
+            )
+        display_line = last_display_line
 
     return (
         selected,
         display_line,
-        len(logical_lines),
+        logical_total_lines,
         wrapped_logical_lines,
         continuation_prefix,
     )
@@ -1955,15 +1996,15 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 2000, task_id: str =
 
         # ── Structured-document extraction ────────────────────────────
         # Try before the binary-extension guard so .docx/.xlsx can render as text.
-        # Binary-document failures are surfaced; notebook JSON syntax/decode
-        # failures alone paginate the already-bounded byte snapshot rather than
-        # retaining a parsed object or re-reading a path.
+        # Binary-document failures are surfaced. Notebook syntax/decode errors
+        # and parsed-but-nonrenderable notebook structures paginate the already-
+        # bounded byte snapshot rather than re-reading a path.
         from tools.read_extract import (
             ANYDOC_EXTENSIONS,
             EXTRACTABLE_EXTENSIONS,
             ExtractionBusyError,
             ExtractionError,
-            NotebookSyntaxError,
+            NotebookFallbackError,
             document_size_limit,
             extract_document_bytes,
             is_extractable_document,
@@ -2002,13 +2043,11 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 2000, task_id: str =
                         extracted_text = extract_document_bytes(
                             document_bytes, path
                         )
-                    except NotebookSyntaxError as extraction_exc:
-                        # Syntax/decode failures occur before a parsed notebook
-                        # object exists. They may use the already-bounded byte
-                        # snapshot without overlapping the parser's high-
-                        # expansion object graph. Clear chained tracebacks so
-                        # the failed parser frame is not retained during raw
-                        # decode, pagination, redaction, and serialization.
+                    except NotebookFallbackError as extraction_exc:
+                        # Syntax/decode failures have no parsed graph. Semantic
+                        # failures do, so clear the complete exception chain
+                        # before raw decoding; JSON graphs are acyclic and are
+                        # released when their traceback frame is detached.
                         fallback_reason = str(extraction_exc)
                         extraction_exc.__traceback__ = None
                         extraction_exc.__cause__ = None
@@ -2024,7 +2063,7 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 2000, task_id: str =
                             binary.file_size,
                             extracted_document=False,
                             fallback_note=(
-                                "Notebook syntax extraction failed; showing the "
+                                "Notebook structured extraction failed; showing the "
                                 "bounded raw snapshot instead: "
                                 f"{fallback_reason}"
                             ),

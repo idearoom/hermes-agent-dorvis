@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import tracemalloc
 import zipfile
 from contextlib import contextmanager
 from pathlib import Path
@@ -45,6 +46,17 @@ def _write_docx(path: Path, text: str) -> None:
         archive.writestr("word/document.xml", document)
 
 
+def _write_dense_docx(path: Path, *, paragraphs: int) -> None:
+    """Generate a normal paragraph-dense document in the temporary test dir."""
+    document = (
+        f'<w:document xmlns:w="{_WORD_NS}"><w:body>'
+        + "<w:p><w:r><w:t>x</w:t></w:r></w:p>" * paragraphs
+        + "</w:body></w:document>"
+    )
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("word/document.xml", document)
+
+
 def _write_xlsx(path: Path, text: str) -> None:
     workbook = (
         f'<workbook xmlns="{_SHEET_NS}" xmlns:r="{_OFFICE_REL_NS}">'
@@ -60,6 +72,30 @@ def _write_xlsx(path: Path, text: str) -> None:
         f'<worksheet xmlns="{_SHEET_NS}"><sheetData><row r="1">'
         f'<c r="A1" t="str"><v>{text}</v></c>'
         "</row></sheetData></worksheet>"
+    )
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("xl/workbook.xml", workbook)
+        archive.writestr("xl/_rels/workbook.xml.rels", relationships)
+        archive.writestr("xl/worksheets/sheet1.xml", worksheet)
+
+
+def _write_dense_xlsx(path: Path, *, rows: int, columns: int) -> None:
+    """Generate a normal dense export without retaining a binary fixture."""
+    workbook = (
+        f'<workbook xmlns="{_SHEET_NS}" xmlns:r="{_OFFICE_REL_NS}">'
+        '<sheets><sheet name="Data" sheetId="1" r:id="rId1"/></sheets>'
+        "</workbook>"
+    )
+    relationships = (
+        f'<Relationships xmlns="{_PACKAGE_REL_NS}">'
+        '<Relationship Id="rId1" Target="worksheets/sheet1.xml" Type="x"/>'
+        "</Relationships>"
+    )
+    cells = '<c t="str"><v>x</v></c>' * columns
+    worksheet = (
+        f'<worksheet xmlns="{_SHEET_NS}"><sheetData>'
+        + "".join(f'<row r="{row}">{cells}</row>' for row in range(1, rows + 1))
+        + "</sheetData></worksheet>"
     )
     with zipfile.ZipFile(path, "w") as archive:
         archive.writestr("xl/workbook.xml", workbook)
@@ -176,6 +212,59 @@ def test_native_reader_slot_covers_rendering_and_serialization(
         clear_file_ops_cache(task_id)
 
 
+def test_document_pagination_does_not_materialize_every_logical_line() -> None:
+    """Newline-dense bounded text must not allocate one object per line."""
+    text = "ab\n" * 666_666
+
+    tracemalloc.start()
+    try:
+        page = file_tools._document_page_lines(
+            text,
+            1,
+            1,
+            max_line_length=2_000,
+        )
+        _current, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    selected, total_lines, logical_lines, wrapped_lines, prefix = page
+    assert selected == ["ab"]
+    assert total_lines == 666_666
+    assert logical_lines == 666_666
+    assert wrapped_lines == 0
+    assert prefix == "↳ "
+    assert peak < 4 * 1024 * 1024
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "",
+        "one",
+        "one\n",
+        "\n\n",
+        "a\nb\r\nc\rd\ve\ff\x1cg\x1dh\x1ei\x85j\u2028k\u2029",
+    ],
+)
+def test_document_pagination_preserves_splitlines_semantics(text: str) -> None:
+    expected = text.splitlines()
+
+    selected, total_lines, logical_lines, wrapped_lines, _prefix = (
+        file_tools._document_page_lines(
+            text,
+            1,
+            max(1, len(expected)),
+            max_line_length=2_000,
+        )
+    )
+
+    assert selected == expected
+    assert total_lines == len(expected)
+    assert logical_lines == len(expected)
+    assert wrapped_lines == 0
+
+
 def test_wide_structured_row_is_losslessly_retrievable_by_offset(
     tmp_path: Path,
 ) -> None:
@@ -288,6 +377,58 @@ def test_structured_char_budget_continues_at_lossless_display_line(
                 pytest.fail("structured continuation did not terminate")
 
         assert "".join(row_parts) == wide_value
+    finally:
+        clear_file_ops_cache(task_id)
+
+
+def test_dense_normal_xlsx_returns_bounded_truncated_content(
+    tmp_path: Path,
+) -> None:
+    """A normal dense export must degrade to partial text, not a hard error."""
+    path = tmp_path / "dense-export.xlsx"
+    _write_dense_xlsx(path, rows=6_000, columns=60)
+    task_id = "structured-dense-xlsx"
+
+    try:
+        result = json.loads(
+            read_file_tool(
+                str(path),
+                offset=4_000,
+                limit=1_000,
+                task_id=task_id,
+            )
+        )
+
+        assert "error" not in result
+        assert result["extracted_document"] is True
+        assert "x\tx\tx" in result["content"]
+        assert "[Extraction truncated" in result["content"]
+    finally:
+        clear_file_ops_cache(task_id)
+
+
+def test_dense_normal_docx_returns_bounded_truncated_content(
+    tmp_path: Path,
+) -> None:
+    """A paragraph-dense document must return its safe prefix, not fail."""
+    path = tmp_path / "dense-body.docx"
+    _write_dense_docx(path, paragraphs=90_000)
+    task_id = "structured-dense-docx"
+
+    try:
+        result = json.loads(
+            read_file_tool(
+                str(path),
+                offset=82_000,
+                limit=2_000,
+                task_id=task_id,
+            )
+        )
+
+        assert "error" not in result
+        assert result["extracted_document"] is True
+        assert "|x" in result["content"]
+        assert "[Extraction truncated" in result["content"]
     finally:
         clear_file_ops_cache(task_id)
 

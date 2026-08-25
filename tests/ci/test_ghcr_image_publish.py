@@ -490,11 +490,11 @@ def test_evidence_records_the_registry_digest_and_not_the_local_image_id(tmp_pat
 
 def test_workflow_builds_once_smokes_that_image_and_exports_publish_evidence():
     yaml = pytest.importorskip("yaml")
-    workflow = yaml.safe_load(
-        (_REPO / ".github/workflows/idearoom-ghcr-publish.yml").read_text(
-            encoding="utf-8"
-        )
-    )
+    workflow_source = (
+        _REPO / ".github/workflows/idearoom-ghcr-publish.yml"
+    ).read_text(encoding="utf-8")
+    workflow = yaml.safe_load(workflow_source)
+    assert "branches: [dorvis/runtime, main]" in workflow_source
     validation = workflow["jobs"]["validate-pr"]
     assert validation["permissions"] == {"contents": "read"}
     assert "pull_request" in validation["if"]
@@ -509,6 +509,7 @@ def test_workflow_builds_once_smokes_that_image_and_exports_publish_evidence():
     assert job["permissions"] == {"contents": "read", "packages": "write"}
     assert "github.event_name == 'push'" in job["if"]
     assert "github.ref == 'refs/heads/main'" in job["if"]
+    assert "github.ref == 'refs/heads/dorvis/runtime'" in job["if"]
     assert "!=" not in job["if"]
     steps = job["steps"]
     builds = [

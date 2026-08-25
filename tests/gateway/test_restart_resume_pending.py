@@ -26,6 +26,7 @@ PRs #9850, #9934, #7536):
 """
 
 import asyncio
+import threading
 import time
 from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -33,6 +34,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from gateway.config import GatewayConfig, HomeChannel, Platform
+from gateway import drain_mode
+from gateway.drain_mode import EcsTaskProtection, reset_drain_mode_for_tests
 from gateway.platforms.base import MessageEvent, MessageType, SendResult
 from gateway.run import (
     _AGENT_PENDING_SENTINEL,
@@ -913,6 +916,67 @@ async def test_auto_resume_sets_sentinel_before_task_execution():
 
 
 @pytest.mark.asyncio
+async def test_auto_resume_waits_for_task_protection_before_adapter_execution(
+    monkeypatch,
+):
+    """The preclaimed startup-resume sentinel is protected before dispatch."""
+    reset_drain_mode_for_tests()
+    runner, adapter = make_restart_runner()
+    source = make_restart_source(chat_id="protected-resume")
+    pending_entry = SessionEntry(
+        session_key="agent:main:telegram:dm:protected-resume",
+        session_id="sid",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        origin=source,
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        resume_pending=True,
+        resume_reason="restart_interrupted",
+        last_resume_marked_at=datetime.now(),
+    )
+    runner.session_store._entries = {pending_entry.session_key: pending_entry}
+    put_started = threading.Event()
+    allow_ack = threading.Event()
+    adapter_started = asyncio.Event()
+
+    def _delayed_put(_url, _payload):
+        put_started.set()
+        assert allow_ack.wait(5.0), "test never released the ECS PUT"
+
+    monkeypatch.setattr(
+        drain_mode,
+        "_task_protection",
+        EcsTaskProtection(
+            agent_uri="http://ecs-agent.local",
+            http_call=_delayed_put,
+        ),
+    )
+
+    async def _handle(_event):
+        adapter_started.set()
+
+    adapter.handle_message = _handle
+    try:
+        assert runner._schedule_resume_pending_sessions() == 1
+        assert await asyncio.to_thread(put_started.wait, 2.0)
+        assert not adapter_started.is_set()
+        assert runner._running_agents.get(
+            pending_entry.session_key
+        ) is _AGENT_PENDING_SENTINEL
+
+        allow_ack.set()
+        for _ in range(20):
+            await asyncio.sleep(0.01)
+            if adapter_started.is_set():
+                break
+        assert adapter_started.is_set()
+    finally:
+        allow_ack.set()
+        reset_drain_mode_for_tests()
+
+
+@pytest.mark.asyncio
 async def test_auto_resume_runs_agent_exactly_once_through_full_path():
     """Full-path regression: the pre-claim must NOT make auto-resume a no-op.
 
@@ -1075,5 +1139,4 @@ async def test_startup_restore_gate_releases_when_resume_turn_outlives_timeout(
 
     never_finishes.set()
     await slow_task
-
 

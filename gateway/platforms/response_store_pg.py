@@ -1,8 +1,8 @@
 """Postgres-backed Responses API store (IdeaRoom D6 / AE-61).
 
 A drop-in replacement for the SQLite ``ResponseStore`` in ``api_server.py`` that
-keeps the exact same 8-method interface but persists to PostgreSQL instead of a
-SQLite file on the agent home.
+keeps the same data and lifecycle interface but persists to PostgreSQL instead
+of a SQLite file on the agent home.
 
 Why: on AWS the agent home is an EFS (NFS) mount, and SQLite over NFS is ~1000x
 slower than local disk (measured 0.2 vs 201 txn/s, 8 concurrent writers). Every
@@ -38,6 +38,78 @@ logger = logging.getLogger(__name__)
 DEFAULT_MAX_STORED_RESPONSES = None
 
 _SCHEMA = "hermes_gw"
+_TERMINAL_STATUSES = frozenset(
+    {"completed", "failed", "cancelled", "canceled", "incomplete"}
+)
+_LEGACY_TERMINAL_FUNCTION_BODY = """
+BEGIN
+    IF NEW.owner_id IS NULL AND NEW.owner_epoch IS NULL THEN
+        NEW.terminal := COALESCE(
+            NEW.data -> 'response' ->> 'status', 'completed'
+        ) IN (
+            'completed', 'failed', 'cancelled',
+            'canceled', 'incomplete'
+        );
+    END IF;
+    RETURN NEW;
+END
+"""
+_OWNED_RESPONSE_FENCE_FUNCTION_BODY = """
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        IF (OLD.owner_id IS NOT NULL OR OLD.owner_epoch IS NOT NULL)
+           AND NOT OLD.terminal THEN
+            RETURN NULL;
+        END IF;
+        RETURN OLD;
+    END IF;
+
+    IF OLD.owner_id IS NULL AND OLD.owner_epoch IS NULL THEN
+        RETURN NEW;
+    END IF;
+
+    IF NEW.response_id IS NOT DISTINCT FROM OLD.response_id
+       AND NEW.data IS NOT DISTINCT FROM OLD.data
+       AND NEW.owner_id IS NOT DISTINCT FROM OLD.owner_id
+       AND NEW.owner_epoch IS NOT DISTINCT FROM OLD.owner_epoch
+       AND NEW.terminal IS NOT DISTINCT FROM OLD.terminal THEN
+        RETURN NEW;
+    END IF;
+
+    IF current_setting(
+           'hermes_gw.response_write_owner_id', true
+       ) = OLD.owner_id
+       AND current_setting(
+           'hermes_gw.response_write_owner_epoch', true
+       ) = OLD.owner_epoch
+       AND NEW.response_id IS NOT DISTINCT FROM OLD.response_id
+       AND NEW.owner_id IS NOT DISTINCT FROM OLD.owner_id
+       AND NEW.owner_epoch IS NOT DISTINCT FROM OLD.owner_epoch THEN
+        RETURN NEW;
+    END IF;
+
+    RAISE EXCEPTION 'unauthorized owned response mutation for %', OLD.response_id;
+END
+"""
+_CONVERSATION_DELETE_FENCE_FUNCTION_BODY = """
+DECLARE
+    mapped_owner_id TEXT;
+    mapped_owner_epoch TEXT;
+    mapped_terminal BOOLEAN;
+BEGIN
+    SELECT owner_id, owner_epoch, terminal
+    INTO mapped_owner_id, mapped_owner_epoch, mapped_terminal
+    FROM hermes_gw.responses
+    WHERE response_id = OLD.response_id;
+
+    IF NOT FOUND
+       OR (mapped_owner_id IS NULL AND mapped_owner_epoch IS NULL)
+       OR mapped_terminal THEN
+        RETURN OLD;
+    END IF;
+    RETURN NULL;
+END
+"""
 
 
 def _dumps(obj: Any) -> str:
@@ -56,11 +128,18 @@ def _normalize_dsn(dsn: str) -> str:
     return dsn.replace("sslmode=no-verify", "sslmode=require")
 
 
+def _record_is_terminal(data: Dict[str, Any]) -> bool:
+    response = data.get("response") if isinstance(data, dict) else None
+    if not isinstance(response, dict) or not response.get("status"):
+        return True
+    return str(response.get("status")) in _TERMINAL_STATUSES
+
+
 class PgResponseStore:
     """Postgres-backed durable store for Responses API state.
 
-    Interface parity with ``api_server.ResponseStore``:
-    ``get / put / delete / get_conversation / set_conversation / close / __len__``.
+    Interface parity with ``api_server.ResponseStore``, including owned
+    response claim/transition and terminal-only deletion operations.
     Thread-safe via a psycopg connection pool (the gateway calls these
     synchronously from async handlers across threads, like the SQLite store with
     ``check_same_thread=False``).
@@ -100,7 +179,18 @@ class PgResponseStore:
             name="hermes-response-store",
         )
         self._closed = False
-        self._init_schema()
+        try:
+            self._init_schema()
+        except Exception:
+            self._closed = True
+            try:
+                self._pool.close()
+            except Exception:
+                logger.debug(
+                    "ResponseStore: failed to close pool after schema init error",
+                    exc_info=True,
+                )
+            raise
 
     def _init_schema(self) -> None:
         with self._pool.connection() as conn:
@@ -109,9 +199,71 @@ class PgResponseStore:
                 f"""CREATE TABLE IF NOT EXISTS {_SCHEMA}.responses (
                     response_id TEXT PRIMARY KEY,
                     data JSONB NOT NULL,
-                    accessed_at DOUBLE PRECISION NOT NULL
+                    accessed_at DOUBLE PRECISION NOT NULL,
+                    owner_id TEXT,
+                    owner_epoch TEXT,
+                    terminal BOOLEAN NOT NULL DEFAULT TRUE
                 )"""
             )
+            conn.execute(
+                f"""CREATE TABLE IF NOT EXISTS {_SCHEMA}.conversations (
+                    name TEXT PRIMARY KEY,
+                    response_id TEXT NOT NULL REFERENCES {_SCHEMA}.responses(response_id)
+                        ON DELETE CASCADE
+                )"""
+            )
+            # Perform every compatibility change while old writers are blocked.
+            # This avoids exposing DEFAULT TRUE without the legacy classifier,
+            # and closes the cleanup/FK window where an old task could recreate
+            # a dangling conversation mapping.
+            with conn.transaction():
+                conn.execute(
+                    f"LOCK TABLE {_SCHEMA}.responses, {_SCHEMA}.conversations "
+                    "IN SHARE ROW EXCLUSIVE MODE"
+                )
+                conn.execute(
+                    f"ALTER TABLE {_SCHEMA}.responses "
+                    "ADD COLUMN IF NOT EXISTS owner_id TEXT"
+                )
+                conn.execute(
+                    f"ALTER TABLE {_SCHEMA}.responses "
+                    "ADD COLUMN IF NOT EXISTS owner_epoch TEXT"
+                )
+                conn.execute(
+                    f"ALTER TABLE {_SCHEMA}.responses "
+                    "ADD COLUMN IF NOT EXISTS terminal "
+                    "BOOLEAN NOT NULL DEFAULT TRUE"
+                )
+                conn.execute(
+                    f"ALTER TABLE {_SCHEMA}.responses "
+                    "ALTER COLUMN terminal SET DEFAULT TRUE"
+                )
+                self._ensure_legacy_terminal_function(conn)
+                self._ensure_legacy_terminal_trigger(conn)
+                self._ensure_owned_response_fence_function(conn)
+                self._ensure_owned_response_fence_trigger(conn)
+                self._ensure_conversation_delete_fence_function(conn)
+                self._ensure_conversation_delete_fence_trigger(conn)
+                # Backstop rows written before the trigger existed while old
+                # and new gateway tasks overlap.
+                conn.execute(
+                    f"""UPDATE {_SCHEMA}.responses
+                        SET terminal = COALESCE(
+                            data -> 'response' ->> 'status', 'completed'
+                        ) IN (
+                            'completed', 'failed', 'cancelled',
+                            'canceled', 'incomplete'
+                        )
+                        WHERE owner_id IS NULL AND owner_epoch IS NULL"""
+                )
+                conn.execute(
+                    f"""DELETE FROM {_SCHEMA}.conversations AS c
+                        WHERE NOT EXISTS (
+                            SELECT 1 FROM {_SCHEMA}.responses AS r
+                            WHERE r.response_id = c.response_id
+                        )"""
+                )
+                self._ensure_conversation_response_fk(conn)
             # accessed_at remains useful for diagnostics and future explicit
             # retention policies, even though this durable store does not apply
             # automatic LRU eviction.
@@ -119,12 +271,422 @@ class PgResponseStore:
                 f"CREATE INDEX IF NOT EXISTS idx_responses_accessed_at "
                 f"ON {_SCHEMA}.responses (accessed_at)"
             )
-            conn.execute(
-                f"""CREATE TABLE IF NOT EXISTS {_SCHEMA}.conversations (
-                    name TEXT PRIMARY KEY,
-                    response_id TEXT NOT NULL
-                )"""
-            )
+
+    @staticmethod
+    def _ensure_legacy_terminal_function(conn) -> None:
+        """Create the compatibility function, or reject a namesake contract."""
+        normalized_body = " ".join(_LEGACY_TERMINAL_FUNCTION_BODY.split())
+        row = conn.execute(
+            f"""SELECT /* hermes_response_legacy_function_contract */
+                       l.lanname = 'plpgsql'
+                   AND p.prokind = 'f'
+                   AND p.prorettype = 'pg_catalog.trigger'::regtype
+                   AND p.pronargs = 0
+                   AND p.provolatile = 'v'
+                   AND NOT p.proisstrict
+                   AND NOT p.prosecdef
+                   AND NOT p.proleakproof
+                   AND p.proparallel = 'u'
+                   AND p.proconfig IS NULL
+                   AND btrim(
+                           regexp_replace(
+                               p.prosrc, '[[:space:]]+', ' ', 'g'
+                           )
+                       ) = %s
+                FROM pg_proc AS p
+                JOIN pg_namespace AS n ON n.oid = p.pronamespace
+                JOIN pg_language AS l ON l.oid = p.prolang
+                WHERE n.nspname = '{_SCHEMA}'
+                  AND p.proname = 'sync_legacy_response_terminal'
+                  AND p.pronargs = 0""",
+            (normalized_body,),
+        ).fetchone()
+        if row is not None:
+            if not bool(row[0]):
+                raise RuntimeError(
+                    "Existing Hermes legacy terminal function has unsafe semantics"
+                )
+            return
+        conn.execute(
+            f"""CREATE FUNCTION {_SCHEMA}.sync_legacy_response_terminal()
+                RETURNS trigger
+                LANGUAGE plpgsql
+                VOLATILE
+                CALLED ON NULL INPUT
+                SECURITY INVOKER
+                PARALLEL UNSAFE
+                AS $function${_LEGACY_TERMINAL_FUNCTION_BODY}$function$"""
+        )
+
+    @staticmethod
+    def _ensure_legacy_terminal_trigger(conn) -> None:
+        """Install the exact old-writer classifier trigger, never a namesake."""
+        row = conn.execute(
+            f"""SELECT /* hermes_response_legacy_trigger_contract */
+                       t.tgfoid =
+                           '{_SCHEMA}.sync_legacy_response_terminal()'::regprocedure
+                   AND t.tgtype = 23
+                   AND t.tgenabled = 'O'
+                   AND NOT t.tgisinternal
+                   AND t.tgqual IS NULL
+                   AND t.tgnargs = 0
+                   AND t.tgoldtable IS NULL
+                   AND t.tgnewtable IS NULL
+                   AND t.tgattr::text = concat_ws(
+                       ' ',
+                       (
+                           SELECT attnum FROM pg_attribute
+                           WHERE attrelid = '{_SCHEMA}.responses'::regclass
+                             AND attname = 'data'
+                       ),
+                       (
+                           SELECT attnum FROM pg_attribute
+                           WHERE attrelid = '{_SCHEMA}.responses'::regclass
+                             AND attname = 'owner_id'
+                       ),
+                       (
+                           SELECT attnum FROM pg_attribute
+                           WHERE attrelid = '{_SCHEMA}.responses'::regclass
+                             AND attname = 'owner_epoch'
+                       )
+                   )
+                FROM pg_trigger AS t
+                WHERE t.tgname = 'sync_legacy_response_terminal'
+                  AND t.tgrelid = '{_SCHEMA}.responses'::regclass"""
+        ).fetchone()
+        if row is not None:
+            if not bool(row[0]):
+                raise RuntimeError(
+                    "Existing Hermes legacy terminal trigger has unsafe semantics"
+                )
+            return
+        conn.execute(
+            f"""CREATE TRIGGER sync_legacy_response_terminal
+                BEFORE INSERT OR UPDATE OF data, owner_id, owner_epoch
+                ON {_SCHEMA}.responses
+                FOR EACH ROW
+                EXECUTE FUNCTION {_SCHEMA}.sync_legacy_response_terminal()"""
+        )
+
+    @staticmethod
+    def _ensure_owned_response_fence_function(conn) -> None:
+        """Install the exact mixed-version mutation/delete fence function.
+
+        Unauthorized semantic updates raise instead of becoming silent no-ops:
+        the old cancel handler ignores ``put`` rowcount and would otherwise
+        return a false 200. Active deletes return a no-op so its old DELETE
+        handler observes rowcount zero/404 while the row remains intact.
+        """
+        PgResponseStore._ensure_trigger_function(
+            conn,
+            function_name="fence_owned_response",
+            function_body=_OWNED_RESPONSE_FENCE_FUNCTION_BODY,
+            contract_marker="hermes_response_owned_fence_function_contract",
+            error_label="owned response fence function",
+        )
+
+    @staticmethod
+    def _ensure_owned_response_fence_trigger(conn) -> None:
+        """Protect owned rows from legacy updates and active deletion."""
+        row = conn.execute(
+            f"""SELECT /* hermes_response_owned_fence_trigger_contract */
+                       t.tgfoid =
+                           '{_SCHEMA}.fence_owned_response()'::regprocedure
+                   AND t.tgtype = 27
+                   AND t.tgenabled = 'O'
+                   AND NOT t.tgisinternal
+                   AND t.tgqual IS NULL
+                   AND t.tgnargs = 0
+                   AND t.tgoldtable IS NULL
+                   AND t.tgnewtable IS NULL
+                   AND t.tgattr::text = ''
+                FROM pg_trigger AS t
+                WHERE t.tgname = 'fence_owned_response'
+                  AND t.tgrelid = '{_SCHEMA}.responses'::regclass"""
+        ).fetchone()
+        if row is not None:
+            if not bool(row[0]):
+                raise RuntimeError(
+                    "Existing owned response fence trigger has unsafe semantics"
+                )
+            return
+        conn.execute(
+            f"""CREATE TRIGGER fence_owned_response
+                BEFORE UPDATE OR DELETE ON {_SCHEMA}.responses
+                FOR EACH ROW
+                EXECUTE FUNCTION {_SCHEMA}.fence_owned_response()"""
+        )
+
+    @staticmethod
+    def _ensure_conversation_delete_fence_function(conn) -> None:
+        """Install the exact active-owned mapping delete fence function."""
+        PgResponseStore._ensure_trigger_function(
+            conn,
+            function_name="fence_owned_response_conversation_delete",
+            function_body=_CONVERSATION_DELETE_FENCE_FUNCTION_BODY,
+            contract_marker=(
+                "hermes_response_conversation_delete_fence_function_contract"
+            ),
+            error_label="conversation delete fence function",
+        )
+
+    @staticmethod
+    def _ensure_conversation_delete_fence_trigger(conn) -> None:
+        """Keep legacy DELETE from detaching an active owned response."""
+        row = conn.execute(
+            f"""SELECT /* hermes_response_conversation_delete_fence_trigger_contract */
+                       t.tgfoid =
+                           '{_SCHEMA}.fence_owned_response_conversation_delete()'
+                           ::regprocedure
+                   AND t.tgtype = 11
+                   AND t.tgenabled = 'O'
+                   AND NOT t.tgisinternal
+                   AND t.tgqual IS NULL
+                   AND t.tgnargs = 0
+                   AND t.tgoldtable IS NULL
+                   AND t.tgnewtable IS NULL
+                   AND t.tgattr::text = ''
+                FROM pg_trigger AS t
+                WHERE t.tgname = 'fence_owned_response_conversation_delete'
+                  AND t.tgrelid = '{_SCHEMA}.conversations'::regclass"""
+        ).fetchone()
+        if row is not None:
+            if not bool(row[0]):
+                raise RuntimeError(
+                    "Existing conversation delete fence trigger has unsafe semantics"
+                )
+            return
+        conn.execute(
+            f"""CREATE TRIGGER fence_owned_response_conversation_delete
+                BEFORE DELETE ON {_SCHEMA}.conversations
+                FOR EACH ROW
+                EXECUTE FUNCTION
+                    {_SCHEMA}.fence_owned_response_conversation_delete()"""
+        )
+
+    @staticmethod
+    def _ensure_trigger_function(
+        conn,
+        *,
+        function_name: str,
+        function_body: str,
+        contract_marker: str,
+        error_label: str,
+    ) -> None:
+        """Create an exact trigger function or fail closed on a namesake."""
+        normalized_body = " ".join(function_body.split())
+        row = conn.execute(
+            f"""SELECT /* {contract_marker} */
+                       l.lanname = 'plpgsql'
+                   AND p.prokind = 'f'
+                   AND p.prorettype = 'pg_catalog.trigger'::regtype
+                   AND p.pronargs = 0
+                   AND p.provolatile = 'v'
+                   AND NOT p.proisstrict
+                   AND NOT p.prosecdef
+                   AND NOT p.proleakproof
+                   AND p.proparallel = 'u'
+                   AND p.proconfig IS NULL
+                   AND btrim(
+                           regexp_replace(
+                               p.prosrc, '[[:space:]]+', ' ', 'g'
+                           )
+                       ) = %s
+                FROM pg_proc AS p
+                JOIN pg_namespace AS n ON n.oid = p.pronamespace
+                JOIN pg_language AS l ON l.oid = p.prolang
+                WHERE n.nspname = '{_SCHEMA}'
+                  AND p.proname = %s
+                  AND p.pronargs = 0""",
+            (normalized_body, function_name),
+        ).fetchone()
+        if row is not None:
+            if not bool(row[0]):
+                raise RuntimeError(
+                    f"Existing {error_label} has unsafe semantics"
+                )
+            return
+        conn.execute(
+            f"""CREATE FUNCTION {_SCHEMA}.{function_name}()
+                RETURNS trigger
+                LANGUAGE plpgsql
+                VOLATILE
+                CALLED ON NULL INPUT
+                SECURITY INVOKER
+                PARALLEL UNSAFE
+                AS $function${function_body}$function$"""
+        )
+
+    @staticmethod
+    def _ensure_conversation_response_fk(conn) -> None:
+        """Install the exact cascading FK, or reject a misleading namesake."""
+        row = conn.execute(
+            f"""SELECT /* hermes_response_conversation_fk_contract */
+                       c.contype = 'f'
+                   AND c.confrelid = '{_SCHEMA}.responses'::regclass
+                   AND cardinality(c.conkey) = 1
+                   AND c.conkey[1] = (
+                       SELECT attnum FROM pg_attribute
+                       WHERE attrelid = '{_SCHEMA}.conversations'::regclass
+                         AND attname = 'response_id'
+                   )
+                   AND cardinality(c.confkey) = 1
+                   AND c.confkey[1] = (
+                       SELECT attnum FROM pg_attribute
+                       WHERE attrelid = '{_SCHEMA}.responses'::regclass
+                         AND attname = 'response_id'
+                   )
+                   AND c.confmatchtype = 's'
+                   AND c.confupdtype = 'a'
+                   AND c.confdeltype = 'c'
+                   AND NOT c.condeferrable
+                   AND NOT c.condeferred
+                   AND c.convalidated
+                FROM pg_constraint AS c
+                WHERE c.conname = 'conversations_response_id_fkey'
+                  AND c.conrelid = '{_SCHEMA}.conversations'::regclass"""
+        ).fetchone()
+        if row is not None:
+            if not bool(row[0]):
+                raise RuntimeError(
+                    "Existing conversation response foreign key has unsafe semantics"
+                )
+            return
+        conn.execute(
+            f"""ALTER TABLE {_SCHEMA}.conversations
+                ADD CONSTRAINT conversations_response_id_fkey
+                FOREIGN KEY (response_id)
+                REFERENCES {_SCHEMA}.responses(response_id)
+                ON DELETE CASCADE"""
+        )
+
+    def claim(
+        self,
+        response_id: str,
+        data: Dict[str, Any],
+        *,
+        owner_id: str,
+        owner_epoch: str,
+        conversation: Optional[str] = None,
+        terminal: bool = False,
+    ) -> bool:
+        """Atomically create an owned response and its conversation mapping."""
+        def _claim():
+            with self._pool.connection() as conn, conn.transaction():
+                row = conn.execute(
+                    f"""INSERT INTO {_SCHEMA}.responses
+                        (response_id, data, accessed_at, owner_id, owner_epoch, terminal)
+                        VALUES (%s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (response_id) DO NOTHING
+                        RETURNING response_id""",
+                    (
+                        response_id,
+                        self._Jsonb(data, dumps=_dumps),
+                        time.time(),
+                        owner_id,
+                        owner_epoch,
+                        terminal,
+                    ),
+                ).fetchone()
+                if row is None:
+                    return False
+                if conversation:
+                    conn.execute(
+                        f"""INSERT INTO {_SCHEMA}.conversations (name, response_id)
+                            VALUES (%s, %s)
+                            ON CONFLICT (name)
+                            DO UPDATE SET response_id = EXCLUDED.response_id""",
+                        (conversation, response_id),
+                    )
+                return True
+
+        return self._with_schema_retry("claim", _claim)
+
+    def get_control(self, response_id: str) -> Optional[Dict[str, Any]]:
+        """Return durable owner/epoch and terminal state."""
+        def _get_control():
+            with self._pool.connection() as conn:
+                row = conn.execute(
+                    f"""SELECT owner_id, owner_epoch, terminal
+                        FROM {_SCHEMA}.responses WHERE response_id = %s""",
+                    (response_id,),
+                ).fetchone()
+                if row is None:
+                    return None
+                return {
+                    "owner_id": row[0],
+                    "owner_epoch": row[1],
+                    "terminal": bool(row[2]),
+                }
+
+        return self._with_schema_retry("get_control", _get_control)
+
+    def transition(
+        self,
+        response_id: str,
+        data: Dict[str, Any],
+        *,
+        owner_id: str,
+        owner_epoch: str,
+        terminal: bool,
+    ) -> bool:
+        """CAS an owned nonterminal response; terminal states are monotonic."""
+        def _transition():
+            with self._pool.connection() as conn, conn.transaction():
+                # Mixed-version database triggers reject data mutation on an
+                # owned row unless this exact owner/epoch authorizes it for the
+                # current transaction.  SET LOCAL semantics prevent pooled
+                # connections from leaking authority to a later legacy write.
+                conn.execute(
+                    """SELECT
+                           set_config(
+                               'hermes_gw.response_write_owner_id', %s, true
+                           ),
+                           set_config(
+                               'hermes_gw.response_write_owner_epoch', %s, true
+                           )""",
+                    (owner_id, owner_epoch),
+                )
+                cur = conn.execute(
+                    f"""UPDATE {_SCHEMA}.responses
+                        SET data = %s, accessed_at = %s, terminal = %s
+                        WHERE response_id = %s
+                          AND owner_id = %s
+                          AND owner_epoch = %s
+                          AND terminal = FALSE""",
+                    (
+                        self._Jsonb(data, dumps=_dumps),
+                        time.time(),
+                        terminal,
+                        response_id,
+                        owner_id,
+                        owner_epoch,
+                    ),
+                )
+                return cur.rowcount == 1
+
+        return self._with_schema_retry("transition", _transition)
+
+    def delete_terminal(self, response_id: str) -> str:
+        """Lock, verify terminality, and delete with FK-cascaded mappings."""
+        def _delete_terminal():
+            with self._pool.connection() as conn, conn.transaction():
+                row = conn.execute(
+                    f"""SELECT terminal FROM {_SCHEMA}.responses
+                        WHERE response_id = %s FOR UPDATE""",
+                    (response_id,),
+                ).fetchone()
+                if row is None:
+                    return "not_found"
+                if not bool(row[0]):
+                    return "active"
+                conn.execute(
+                    f"DELETE FROM {_SCHEMA}.responses WHERE response_id = %s",
+                    (response_id,),
+                )
+                return "deleted"
+
+        return self._with_schema_retry("delete_terminal", _delete_terminal)
 
     def _with_schema_retry(self, operation: str, fn):
         try:
@@ -165,11 +727,21 @@ class PgResponseStore:
         def _put():
             with self._pool.connection() as conn:
                 conn.execute(
-                    f"""INSERT INTO {_SCHEMA}.responses (response_id, data, accessed_at)
-                        VALUES (%s, %s, %s)
+                    f"""INSERT INTO {_SCHEMA}.responses
+                        (response_id, data, accessed_at, owner_id, owner_epoch, terminal)
+                        VALUES (%s, %s, %s, NULL, NULL, %s)
                         ON CONFLICT (response_id)
-                        DO UPDATE SET data = EXCLUDED.data, accessed_at = EXCLUDED.accessed_at""",
-                    (response_id, self._Jsonb(data, dumps=_dumps), time.time()),
+                        DO UPDATE SET data = EXCLUDED.data,
+                                      accessed_at = EXCLUDED.accessed_at,
+                                      owner_id = NULL,
+                                      owner_epoch = NULL,
+                                      terminal = EXCLUDED.terminal""",
+                    (
+                        response_id,
+                        self._Jsonb(data, dumps=_dumps),
+                        time.time(),
+                        _record_is_terminal(data),
+                    ),
                 )
 
         self._with_schema_retry("put", _put)
@@ -177,7 +749,7 @@ class PgResponseStore:
     def delete(self, response_id: str) -> bool:
         """Remove a response from the store. Returns True if found and deleted."""
         def _delete():
-            with self._pool.connection() as conn:
+            with self._pool.connection() as conn, conn.transaction():
                 conn.execute(
                     f"DELETE FROM {_SCHEMA}.conversations WHERE response_id = %s",
                     (response_id,),
@@ -202,19 +774,28 @@ class PgResponseStore:
 
         return self._with_schema_retry("get_conversation", _get_conversation)
 
-    def set_conversation(self, name: str, response_id: str) -> None:
-        """Map a conversation name to its latest response_id."""
+    def set_conversation(self, name: str, response_id: str) -> bool:
+        """Map a name only while the referenced response still exists."""
         def _set_conversation():
-            with self._pool.connection() as conn:
-                conn.execute(
+            with self._pool.connection() as conn, conn.transaction():
+                response = conn.execute(
+                    f"""SELECT response_id FROM {_SCHEMA}.responses
+                        WHERE response_id = %s FOR KEY SHARE""",
+                    (response_id,),
+                ).fetchone()
+                if response is None:
+                    return False
+                row = conn.execute(
                     f"""INSERT INTO {_SCHEMA}.conversations (name, response_id)
                         VALUES (%s, %s)
                         ON CONFLICT (name)
-                        DO UPDATE SET response_id = EXCLUDED.response_id""",
+                        DO UPDATE SET response_id = EXCLUDED.response_id
+                        RETURNING name""",
                     (name, response_id),
-                )
+                ).fetchone()
+                return row is not None
 
-        self._with_schema_retry("set_conversation", _set_conversation)
+        return self._with_schema_retry("set_conversation", _set_conversation)
 
     def close(self) -> None:
         """Close the connection pool."""

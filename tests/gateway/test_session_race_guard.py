@@ -9,11 +9,14 @@ duplicate agent.
 """
 
 import asyncio
+import threading
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from gateway.config import GatewayConfig, Platform, PlatformConfig
+from gateway import drain_mode
+from gateway.drain_mode import EcsTaskProtection, reset_drain_mode_for_tests
 from gateway.platforms.base import MessageEvent, MessageType, merge_pending_message_event
 from gateway.run import GatewayRunner, _AGENT_PENDING_SENTINEL
 from gateway.session import SessionSource, build_session_key
@@ -101,6 +104,46 @@ async def test_sentinel_placed_before_agent_setup():
     assert sentinel_was_set, (
         "Sentinel must be in _running_agents when _handle_message_with_agent starts"
     )
+
+
+@pytest.mark.asyncio
+async def test_relay_turn_waits_for_task_protection_ack_before_agent_setup(monkeypatch):
+    """A relay-only 0 -> 1 turn cannot execute while ECS can scale it in."""
+    reset_drain_mode_for_tests()
+    runner = _make_runner()
+    event = _make_event()
+    session_key = build_session_key(event.source)
+    put_started = threading.Event()
+    allow_ack = threading.Event()
+    inner_started = asyncio.Event()
+
+    def _delayed_put(_url, _payload):
+        put_started.set()
+        assert allow_ack.wait(5.0), "test never released the ECS PUT"
+
+    protection = EcsTaskProtection(
+        agent_uri="http://ecs-agent.local",
+        http_call=_delayed_put,
+    )
+    monkeypatch.setattr(drain_mode, "_task_protection", protection)
+
+    async def _inner(_self, _event, _source, _key, _generation):
+        inner_started.set()
+        return "ok"
+
+    try:
+        with patch.object(GatewayRunner, "_handle_message_with_agent", _inner):
+            turn = asyncio.create_task(runner._handle_message(event))
+            assert await asyncio.to_thread(put_started.wait, 2.0)
+            assert runner._running_agents.get(session_key) is _AGENT_PENDING_SENTINEL
+            assert not inner_started.is_set(), (
+                "relay agent setup entered before task protection was acknowledged"
+            )
+            allow_ack.set()
+            assert await asyncio.wait_for(turn, 2.0) == "ok"
+    finally:
+        allow_ack.set()
+        reset_drain_mode_for_tests()
 
 
 # ------------------------------------------------------------------
