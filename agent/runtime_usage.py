@@ -259,8 +259,16 @@ def track_auxiliary_stream_dispatch(
     base_url: Optional[str] = None,
     api_mode: Optional[str] = None,
     request: Any = None,
+    completed_response_predicate: Optional[Callable[[Any], bool]] = None,
 ) -> Any:
-    """Dispatch a stream and keep its observer open until consume/close/error."""
+    """Dispatch a stream and keep its observer open until consume/close/error.
+
+    Some OpenAI-compatible adapters ignore ``stream=True`` and return an
+    already-completed response.  Callers that support that wire behavior may
+    provide ``completed_response_predicate``; a matching response is accounted
+    and observed immediately, then returned unchanged instead of being wrapped
+    as an iterator.
+    """
     observer = _begin_auxiliary_observer_attempt(
         task=task,
         provider=provider,
@@ -274,6 +282,24 @@ def track_auxiliary_stream_dispatch(
     except BaseException as exc:
         _end_auxiliary_observer_attempt(observer, error=exc)
         raise
+    if (
+        completed_response_predicate is not None
+        and completed_response_predicate(stream)
+    ):
+        _notify_auxiliary_attempt_observer(response=stream, reason=None)
+        try:
+            _record_tracked_auxiliary_response(stream, task=task)
+        except Exception:
+            logger.debug(
+                "Auxiliary completed-stream usage accounting failed",
+                exc_info=True,
+            )
+            _best_effort_mark_auxiliary_dispatch_uncertain(
+                task=task,
+                reason="usage_accounting_failed",
+            )
+        _end_auxiliary_observer_attempt(observer, response=stream)
+        return stream
     return _ObservedAuxiliaryStream(stream, observer, task=task)
 
 
@@ -1137,14 +1163,28 @@ def _usage_components(
     prompt_tokens = _token_value(usage, "prompt_tokens")
     snake_input_tokens = _token_value(usage, "input_tokens")
     camel_input_tokens = _token_value(usage, "inputTokens")
-    # Codex app-server reports uncached and cached input separately in camel
-    # case. Responses/chat prompt totals already include cached tokens, so only
-    # add this bucket when the camelCase input shape was selected.
-    cached_input_tokens = (
+    warnings: list[str] = []
+    # Codex app-server mirrors the Responses API contract: camelCase
+    # inputTokens is the whole prompt total, while cachedInputTokens (and newer
+    # cacheWriteInputTokens) are subsets. They must never be added to the
+    # provider total a second time.
+    uses_camel_input = prompt_tokens is None and snake_input_tokens is None
+    camel_cache_read_tokens = (
         _token_value(usage, "cachedInputTokens") or 0
-        if prompt_tokens is None and snake_input_tokens is None
+        if uses_camel_input
         else 0
     )
+    camel_cache_write_tokens = (
+        _token_value(usage, "cacheWriteInputTokens") or 0
+        if uses_camel_input
+        else 0
+    )
+    if (
+        uses_camel_input
+        and camel_input_tokens is not None
+        and camel_cache_read_tokens + camel_cache_write_tokens > camel_input_tokens
+    ):
+        warnings.append("cache_tokens_exceed_input_tokens")
     base_input_tokens = (
         prompt_tokens
         if prompt_tokens is not None
@@ -1172,7 +1212,7 @@ def _usage_components(
         else 0
     )
     input_tokens = (
-        base_input_tokens + cached_input_tokens + anthropic_cache_tokens
+        base_input_tokens + anthropic_cache_tokens
         if base_input_tokens is not None
         else None
     )
@@ -1183,7 +1223,6 @@ def _usage_components(
         "outputTokens",
     )
     reported_total = _token_value(usage, "total_tokens", "totalTokens")
-    warnings: list[str] = []
     if input_tokens is None or output_tokens is None:
         warnings.append("input_output_breakdown_missing_or_invalid")
     expected_total = (

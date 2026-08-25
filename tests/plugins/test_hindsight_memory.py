@@ -1,3 +1,5 @@
+from types import SimpleNamespace
+
 from plugins.memory.hindsight import HindsightMemoryProvider
 
 
@@ -14,11 +16,15 @@ def test_same_turn_recall_fills_empty_prefetch(monkeypatch):
 
     def _recall(query: str):
         seen["query"] = query
-        return "- remembered fact", [
-            {"id": "fact-1", "text": "remembered fact", "score": None, "type": "world"}
-        ]
+        record = {
+            "id": "fact-1",
+            "text": "remembered fact",
+            "score": None,
+            "type": "world",
+        }
+        return SimpleNamespace(text="- remembered fact", count=1, records=(record,))
 
-    monkeypatch.setattr(provider, "_recall_context", _recall)
+    monkeypatch.setattr(provider, "_do_recall", _recall)
 
     result = provider.prefetch("0123456789abcdef")
 
@@ -43,9 +49,9 @@ def test_same_turn_recall_respects_platform_allowlist(monkeypatch):
     def _recall(query: str):
         nonlocal called
         called = True
-        return "- should not appear", []
+        return SimpleNamespace(text="- should not appear", count=1, records=())
 
-    monkeypatch.setattr(provider, "_recall_context", _recall)
+    monkeypatch.setattr(provider, "_do_recall", _recall)
 
     assert provider.prefetch("hello") == ""
     assert called is False

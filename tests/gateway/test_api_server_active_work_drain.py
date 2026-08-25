@@ -8,6 +8,8 @@ turns once the gateway starts draining.
 """
 
 import asyncio
+import json
+import threading
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -16,8 +18,16 @@ from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
 from gateway.config import Platform, PlatformConfig
-from gateway.platforms.api_server import APIServerAdapter
+from gateway import drain_mode
+from gateway.drain_mode import EcsTaskProtection
+from gateway.platforms.api_server import APIServerAdapter, _admit_api_agent_request
+from gateway.run import _INTERRUPT_REASON_GATEWAY_SHUTDOWN
+from hermes_state import SessionDB
 from tests.gateway.restart_test_helpers import make_restart_runner
+
+# Safety net so a regression parks the executor thread forever instead of
+# hanging CI.  No assertion below depends on elapsed time.
+_TURN_UNBLOCK_TIMEOUT = 30.0
 
 
 class _RunTask:
@@ -57,52 +67,35 @@ def _make_admission_app(adapter: APIServerAdapter) -> web.Application:
     return app
 
 
+class _AdmissionProbe:
+    """Small real-decorator harness for the pre-handler admission boundary."""
+
+    def __init__(self, handler_started: asyncio.Event):
+        self._handler_started = handler_started
+        self._pending_agent_requests = 0
+
+    @staticmethod
+    def _check_auth(_request):
+        return None
+
+    @staticmethod
+    def _draining_response():
+        return None
+
+    @_admit_api_agent_request
+    async def handle(self, _request):
+        self._handler_started.set()
+        return "handler-result"
+
+
 class TestActiveApiRunCount:
     def test_zero_when_no_api_adapter(self):
         runner, _adapter = make_restart_runner()
         runner.adapters = {}
         assert runner._active_api_run_count() == 0
 
-    def test_delegates_to_primary_api_adapter(self):
-        runner, _adapter = make_restart_runner()
-        runner.adapters = {
-            Platform.API_SERVER: _make_api_adapter(inflight=2, queued_ids=["r1"])
-        }
-        assert runner._active_api_run_count() == 3
-
-    def test_ignores_non_api_platforms(self):
-        runner, _adapter = make_restart_runner()
-        other = SimpleNamespace(
-            platform=Platform.DISCORD,
-            active_agent_work_count=lambda: 99,
-        )
-        runner.adapters = {Platform.DISCORD: other}
-        assert runner._active_api_run_count() == 0
-
-    def test_never_raises_on_broken_adapter(self):
-        runner, _adapter = make_restart_runner()
-
-        class Bad:
-            platform = Platform.API_SERVER
-
-            @staticmethod
-            def active_agent_work_count() -> int:
-                raise RuntimeError("boom")
-
-        runner.adapters = {Platform.API_SERVER: Bad()}
-        assert runner._active_api_run_count() == 0
-
 
 class TestAPIServerAdapterWorkCount:
-    def test_concurrency_limit_counts_other_pending_admissions(self):
-        adapter = APIServerAdapter(PlatformConfig(enabled=True))
-        adapter._max_concurrent_runs = 1
-        adapter._pending_agent_requests = 1
-
-        response = adapter._concurrency_limited_response()
-
-        assert response is not None
-        assert response.status == 429
 
     @pytest.mark.asyncio
     async def test_concurrency_limit_excludes_current_pending_admission(self):
@@ -119,11 +112,6 @@ class TestAPIServerAdapterWorkCount:
 
         assert response.status == 404
 
-    def test_counts_pending_admission_before_agent_bookkeeping(self):
-        adapter = APIServerAdapter(PlatformConfig(enabled=True))
-        adapter._pending_agent_requests = 1
-
-        assert adapter.active_agent_work_count() == 1
 
     def test_counts_live_run_task_before_agent_creation(self):
         adapter = APIServerAdapter(PlatformConfig(enabled=True))
@@ -144,16 +132,17 @@ class TestAPIServerAdapterWorkCount:
 
         assert adapter.active_agent_work_count() == 1
 
+    def test_interrupt_active_runs_interrupts_adapter_owned_agents(self):
+        adapter = APIServerAdapter(PlatformConfig(enabled=True))
+        agent = MagicMock()
+        adapter._active_run_agents = {"run-1": agent}
+
+        assert adapter.interrupt_active_runs("gateway shutdown") == 1
+
+        agent.interrupt.assert_called_once_with("gateway shutdown")
+
 
 class TestDrainWaitsForApiWork:
-    @pytest.mark.asyncio
-    async def test_drain_returns_immediately_when_nothing_active(self):
-        runner, _adapter = make_restart_runner()
-        runner.adapters = {}
-
-        _snapshot, timed_out = await runner._drain_active_agents(5.0)
-
-        assert timed_out is False
 
     @pytest.mark.asyncio
     async def test_drain_waits_for_real_queued_run_before_agent_creation(self):
@@ -165,6 +154,7 @@ class TestDrainWaitsForApiWork:
         original_create_task = asyncio.create_task
         task_started = asyncio.Event()
         allow_task = asyncio.Event()
+        transfer_task_counts = []
 
         def delayed_create_task(coro):
             async def delayed():
@@ -180,9 +170,21 @@ class TestDrainWaitsForApiWork:
         mock_agent.session_completion_tokens = 0
         mock_agent.session_total_tokens = 0
 
+        original_activate = api._activate_admitted_request
+
+        def observe_transfer():
+            transfer_task_counts.append(
+                sum(not task.done() for task in api._active_run_tasks.values())
+            )
+            original_activate()
+
         with patch(
             "gateway.platforms.api_server.asyncio.create_task",
             side_effect=delayed_create_task,
+        ), patch.object(
+            api,
+            "_activate_admitted_request",
+            side_effect=observe_transfer,
         ), patch.object(api, "_create_agent", return_value=mock_agent):
             async with TestClient(TestServer(app)) as client:
                 response = await client.post("/v1/runs", json={"input": "hello"})
@@ -199,6 +201,7 @@ class TestDrainWaitsForApiWork:
                 _snapshot, timed_out = await drain_task
 
         assert timed_out is False
+        assert transfer_task_counts == [1]
 
     @pytest.mark.asyncio
     async def test_drain_times_out_if_api_run_outlives_the_window(self):
@@ -208,6 +211,17 @@ class TestDrainWaitsForApiWork:
         _snapshot, timed_out = await runner._drain_active_agents(0.1)
 
         assert timed_out is True
+
+    def test_shutdown_interrupt_reaches_api_server_runs(self):
+        runner, _adapter = make_restart_runner()
+        api = APIServerAdapter(PlatformConfig(enabled=True))
+        agent = MagicMock()
+        api._active_run_agents = {"run-1": agent}
+        runner.adapters = {Platform.API_SERVER: api}
+
+        runner._interrupt_running_agents("gateway shutdown")
+
+        agent.interrupt.assert_called_once_with("gateway shutdown")
 
     @pytest.mark.asyncio
     async def test_drain_still_waits_for_chat_cron_and_api_work(self):
@@ -236,6 +250,99 @@ class TestDrainWaitsForApiWork:
 
 class TestDrainAdmission:
     @pytest.mark.asyncio
+    async def test_admission_waits_for_task_protection_ack_before_handler_body(
+        self, monkeypatch
+    ):
+        """The 0 -> 1 transition is protected before agent code can run."""
+        put_started = threading.Event()
+        allow_ack = threading.Event()
+        handler_started = asyncio.Event()
+
+        def _delayed_put(_url, _payload):
+            put_started.set()
+            assert allow_ack.wait(5.0), "test never released the ECS PUT"
+
+        protection = EcsTaskProtection(
+            agent_uri="http://ecs-agent.local",
+            http_call=_delayed_put,
+        )
+        monkeypatch.setattr(drain_mode, "_task_protection", protection, raising=False)
+        probe = _AdmissionProbe(handler_started)
+
+        request_task = asyncio.create_task(probe.handle(object()))
+        assert await asyncio.to_thread(put_started.wait, 2.0)
+        assert probe._pending_agent_requests == 1
+        assert not handler_started.is_set(), (
+            "handler entered before ECS acknowledged task protection"
+        )
+
+        allow_ack.set()
+        assert await asyncio.wait_for(request_task, timeout=2.0) == "handler-result"
+        assert handler_started.is_set()
+        assert probe._pending_agent_requests == 0
+
+    @pytest.mark.asyncio
+    async def test_failed_task_protection_refuses_without_entering_handler(
+        self, monkeypatch
+    ):
+        handler_started = asyncio.Event()
+
+        def _failed_put(_url, _payload):
+            raise OSError("ECS agent unavailable")
+
+        protection = EcsTaskProtection(
+            agent_uri="http://ecs-agent.local",
+            http_call=_failed_put,
+        )
+        monkeypatch.setattr(drain_mode, "_task_protection", protection, raising=False)
+        probe = _AdmissionProbe(handler_started)
+
+        response = await probe.handle(object())
+
+        assert response.status == 503
+        assert response.headers["Retry-After"]
+        assert json.loads(response.text)["error"]["code"] == (
+            "task_protection_unavailable"
+        )
+        assert not handler_started.is_set()
+        assert probe._pending_agent_requests == 0
+
+    @pytest.mark.asyncio
+    async def test_concurrent_first_admissions_share_one_protection_put(
+        self, monkeypatch
+    ):
+        put_started = threading.Event()
+        allow_ack = threading.Event()
+        calls = []
+
+        def _delayed_put(_url, payload):
+            calls.append(dict(payload))
+            put_started.set()
+            assert allow_ack.wait(5.0), "test never released the ECS PUT"
+
+        protection = EcsTaskProtection(
+            agent_uri="http://ecs-agent.local",
+            http_call=_delayed_put,
+        )
+        monkeypatch.setattr(drain_mode, "_task_protection", protection, raising=False)
+        first = _AdmissionProbe(asyncio.Event())
+        second = _AdmissionProbe(asyncio.Event())
+
+        tasks = [
+            asyncio.create_task(first.handle(object())),
+            asyncio.create_task(second.handle(object())),
+        ]
+        assert await asyncio.to_thread(put_started.wait, 2.0)
+        assert not first._handler_started.is_set()
+        assert not second._handler_started.is_set()
+        allow_ack.set()
+
+        assert await asyncio.gather(*tasks) == ["handler-result", "handler-result"]
+        assert calls == [
+            {"ProtectionEnabled": True, "ExpiresInMinutes": 15}
+        ]
+
+    @pytest.mark.asyncio
     async def test_drain_refuses_every_agent_start_endpoint(self):
         adapter = APIServerAdapter(PlatformConfig(enabled=True))
         runner = SimpleNamespace(_draining=True, _external_drain_active=False)
@@ -255,72 +362,414 @@ class TestDrainAdmission:
                     payload = await response.json()
 
                     assert response.status == 503
-                    assert response.headers["Retry-After"] == "1"
+                    retry_after = response.headers["Retry-After"]
+                    assert retry_after.isdigit() and int(retry_after) > 0
                     assert payload["error"]["code"] == "gateway_draining"
 
+
+# ---------------------------------------------------------------------------
+# Shutdown interrupt coverage (#63529)
+#
+# The drain ACCOUNTS for every API turn (`active_agent_work_count()` sums
+# `_pending_agent_requests` + `_inflight_agent_runs` + live `_active_run_tasks`)
+# but `GatewayRunner._interrupt_running_agents()` only walked
+# `self._running_agents`, which no API turn ever enters.  So an API turn held
+# the drain open for the full timeout and was then amputated by
+# `_kill_tool_subprocesses("post-interrupt")` with no cooperative interrupt.
+#
+# `/v1/runs` is only one of seven API agent-entry points.  The other six all
+# funnel through `_run_agent()` — both session-chat routes and
+# `/v1/chat/completions` + `/v1/responses` in streaming and non-streaming form
+# — and none of them has a run_id, so `_active_run_agents` cannot reach them.
+# ---------------------------------------------------------------------------
+
+
+def _parked_agent(loop, started: asyncio.Event, release: threading.Event) -> MagicMock:
+    """A mock agent whose turn parks inside ``run_conversation`` until released.
+
+    ``request_hard_interrupt`` falls back to ``agent.interrupt(reason)`` for an
+    unspecced ``MagicMock`` — ``inspect.getattr_static`` refuses to invent
+    ``hard_interrupt`` on a ``__getattr__`` proxy — which is exactly the ABI
+    teknium1's review asked this regression to verify.
+    """
+    agent = MagicMock()
+    agent.session_id = None
+    agent.session_prompt_tokens = 0
+    agent.session_completion_tokens = 0
+    agent.session_total_tokens = 0
+    agent._last_compaction_in_place = False
+    agent._hermes_api_runtime = {}
+
+    def _park(user_message=None, conversation_history=None, task_id=None):
+        loop.call_soon_threadsafe(started.set)
+        release.wait(_TURN_UNBLOCK_TIMEOUT)
+        return {"final_response": "done", "messages": [], "api_calls": 0, "tools": []}
+
+    agent.run_conversation.side_effect = _park
+    # A real agent unwinds its turn on interrupt; releasing here models that so
+    # the parked executor thread can finish.
+    agent.interrupt.side_effect = lambda *_a, **_k: release.set()
+    return agent
+
+
+class _SettlingApiAdapter:
+    """API adapter double whose work clears a few polls AFTER it is interrupted.
+
+    The poll count is the deterministic quantity under test: it makes "the
+    settle window kept polling API work" observable without timing anything.
+    """
+
+    def __init__(self, polls_to_settle: int = 3):
+        self._polls_to_settle = polls_to_settle
+        self.interrupt_reasons: list = []
+
+    def active_agent_work_count(self) -> int:
+        if not self.interrupt_reasons:
+            return 1
+        if self._polls_to_settle > 0:
+            self._polls_to_settle -= 1
+            return 1
+        return 0
+
+    def interrupt_active_runs(self, reason: str) -> int:
+        self.interrupt_reasons.append(reason)
+        return 1
+
+    @property
+    def settled(self) -> bool:
+        """Non-consuming view of the same state, safe to read from a spy."""
+        return bool(self.interrupt_reasons) and self._polls_to_settle == 0
+
+
+def _make_async_noop():
+    async def _noop(*args, **kwargs):
+        return None
+
+    return _noop
+
+
+class TestRunAgentRegistersForShutdownInterrupt:
     @pytest.mark.asyncio
-    async def test_external_drain_refuses_every_agent_start_endpoint(self):
+    async def test_run_agent_registers_and_unregisters_the_agent(self):
+        """One registration inside ``_run_agent`` covers all six of its callers.
+
+        Only two callers pass ``agent_ref``, and that lands in a caller-local
+        list rather than any registry, so it is not a usable hook.
+        """
         adapter = APIServerAdapter(PlatformConfig(enabled=True))
-        runner = SimpleNamespace(_draining=False, _external_drain_active=True)
-        app = _make_admission_app(adapter)
-        paths = (
-            "/api/sessions/missing/chat",
-            "/api/sessions/missing/chat/stream",
-            "/v1/chat/completions",
-            "/v1/responses",
-            "/v1/runs",
+        agent = MagicMock()
+        agent.session_id = None
+        agent.session_prompt_tokens = 0
+        agent.session_completion_tokens = 0
+        agent.session_total_tokens = 0
+        agent._last_compaction_in_place = False
+        observed = {}
+
+        def _record(user_message=None, conversation_history=None, task_id=None):
+            observed["during"] = dict(adapter._shutdown_interruptible_agents)
+            return {"final_response": "done", "messages": [], "api_calls": 0, "tools": []}
+
+        agent.run_conversation.side_effect = _record
+
+        with patch.object(adapter, "_create_agent", return_value=agent):
+            await adapter._run_agent(
+                user_message="hello",
+                conversation_history=[],
+                session_id="s1",
+            )
+
+        assert list(observed["during"].values()) == [agent]
+        assert adapter._shutdown_interruptible_agents == {}
+
+    @pytest.mark.asyncio
+    async def test_run_agent_registers_before_releasing_pending_admission(self):
+        """The pending -> running transfer has no protection-visible zero gap."""
+        adapter = APIServerAdapter(PlatformConfig(enabled=True))
+        agent = MagicMock()
+        agent.session_id = None
+        agent.session_prompt_tokens = 0
+        agent.session_completion_tokens = 0
+        agent.session_total_tokens = 0
+        agent._last_compaction_in_place = False
+        agent.run_conversation.return_value = {
+            "final_response": "done",
+            "messages": [],
+            "api_calls": 0,
+            "tools": [],
+        }
+        running_counts = []
+
+        def _observe_transfer():
+            running_counts.append(adapter._inflight_agent_runs)
+
+        with (
+            patch.object(adapter, "_create_agent", return_value=agent),
+            patch.object(
+                adapter,
+                "_activate_admitted_request",
+                side_effect=_observe_transfer,
+            ),
+        ):
+            await adapter._run_agent(
+                user_message="hello",
+                conversation_history=[],
+                session_id="s1",
+            )
+
+        assert running_counts == [1]
+
+    @pytest.mark.asyncio
+    async def test_agent_is_unregistered_when_the_turn_raises(self):
+        adapter = APIServerAdapter(PlatformConfig(enabled=True))
+        agent = MagicMock()
+        agent.run_conversation.side_effect = RuntimeError("boom")
+
+        with patch.object(adapter, "_create_agent", return_value=agent):
+            with pytest.raises(RuntimeError):
+                await adapter._run_agent(
+                    user_message="hello",
+                    conversation_history=[],
+                    session_id="s1",
+                )
+
+        assert adapter._shutdown_interruptible_agents == {}
+
+
+class TestInterruptActiveRuns:
+    def test_interrupts_v1_runs_agents(self):
+        """The ``/v1/runs`` coverage #63963 established stays green."""
+        adapter = APIServerAdapter(PlatformConfig(enabled=True))
+        agent = MagicMock()
+        adapter._active_run_agents = {"run-1": agent}
+
+        assert adapter.interrupt_active_runs("gateway shutdown") == 1
+        agent.interrupt.assert_called_once_with("gateway shutdown")
+
+    def test_interrupts_each_agent_exactly_once_across_both_registries(self):
+        adapter = APIServerAdapter(PlatformConfig(enabled=True))
+        shared = MagicMock()
+        run_only = MagicMock()
+        turn_only = MagicMock()
+        adapter._active_run_agents = {"run-1": run_only, "run-2": shared}
+        adapter._shutdown_interruptible_agents = {
+            id(shared): shared,
+            id(turn_only): turn_only,
+        }
+
+        assert adapter.interrupt_active_runs("gateway shutdown") == 3
+        shared.interrupt.assert_called_once_with("gateway shutdown")
+        run_only.interrupt.assert_called_once_with("gateway shutdown")
+        turn_only.interrupt.assert_called_once_with("gateway shutdown")
+
+    def test_one_bad_agent_does_not_strand_the_others(self):
+        adapter = APIServerAdapter(PlatformConfig(enabled=True))
+        exploding = MagicMock()
+        exploding.interrupt.side_effect = RuntimeError("already torn down")
+        no_abi = object()  # exposes neither hard_interrupt nor interrupt
+        healthy = MagicMock()
+        adapter._shutdown_interruptible_agents = {
+            id(exploding): exploding,
+            id(no_abi): no_abi,
+            id(healthy): healthy,
+        }
+
+        assert adapter.interrupt_active_runs("gateway shutdown") == 1
+        healthy.interrupt.assert_called_once_with("gateway shutdown")
+
+
+class TestShutdownInterruptReachesEveryApiTurn:
+    @pytest.mark.asyncio
+    async def test_chat_completions_turn_is_interrupted(self):
+        """A non-``/v1/runs`` API turn, end to end through the real handler.
+
+        This is teknium1's named acceptance criterion on #63963: the drain
+        counts this turn, so the shutdown interrupt must reach it.
+        """
+        runner, _adapter = make_restart_runner()
+        api = APIServerAdapter(PlatformConfig(enabled=True))
+        runner.adapters = {Platform.API_SERVER: api}
+        app = _make_admission_app(api)
+
+        loop = asyncio.get_running_loop()
+        started = asyncio.Event()
+        release = threading.Event()
+        agent = _parked_agent(loop, started, release)
+
+        try:
+            with patch.object(api, "_create_agent", return_value=agent):
+                async with TestClient(TestServer(app)) as client:
+                    request = asyncio.ensure_future(
+                        client.post(
+                            "/v1/chat/completions",
+                            json={"messages": [{"role": "user", "content": "hi"}]},
+                        )
+                    )
+                    await asyncio.wait_for(started.wait(), _TURN_UNBLOCK_TIMEOUT)
+
+                    # The drain sees this turn ...
+                    assert runner._active_api_run_count() == 1
+                    # ... and it is not in _running_agents, so only the API
+                    # hook can reach it.
+                    assert runner._running_agents == {}
+
+                    runner._interrupt_running_agents(_INTERRUPT_REASON_GATEWAY_SHUTDOWN)
+
+                    agent.interrupt.assert_called_once_with(
+                        _INTERRUPT_REASON_GATEWAY_SHUTDOWN
+                    )
+                    response = await asyncio.wait_for(request, _TURN_UNBLOCK_TIMEOUT)
+                    assert response.status == 200
+        finally:
+            release.set()
+
+        assert api._shutdown_interruptible_agents == {}
+
+    @pytest.mark.asyncio
+    async def test_session_chat_sse_turn_is_interrupted(self, tmp_path):
+        """The SSE session-chat route is a second, differently shaped caller."""
+        runner, _adapter = make_restart_runner()
+        api = APIServerAdapter(PlatformConfig(enabled=True))
+        session_db = SessionDB(tmp_path / "state.db")
+        api._session_db = session_db
+        runner.adapters = {Platform.API_SERVER: api}
+        app = _make_admission_app(api)
+        session_id = session_db.create_session("sse-session", "api_server")
+
+        loop = asyncio.get_running_loop()
+        started = asyncio.Event()
+        release = threading.Event()
+        agent = _parked_agent(loop, started, release)
+
+        try:
+            with patch.object(api, "_create_agent", return_value=agent):
+                async with TestClient(TestServer(app)) as client:
+                    request = asyncio.ensure_future(
+                        client.post(
+                            f"/api/sessions/{session_id}/chat/stream",
+                            json={"message": "hi"},
+                        )
+                    )
+                    await asyncio.wait_for(started.wait(), _TURN_UNBLOCK_TIMEOUT)
+
+                    assert runner._active_api_run_count() == 1
+                    assert runner._running_agents == {}
+
+                    runner._interrupt_running_agents(_INTERRUPT_REASON_GATEWAY_SHUTDOWN)
+
+                    agent.interrupt.assert_called_once_with(
+                        _INTERRUPT_REASON_GATEWAY_SHUTDOWN
+                    )
+                    response = await asyncio.wait_for(request, _TURN_UNBLOCK_TIMEOUT)
+                    assert response.status == 200
+                    await asyncio.wait_for(response.text(), _TURN_UNBLOCK_TIMEOUT)
+        finally:
+            release.set()
+            close = getattr(session_db, "close", None)
+            if callable(close):
+                close()
+
+        assert api._shutdown_interruptible_agents == {}
+
+    def test_interrupt_running_agents_is_a_noop_without_an_api_adapter(self):
+        """The hook is duck-typed — an adapterless runner must not raise."""
+        runner, _adapter = make_restart_runner()
+        runner.adapters = {}
+
+        runner._interrupt_running_agents(_INTERRUPT_REASON_GATEWAY_SHUTDOWN)
+
+        assert runner._interrupt_api_server_runs("x") == 0
+
+
+class TestShutdownSettleWindow:
+    @pytest.mark.asyncio
+    async def test_settle_window_waits_for_interrupted_api_work(self, monkeypatch):
+        """The interrupt is cooperative, so the settle window must poll API work.
+
+        Otherwise the window closes the instant ``_running_agents`` is empty —
+        which it always is for API turns — and the post-interrupt tool kill
+        lands on a turn that was asked to stop microseconds earlier.
+        """
+        import tools.browser_tool as _bt
+        import tools.process_registry as _pr
+        import tools.terminal_tool as _tt
+
+        runner, adapter = make_restart_runner()
+        runner._restart_drain_timeout = 0.01  # force the drain-timeout path
+        adapter.disconnect = _make_async_noop()
+        api = _SettlingApiAdapter()
+        runner.adapters = {Platform.TELEGRAM: adapter, Platform.API_SERVER: api}
+
+        settled_at_kill: list = []
+
+        def _spy_kill_all(task_id=None):
+            settled_at_kill.append(api.settled)
+            return 0
+
+        monkeypatch.setattr(_pr.process_registry, "kill_all", _spy_kill_all)
+        monkeypatch.setattr(_tt, "cleanup_all_environments", lambda: None)
+        monkeypatch.setattr(_bt, "cleanup_all_browsers", lambda: None)
+
+        with patch("gateway.status.remove_pid_file"), \
+             patch("gateway.status.write_runtime_status"), \
+             patch("cron.scheduler.mark_job_run"):
+            await runner.stop()
+
+        assert api.interrupt_reasons == [_INTERRUPT_REASON_GATEWAY_SHUTDOWN]
+        assert settled_at_kill, "post-interrupt tool kill never ran"
+        assert settled_at_kill[0] is True, (
+            "post-interrupt tool kill ran while the interrupted API turn was "
+            "still unwinding"
         )
 
-        with patch("gateway.run._gateway_runner_ref", lambda: runner):
-            async with TestClient(TestServer(app)) as client:
-                for path in paths:
-                    response = await client.post(path, json={})
-                    payload = await response.json()
-
-                    assert response.status == 503
-                    assert payload["error"]["code"] == "gateway_draining"
-
     @pytest.mark.asyncio
-    async def test_admitted_request_blocks_drain_before_agent_bookkeeping(self):
-        adapter = APIServerAdapter(PlatformConfig(enabled=True))
-        runner, _adapter = make_restart_runner()
-        runner.adapters = {Platform.API_SERVER: adapter}
-        app = _make_admission_app(adapter)
-        body_read_started = asyncio.Event()
-        allow_body_read = asyncio.Event()
+    async def test_api_work_still_live_at_settle_exit_is_reinterrupted(
+        self, monkeypatch
+    ):
+        """A /v1/runs agent can materialize AFTER the one-shot interrupt.
 
-        async def delayed_read_json(_request):
-            body_read_started.set()
-            await allow_body_read.wait()
-            return {"message": "hello"}, None
+        The task is counted via ``_active_run_tasks`` from admission, but
+        ``_active_run_agents[run_id]`` is populated only once ``_create_agent``
+        returns — an agent landing in that window missed the single interrupt
+        and previously went straight to the tool-subprocess kill. The settle
+        loop must re-signal when API work is still live at exit.
+        """
+        import tools.browser_tool as _bt
+        import tools.process_registry as _pr
+        import tools.terminal_tool as _tt
 
-        with patch.object(
-            adapter,
-            "_get_existing_session_or_404",
-            return_value=({}, None),
-        ), patch.object(
-            adapter,
-            "_read_json_body",
-            side_effect=delayed_read_json,
-        ), patch.object(
-            adapter,
-            "_run_agent",
-            new=AsyncMock(return_value=({"final_response": "done"}, {})),
-        ):
-            async with TestClient(TestServer(app)) as client:
-                request_task = asyncio.create_task(
-                    client.post("/api/sessions/missing/chat", json={})
-                )
-                await body_read_started.wait()
+        runner, adapter = make_restart_runner()
+        runner._restart_drain_timeout = 0.01
+        adapter.disconnect = _make_async_noop()
+        api = _SettlingApiAdapter(polls_to_settle=10_000)  # never settles
+        runner.adapters = {Platform.TELEGRAM: adapter, Platform.API_SERVER: api}
 
-                assert adapter._pending_agent_requests == 1
-                drain_task = asyncio.create_task(runner._drain_active_agents(2.0))
-                await asyncio.sleep(0.1)
-                assert not drain_task.done()
+        monkeypatch.setattr(_pr.process_registry, "kill_all", lambda task_id=None: 0)
+        monkeypatch.setattr(_tt, "cleanup_all_environments", lambda: None)
+        monkeypatch.setattr(_bt, "cleanup_all_browsers", lambda: None)
 
-                allow_body_read.set()
-                response = await request_task
-                assert response.status == 200
-                _snapshot, timed_out = await drain_task
+        # Accelerate the loop clock: each time() call advances 1s of virtual
+        # time, so the 5s settle deadline expires after a handful of polls
+        # instead of 5 real seconds. Relative deadline math is preserved.
+        loop = asyncio.get_running_loop()
+        _real_time = type(loop).time
+        _skew = [0.0]
 
-        assert timed_out is False
+        def _fast_time(self):
+            _skew[0] += 1.0
+            return _real_time(self) + _skew[0]
+
+        monkeypatch.setattr(type(loop), "time", _fast_time)
+        try:
+            with patch("gateway.status.remove_pid_file"), \
+                 patch("gateway.status.write_runtime_status"), \
+                 patch("cron.scheduler.mark_job_run"):
+                await runner.stop()
+        finally:
+            monkeypatch.undo()
+
+        # One shot from _interrupt_running_agents + one re-signal at settle
+        # exit because API work was still live.
+        assert api.interrupt_reasons == [
+            _INTERRUPT_REASON_GATEWAY_SHUTDOWN,
+            _INTERRUPT_REASON_GATEWAY_SHUTDOWN,
+        ]

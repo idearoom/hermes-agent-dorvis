@@ -46,13 +46,13 @@ duplicated:
   ``runner.stop()``, so the final teardown reuses the upstream graceful
   shutdown machinery unchanged.
 
-Background work during a drain: new agent-run launches are refused at the API
-surface, and context/session compression only ever starts inside a running
-turn — so a draining task cannot start compression for new work, while an
-in-flight run may still compress as part of finishing (intended). Cron and
-scheduled deliveries keep upstream behaviour: the ticker stops via
-``cron_stop`` when the drain completes and ``start_gateway`` tears down, with
-the existing cooperative in-flight delivery drain bounds.
+Background work during a drain: new API and relay agent-run launches are
+refused, while work admitted before the drain remains counted through its
+whole execution. Context/session compression only starts inside a running
+turn, so an in-flight turn may still compress as part of finishing (intended).
+Cron jobs retain upstream scheduling behavior but are registered as runner
+work from pre-dispatch through completion; the coordinator therefore waits
+for them and its hard-cap path fences a forced run as interrupted.
 
 Environment contract (all optional):
 
@@ -74,10 +74,15 @@ Environment contract (all optional):
   PUT (default 15).
 * ``HERMES_TASK_PROTECTION_RENEW_SECONDS`` — renew cadence while runs are
   active (default 300).
+* ``HERMES_TASK_PROTECTION_HTTP_TIMEOUT_SECONDS`` — bounded ECS-agent request
+  timeout (default 3; clamped to 0.1–10 seconds).
+* ``HERMES_TASK_PROTECTION_FAILURE_BACKOFF_SECONDS`` — fail-closed admission
+  backoff after a protection request fails (default 2).
 """
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import inspect
 import json
 import logging
@@ -89,6 +94,11 @@ import urllib.request
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
+
+_TASK_PROTECTION_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+    max_workers=1,
+    thread_name_prefix="hermes-task-protection",
+)
 
 # Programmatically detectable refusal contract: HTTP 503 with an OpenAI-style
 # error envelope carrying this code. Clients (Hermes web, the agent-platform
@@ -103,6 +113,8 @@ DEFAULT_FORCE_GRACE_SECONDS = 30.0
 DEFAULT_PROTECTION_EXPIRES_MINUTES = 15
 DEFAULT_PROTECTION_RENEW_SECONDS = 300.0
 DEFAULT_PROTECTION_CHECK_SECONDS = 15.0
+DEFAULT_TASK_PROTECTION_HTTP_TIMEOUT_SECONDS = 3.0
+DEFAULT_TASK_PROTECTION_FAILURE_BACKOFF_SECONDS = 2.0
 
 
 def _positive_float_env(name: str, default: float) -> float:
@@ -142,12 +154,11 @@ def drain_force_grace_seconds() -> float:
 class DrainMode:
     """Process-wide one-way drain latch plus active-run accounting registry.
 
-    Sources (today only the API server adapter; the relay side is quiesced
-    through the upstream drain-control marker instead) register a count
-    callable and an optional force-terminate callable keyed by name —
-    re-registering the same name replaces the previous callbacks, so adapter
-    reconnect loops that construct fresh instances never leave stale counts
-    behind.
+    The API adapter and gateway runner (relay sessions plus cron, without
+    overlap) each register a count callable and optional force-terminate
+    callable keyed by name. Re-registering the same name replaces previous
+    callbacks, so adapter reconnect loops that construct fresh instances never
+    leave stale counts behind.
 
     Thread-safety: ``begin`` may be called from the asyncio signal handler,
     an HTTP handler, or tests; registration happens at adapter construction.
@@ -224,7 +235,7 @@ class DrainMode:
             self._sources.pop(name, None)
 
     def active_runs(self) -> int:
-        """Sum of all registered sources. A failing source counts as 0."""
+        """Sum registered sources, conservatively counting a failed source."""
         with self._lock:
             sources = list(self._sources.items())
         total = 0
@@ -232,7 +243,11 @@ class DrainMode:
             try:
                 total += max(0, int(count_fn()))
             except Exception:
-                logger.debug("drain-mode: active-run source %s failed", name, exc_info=True)
+                # A counter failure is not evidence of idleness. Counting one
+                # keeps task protection and the drain wait fail-closed until a
+                # later poll succeeds (or the existing hard cap intervenes).
+                total += 1
+                logger.error("drain-mode: active-run source %s failed", name, exc_info=True)
         return total
 
     def force_terminate_all(self, reason: str) -> int:
@@ -273,6 +288,10 @@ class DrainMode:
 
 _drain_mode: Optional[DrainMode] = None
 _drain_mode_lock = threading.Lock()
+_task_protection: Optional["EcsTaskProtection"] = None
+_task_protection_lock = threading.Lock()
+_task_protection_wakeup_lock = threading.Lock()
+_task_protection_wakeup: Optional[Tuple[Any, "asyncio.Event"]] = None
 
 
 def get_drain_mode() -> DrainMode:
@@ -285,11 +304,15 @@ def get_drain_mode() -> DrainMode:
 
 
 def reset_drain_mode_for_tests() -> DrainMode:
-    """Replace the global drain state. Test-only."""
-    global _drain_mode
+    """Replace global drain/protection state. Test-only."""
+    global _drain_mode, _task_protection, _task_protection_wakeup
     with _drain_mode_lock:
         _drain_mode = DrainMode()
-        return _drain_mode
+    with _task_protection_lock:
+        _task_protection = None
+    with _task_protection_wakeup_lock:
+        _task_protection_wakeup = None
+    return _drain_mode
 
 
 def sigterm_begins_drain() -> bool:
@@ -349,10 +372,38 @@ class EcsTaskProtection:
                 )
             )
         self._expires_minutes = max(1, int(expires_minutes))
+        self._http_timeout_seconds = min(
+            10.0,
+            max(
+                0.1,
+                _positive_float_env(
+                    "HERMES_TASK_PROTECTION_HTTP_TIMEOUT_SECONDS",
+                    DEFAULT_TASK_PROTECTION_HTTP_TIMEOUT_SECONDS,
+                ),
+            ),
+        )
+        self._failure_backoff_seconds = max(
+            0.0,
+            _positive_float_env(
+                "HERMES_TASK_PROTECTION_FAILURE_BACKOFF_SECONDS",
+                DEFAULT_TASK_PROTECTION_FAILURE_BACKOFF_SECONDS,
+            ),
+        )
         self._http_call = http_call or self._default_http_call
         self._protected = False
         self._last_set_monotonic = 0.0
+        self._last_protect_failure_monotonic = 0.0
+        # Incremented under _operation_lock for every admitted work item,
+        # including admissions that reuse a fresh SET acknowledgement. An idle
+        # snapshot taken on the asyncio owner thread carries this fence into
+        # the worker that performs the blocking ECS PUT.
+        self._admission_epoch = 0
         self._noop_logged = False
+        # Admission, renewal, and release all share this client. Serialize the
+        # state transition plus its ECS acknowledgement so concurrent 0 -> 1
+        # admissions single-flight their PUT and a stale idle reconciliation
+        # cannot release protection after newly admitted work appears.
+        self._operation_lock = threading.Lock()
 
     @property
     def enabled(self) -> bool:
@@ -368,11 +419,20 @@ class EcsTaskProtection:
         return self._last_set_monotonic
 
     @property
+    def admission_epoch(self) -> int:
+        """Monotonic fence for work admitted since an idle snapshot."""
+        return self._admission_epoch
+
+    @property
+    def safe_refresh_seconds(self) -> float:
+        """Renew by half the ECS expiry even if polling is misconfigured."""
+        return max(1.0, float(self._expires_minutes) * 30.0)
+
+    @property
     def endpoint(self) -> str:
         return f"{self._agent_uri}/task-protection/v1/state"
 
-    @staticmethod
-    def _default_http_call(url: str, payload: Dict[str, Any]) -> None:
+    def _default_http_call(self, url: str, payload: Dict[str, Any]) -> None:
         data = json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(
             url,
@@ -380,7 +440,9 @@ class EcsTaskProtection:
             method="PUT",
             headers={"Content-Type": "application/json"},
         )
-        with urllib.request.urlopen(req, timeout=10) as resp:  # nosec B310 - link-local ECS agent URI from the task metadata contract
+        with urllib.request.urlopen(  # nosec B310 - link-local ECS agent URI from the task metadata contract
+            req, timeout=self._http_timeout_seconds
+        ) as resp:
             resp.read()
 
     def _log_noop_once(self) -> None:
@@ -392,17 +454,37 @@ class EcsTaskProtection:
             )
             self._noop_logged = True
 
-    def set_protection_sync(self, protect: bool) -> bool:
-        """Blocking PUT. Returns True on success (or non-ECS no-op)."""
-        if not self.enabled:
-            self._log_noop_once()
-            return True
+    def _set_protection_locked(self, protect: bool) -> bool:
+        """Perform one blocking PUT while ``_operation_lock`` is held."""
+        now = time.monotonic()
+        if (
+            protect
+            and self._last_protect_failure_monotonic > 0
+            and now - self._last_protect_failure_monotonic
+            < self._failure_backoff_seconds
+        ):
+            logger.debug(
+                "drain-mode: task-protection admission remains in %.1fs "
+                "failure backoff; refusing without another blocking PUT",
+                self._failure_backoff_seconds,
+            )
+            return False
         payload: Dict[str, Any] = {"ProtectionEnabled": bool(protect)}
         if protect:
             payload["ExpiresInMinutes"] = self._expires_minutes
         try:
             self._http_call(self.endpoint, payload)
         except Exception as exc:
+            # A transport failure is ambiguous: ECS may have applied the PUT
+            # and lost only the response.  In particular, retaining a prior
+            # ``True`` after an ambiguous release lets the next admission
+            # reuse a stale acknowledgement even though ECS may now be
+            # unprotected.  Collapse unknown to the fail-closed local state so
+            # every subsequent admission must obtain a fresh SET response.
+            self._protected = False
+            self._last_set_monotonic = 0.0
+            if protect:
+                self._last_protect_failure_monotonic = time.monotonic()
             # Loud but non-fatal: without protection ECS may scale this task
             # in mid-run, but crashing the gateway here would kill the runs
             # immediately and for certain.
@@ -412,6 +494,7 @@ class EcsTaskProtection:
                 protect, self.endpoint, exc,
             )
             return False
+        self._last_protect_failure_monotonic = 0.0
         self._protected = bool(protect)
         self._last_set_monotonic = time.monotonic()
         logger.info(
@@ -421,11 +504,178 @@ class EcsTaskProtection:
         )
         return True
 
+    def set_protection_sync(self, protect: bool) -> bool:
+        """Blocking PUT. Returns True on success (or non-ECS no-op)."""
+        with self._operation_lock:
+            if not self.enabled:
+                self._log_noop_once()
+                return True
+            return self._set_protection_locked(protect)
+
+    def ensure_protected_sync(self) -> bool:
+        """Acknowledge protection once, coalescing concurrent admissions."""
+        with self._operation_lock:
+            if not self.enabled:
+                self._log_noop_once()
+                return True
+            self._admission_epoch += 1
+            fresh = (
+                time.monotonic() - self._last_set_monotonic
+                < self.safe_refresh_seconds
+            )
+            if self._protected and fresh:
+                return True
+            return self._set_protection_locked(True)
+
+    def reconcile_sync(
+        self,
+        active_count: int,
+        *,
+        renew_seconds: float,
+        observed_admission_epoch: Optional[int] = None,
+    ) -> bool:
+        """Reconcile an owner-thread work snapshot with ECS protection.
+
+        The potentially blocking PUT stays off the event loop, but callbacks
+        that inspect asyncio tasks/dicts do not. ``observed_admission_epoch``
+        closes the handoff: if an admission acquired this transition lock
+        after the idle snapshot began, a stale worker must not release the
+        acknowledgement that admission relied on.
+        """
+        with self._operation_lock:
+            if not self.enabled:
+                self._log_noop_once()
+                return True
+            active = max(0, int(active_count))
+            if active > 0:
+                effective_renew_seconds = min(
+                    renew_seconds,
+                    self.safe_refresh_seconds,
+                )
+                stale = (
+                    time.monotonic() - self._last_set_monotonic
+                    >= effective_renew_seconds
+                )
+                if not self._protected or stale:
+                    return self._set_protection_locked(True)
+                return True
+            if (
+                observed_admission_epoch is not None
+                and observed_admission_epoch != self._admission_epoch
+            ):
+                return True
+            if self._protected:
+                return self._set_protection_locked(False)
+            return True
+
     async def set_protection(self, protect: bool) -> bool:
         if not self.enabled:
             self._log_noop_once()
             return True
-        return await asyncio.to_thread(self.set_protection_sync, protect)
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            _TASK_PROTECTION_EXECUTOR,
+            self.set_protection_sync,
+            protect,
+        )
+
+    async def ensure_protected(self) -> bool:
+        if not self.enabled:
+            self._log_noop_once()
+            return True
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            _TASK_PROTECTION_EXECUTOR,
+            self.ensure_protected_sync,
+        )
+
+    async def reconcile(
+        self,
+        active_count: Callable[[], int],
+        *,
+        renew_seconds: float,
+    ) -> bool:
+        if not self.enabled:
+            self._log_noop_once()
+            return True
+        # Snapshot the epoch first. Every admission publishes its work count
+        # before waiting on ensure_protected_sync(), so any admission that
+        # races after this point is either visible in ``active`` or advances
+        # the epoch before the worker can release protection.
+        observed_admission_epoch = self.admission_epoch
+        try:
+            active = max(0, int(active_count()))
+        except Exception:
+            logger.error(
+                "drain-mode: task-protection active-work snapshot failed",
+                exc_info=True,
+            )
+            active = 1
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            _TASK_PROTECTION_EXECUTOR,
+            lambda: self.reconcile_sync(
+                active,
+                renew_seconds=renew_seconds,
+                observed_admission_epoch=observed_admission_epoch,
+            ),
+        )
+
+
+def get_task_protection() -> EcsTaskProtection:
+    """Process-global client shared by admission, renewal, and release."""
+    global _task_protection
+    with _task_protection_lock:
+        if _task_protection is None:
+            _task_protection = EcsTaskProtection()
+        return _task_protection
+
+
+class TaskProtectionUnavailableError(RuntimeError):
+    """New work was rolled back because ECS protection was not acknowledged."""
+
+
+def ensure_task_protection_for_admission_sync() -> bool:
+    """Synchronous admission gate for thread-pool work such as cron jobs."""
+    # This shared seam is used by API, relay/startup, and cron. Re-check the
+    # one-way latch here (not only at each transport) so no internal/manual
+    # source can repopulate work during the coordinator's final zero settle.
+    # Every caller publishes its pending/running count before reaching this
+    # gate, so an admission already in progress when drain begins remains
+    # visible until it either receives protection or rolls itself back.
+    if get_drain_mode().draining:
+        return False
+    return get_task_protection().ensure_protected_sync()
+
+
+def require_task_protection_for_admission_sync() -> None:
+    """Raise a stable error when synchronous work cannot be protected."""
+    if not ensure_task_protection_for_admission_sync():
+        raise TaskProtectionUnavailableError(
+            "ECS task protection was not acknowledged; work was not started"
+        )
+
+
+async def ensure_task_protection_for_admission() -> bool:
+    """Protect this ECS task before newly admitted agent work may execute."""
+    if get_drain_mode().draining:
+        return False
+    return await get_task_protection().ensure_protected()
+
+
+def notify_task_protection_work_changed() -> None:
+    """Wake protection reconciliation after an admission/release transition."""
+    with _task_protection_wakeup_lock:
+        target = _task_protection_wakeup
+    if target is None:
+        return
+    loop, wakeup = target
+    try:
+        loop.call_soon_threadsafe(wakeup.set)
+    except RuntimeError:
+        # The loop is already closed during interpreter/gateway teardown. The
+        # expiry on ECS protection remains the final fail-safe.
+        return
 
 
 async def task_protection_loop(
@@ -456,26 +706,42 @@ async def task_protection_loop(
         renew_seconds = _positive_float_env(
             "HERMES_TASK_PROTECTION_RENEW_SECONDS", DEFAULT_PROTECTION_RENEW_SECONDS
         )
+    loop = asyncio.get_running_loop()
+    wakeup = asyncio.Event()
+    global _task_protection_wakeup
+    with _task_protection_wakeup_lock:
+        _task_protection_wakeup = (loop, wakeup)
     iterations = 0
-    while True:
-        try:
-            active = drain.active_runs()
-            if active > 0:
-                stale = (
-                    time.monotonic() - protection.last_set_monotonic >= renew_seconds
+    try:
+        while True:
+            # Clearing before reconciliation is race-safe: a state change that
+            # happened before this point is observed by active_runs(); one
+            # during/after reconciliation sets the event for an immediate
+            # second pass.
+            wakeup.clear()
+            try:
+                await protection.reconcile(
+                    drain.active_runs,
+                    renew_seconds=renew_seconds,
                 )
-                if not protection.protected or stale:
-                    await protection.set_protection(True)
-            elif protection.protected:
-                await protection.set_protection(False)
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            logger.error("drain-mode: task-protection loop iteration failed", exc_info=True)
-        iterations += 1
-        if max_iterations is not None and iterations >= max_iterations:
-            return
-        await asyncio.sleep(check_interval)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.error(
+                    "drain-mode: task-protection loop iteration failed",
+                    exc_info=True,
+                )
+            iterations += 1
+            if max_iterations is not None and iterations >= max_iterations:
+                return
+            try:
+                await asyncio.wait_for(wakeup.wait(), timeout=check_interval)
+            except asyncio.TimeoutError:
+                pass
+    finally:
+        with _task_protection_wakeup_lock:
+            if _task_protection_wakeup == (loop, wakeup):
+                _task_protection_wakeup = None
 
 
 # ---------------------------------------------------------------------------
@@ -614,7 +880,17 @@ def start_drain_mode_tasks(runner: Any) -> List["asyncio.Task"]:
     cannot wedge the stop).
     """
     drain = get_drain_mode()
-    protection = EcsTaskProtection()
+    protection = get_task_protection()
+    # APIServerAdapter owns its own non-overlapping source. Relay turns and
+    # cron jobs live on GatewayRunner and were previously invisible here,
+    # which let a relay-only task look idle to both ECS protection and the
+    # drain coordinator for its entire lifetime.
+    drain.register_source(
+        "gateway_runner",
+        lambda: max(0, int(runner._running_agent_count()))
+        + max(0, int(runner._active_cron_job_count())),
+        getattr(runner, "_drain_mode_force_terminate", None),
+    )
 
     def _shutdown() -> None:
         stop_task = asyncio.get_running_loop().create_task(runner.stop())

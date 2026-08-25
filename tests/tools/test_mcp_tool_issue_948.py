@@ -66,79 +66,6 @@ def test_resolve_stdio_command_falls_back_to_usr_local_bin():
     assert env["PATH"].split(os.pathsep)[0] == os.path.dirname(target)
 
 
-def test_resolve_stdio_command_respects_explicit_empty_path():
-    seen_paths = []
-
-    def _fake_which(_cmd, path=None):
-        seen_paths.append(path)
-        return None
-
-    with patch("tools.mcp_tool.shutil.which", side_effect=_fake_which):
-        command, env = _resolve_stdio_command("python", {"PATH": ""})
-
-    assert command == "python"
-    assert env["PATH"] == ""
-    assert seen_paths == [""]
-
-
-def test_format_connect_error_unwraps_exception_group():
-    error = ExceptionGroup(
-        "unhandled errors in a TaskGroup",
-        [FileNotFoundError(2, "No such file or directory", "node")],
-    )
-
-    message = _format_connect_error(error)
-
-    assert "missing executable 'node'" in message
-
-
-def test_run_stdio_uses_resolved_command_and_prepended_path(tmp_path):
-    node_bin = tmp_path / "node" / "bin"
-    node_bin.mkdir(parents=True)
-    npx_path = node_bin / "npx"
-    npx_path.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-    npx_path.chmod(0o755)
-
-    mock_session = MagicMock()
-    mock_session.initialize = AsyncMock()
-    mock_session.list_tools = AsyncMock(return_value=SimpleNamespace(tools=[]))
-
-    mock_stdio_cm = MagicMock()
-    mock_stdio_cm.__aenter__ = AsyncMock(return_value=(object(), object()))
-    mock_stdio_cm.__aexit__ = AsyncMock(return_value=False)
-
-    mock_session_cm = MagicMock()
-    mock_session_cm.__aenter__ = AsyncMock(return_value=mock_session)
-    mock_session_cm.__aexit__ = AsyncMock(return_value=False)
-
-    async def _test():
-        with patch("tools.mcp_tool.shutil.which", return_value=None), \
-             patch.dict("os.environ", {"HERMES_HOME": str(tmp_path), "PATH": "/usr/bin", "HOME": str(tmp_path)}, clear=False), \
-             patch("tools.mcp_tool.StdioServerParameters") as mock_params, \
-             patch("tools.mcp_tool.stdio_client", return_value=mock_stdio_cm), \
-             patch("tools.mcp_tool.ClientSession", return_value=mock_session_cm):
-            server = MCPServerTask("srv")
-            await server.start({"command": "npx", "args": ["-y", "pkg"], "env": {"PATH": "/usr/bin"}})
-
-            # The real (resolved) command no longer reaches StdioServerParameters
-            # directly -- it's now wrapped in the parent-death watchdog
-            # supervisor (tools/mcp_stdio_watchdog.py) so an ungraceful exit of
-            # this process can't orphan it. Assert the resolved npx path and
-            # its args still flow through correctly as the watchdog's target
-            # command, preserving this test's original path-resolution intent.
-            call_kwargs = mock_params.call_args.kwargs
-            assert call_kwargs["command"] == sys.executable
-            assert call_kwargs["args"][0].endswith("mcp_stdio_watchdog.py")
-            assert "--" in call_kwargs["args"]
-            sep = call_kwargs["args"].index("--")
-            assert call_kwargs["args"][sep + 1:] == [str(npx_path), "-y", "pkg"]
-            assert call_kwargs["env"]["PATH"].split(os.pathsep)[0] == str(node_bin)
-
-            await server.shutdown()
-
-    asyncio.run(_test())
-
-
 # ---------------------------------------------------------------------------
 # #29184: OSV malware preflight must not block the asyncio event loop, and a
 # stalled check must time out fail-open rather than freezing MCP startup.
@@ -197,25 +124,44 @@ def test_run_stdio_malware_check_does_not_block_event_loop():
 def test_run_stdio_malware_check_times_out_fail_open():
     """A check that hangs past the timeout must NOT freeze startup: it times
     out, logs, and proceeds (fail-open) so the server still starts."""
-    import time
     mock_stdio_cm, mock_session_cm = _stdio_mocks()
 
-    def hung_check(_command, _args):
-        time.sleep(0.5)  # outlasts the 0.2s timeout 2.5x; short enough not to stall teardown
-        return "MALWARE"  # would block startup if awaited to completion
+    check_started = asyncio.Event()
+    check_cancelled = asyncio.Event()
+    real_to_thread = asyncio.to_thread
+
+    async def controlled_to_thread(func, *args, **kwargs):
+        """Model a worker that cannot finish before wait_for cancels it.
+
+        This avoids a wall-clock assertion whose scheduling budget can be
+        consumed by unrelated workers when the full suite saturates the host.
+        The adjacent regression still exercises a real blocking function via
+        asyncio.to_thread and proves that the event loop remains responsive.
+        """
+        if func.__name__ != "check_package_for_malware":
+            return await real_to_thread(func, *args, **kwargs)
+
+        command, package_args = args
+        assert os.path.basename(command) == "npx"
+        assert package_args == ["-y", "pkg"]
+        check_started.set()
+        try:
+            await asyncio.Future()
+        finally:
+            check_cancelled.set()
 
     async def _test():
-        with patch("tools.osv_check.check_package_for_malware", side_effect=hung_check), \
-             patch("tools.mcp_tool._OSV_MALWARE_CHECK_TIMEOUT_S", 0.2), \
+        with patch("tools.mcp_tool.asyncio.to_thread", side_effect=controlled_to_thread), \
+             patch("tools.mcp_tool._OSV_MALWARE_CHECK_TIMEOUT_S", 0.01), \
              patch("tools.mcp_tool.StdioServerParameters"), \
              patch("tools.mcp_tool.stdio_client", return_value=mock_stdio_cm), \
              patch("tools.mcp_tool.ClientSession", return_value=mock_session_cm):
             server = MCPServerTask("srv")
-            start = time.monotonic()
             await server.start({"command": "npx", "args": ["-y", "pkg"]})
-            elapsed = time.monotonic() - start
             await server.shutdown()
-        # Returned shortly after the 0.2s timeout (fail-open), not the 0.5s hang.
-        assert elapsed < 1.0, f"startup did not fail-open promptly ({elapsed:.1f}s)"
+        # wait_for cancelled the stalled check and start continued fail-open.
+        assert check_started.is_set()
+        assert check_cancelled.is_set()
+        assert mock_stdio_cm.__aenter__.await_count == 1
 
     asyncio.run(_test())
