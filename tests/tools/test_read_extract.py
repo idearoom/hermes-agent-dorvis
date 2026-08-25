@@ -171,7 +171,10 @@ class TestAnydocExtraction(unittest.TestCase):
             "</w:body></w:document>",
         )
         text = extract_document_text(p)
-        self.assertEqual(text, "hello\n")
+        self.assertTrue(
+            text.startswith("[Extraction view: main document body only")
+        )
+        self.assertTrue(text.endswith("hello\n"))
 
 
 class TestAnydocSizeCap(unittest.TestCase):
@@ -184,13 +187,15 @@ class TestAnydocSizeCap(unittest.TestCase):
         self.rex = read_extract
         self._saved_module = read_extract._anydoc_module
         self._saved_cap = read_extract.MAX_ANYDOC_BYTES
+        self._saved_output_cap = read_extract.MAX_ANYDOC_OUTPUT_CHARS
         self.tmp = tempfile.mkdtemp(prefix="rex_cap_")
         self.calls = []
+        self.output = "converted\n"
 
         class _FakeAnydoc:
             def to_markdown(_self, path):
                 self.calls.append(path)
-                return "converted\n"
+                return self.output
 
         read_extract._anydoc_module = _FakeAnydoc()
 
@@ -199,6 +204,7 @@ class TestAnydocSizeCap(unittest.TestCase):
 
         self.rex._anydoc_module = self._saved_module
         self.rex.MAX_ANYDOC_BYTES = self._saved_cap
+        self.rex.MAX_ANYDOC_OUTPUT_CHARS = self._saved_output_cap
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def _write(self, name, size):
@@ -224,6 +230,51 @@ class TestAnydocSizeCap(unittest.TestCase):
         p = self._write("ok.pdf", 10)
         self.assertEqual(_extract_anydoc(p), "converted\n")
         self.assertEqual(self.calls, [p])
+
+    def test_conversion_output_over_limit_is_rejected(self):
+        """The public document reader must not return an unbounded converter result."""
+        self.rex.MAX_ANYDOC_OUTPUT_CHARS = 10
+        self.output = "x" * 11
+        p = self._write("expanding.pdf", 10)
+
+        with self.assertRaisesRegex(
+            ExtractionError,
+            "more than 10 characters",
+        ):
+            extract_document_text(p)
+
+        self.assertEqual(self.calls, [p])
+
+    def test_anydoc_path_respects_extraction_capacity(self):
+        slots = mock.Mock()
+        slots.acquire.return_value = False
+        p = self._write("busy.pdf", 10)
+
+        with mock.patch.object(self.rex, "_native_read_slots", slots):
+            with self.assertRaisesRegex(
+                self.rex.ExtractionBusyError,
+                "retry this read shortly",
+            ):
+                extract_document_text(p)
+
+        self.assertEqual(self.calls, [])
+        slots.acquire.assert_called_once_with(blocking=False)
+        slots.release.assert_not_called()
+
+    def test_anydoc_bytes_respect_extraction_capacity(self):
+        slots = mock.Mock()
+        slots.acquire.return_value = False
+
+        with mock.patch.object(self.rex, "_native_read_slots", slots):
+            with self.assertRaisesRegex(
+                self.rex.ExtractionBusyError,
+                "retry this read shortly",
+            ):
+                self.rex.extract_document_bytes(b"0123456789", "remote.pdf")
+
+        self.assertEqual(self.calls, [])
+        slots.acquire.assert_called_once_with(blocking=False)
+        slots.release.assert_not_called()
 
     def test_missing_file_raises_extraction_error(self):
         from tools.read_extract import _extract_anydoc

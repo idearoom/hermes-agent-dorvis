@@ -60,17 +60,19 @@ ANYDOC_EXTENSIONS = frozenset({
 # Refuse to convert huge documents. anydoc loads the whole file through its
 # Rust core with no streaming, and the read_file char budget only applies
 # after conversion, so an unbounded input can pin a tool turn and spike RAM.
-# Its returned Markdown is still materialized by the optional converter and is
-# intentionally outside the native-reader guarantees below. Dorvis does not
-# bake AnyDoc in this release; bounded converter output remains follow-up work
-# under AE-226 rather than a behavior change in the upstream parity update.
+# Its returned Markdown is materialized by the optional converter, so keep a
+# separate result cap in addition to the input and concurrency bounds. The
+# converter's Rust core raises ResourceLimitError for its internal limits; this
+# final cap protects the read_file pagination/serialization path from an
+# unexpectedly expansive but otherwise valid conversion.
 MAX_ANYDOC_BYTES = 50 * 1024 * 1024
+MAX_ANYDOC_OUTPUT_CHARS = 2_000_000
 MAX_DOCUMENT_BYTES = 32 * 1024 * 1024
 MAX_NOTEBOOK_BYTES = 8 * 1024 * 1024
 
-# The always-on stdlib DOCX/XLSX/IPYNB readers run inside the long-lived
-# gateway. A process-wide, fail-fast semaphore below limits native extraction
-# independently of the gateway's broader API-run admission and delegation.
+# The stdlib DOCX/XLSX/IPYNB readers and optional AnyDoc converter run inside
+# the long-lived gateway. A shared process-wide, fail-fast semaphore limits
+# document extraction independently of broader API-run admission/delegation.
 # The limits are sized for ten simultaneous document reads in an 8 GiB task
 # while leaving most of the task for the agent, browser, and gateway itself.
 # At the worst transport
@@ -79,6 +81,8 @@ MAX_NOTEBOOK_BYTES = 8 * 1024 * 1024
 # output state: comfortably below 256 MiB per request. An 8 MiB notebook stays
 # below that same envelope with a 26x allowance for Python's parsed-JSON
 # object overhead (measured adversarial empty-cell JSON peaks at ~24.2x).
+# AnyDoc separately enforces its 50 MiB input, 2M-character output, and Rust
+# parser resource limits before it returns through the same shared capacity.
 MAX_CONCURRENT_NATIVE_READS = 10
 MAX_NATIVE_READ_WORKING_SET_BYTES = 256 * 1024 * 1024
 
@@ -196,8 +200,9 @@ _native_read_depth: ContextVar[int] = ContextVar("native_read_depth", default=0)
 
 @contextmanager
 def native_extraction_slot(path: str) -> Iterator[None]:
-    """Bound native document transport + parsing without queueing requests."""
-    if Path(path).suffix.lower() not in EXTRACTABLE_EXTENSIONS:
+    """Bound document transport + parsing without queueing requests."""
+    ext = Path(path).suffix.lower()
+    if ext not in EXTRACTABLE_EXTENSIONS and ext not in ANYDOC_EXTENSIONS:
         yield
         return
 
@@ -347,12 +352,13 @@ def extract_document_bytes(data: bytes, path: str) -> str:
             f"{label} too large to parse ({len(data):,} bytes, limit is {limit:,})"
         )
     ext = _extension(path)
-    if ext in ANYDOC_EXTENSIONS:
-        return _extract_anydoc_bytes(data, path)
-    if ext not in EXTRACTABLE_EXTENSIONS:
+    if ext not in EXTRACTABLE_EXTENSIONS and ext not in ANYDOC_EXTENSIONS:
         raise ExtractionError(f"Unsupported document type: {path!r}")
 
     with native_extraction_slot(path):
+        if ext in ANYDOC_EXTENSIONS:
+            return _extract_anydoc_bytes(data, path)
+
         # The stdlib extractors are path-oriented. Materialize backend bytes in
         # a private host temp file, then remove it even when parsing fails.
         temp_path = ""
@@ -391,15 +397,26 @@ def _extract_anydoc(path: str) -> str:
         # Any of them means "no meaningful text": fall back to the normal
         # path/binary handling rather than crash read_file.
         raise ExtractionError(f"{type(exc).__name__}: {exc}") from exc
-    if not isinstance(text, str) or not text.strip():
-        raise ExtractionError("Document contains no extractable text")
-    text = text.rstrip("\n") + "\n"
+    text = _bounded_anydoc_markdown(text)
     if Path(path).suffix.lower() == ".pdf":
         note = _pdf_coverage_note(path)
         if note:
             # Prepend: read_file paginates the extraction, so a footer on a
             # long document would sit on a page the model may never fetch.
             text = note + text
+    return _bounded_anydoc_markdown(text)
+
+
+def _bounded_anydoc_markdown(text: Any) -> str:
+    """Normalize one converter result and enforce the read_file output cap."""
+    if not isinstance(text, str) or not text.strip():
+        raise ExtractionError("Document contains no extractable text")
+    text = text.rstrip("\n") + "\n"
+    if len(text) > MAX_ANYDOC_OUTPUT_CHARS:
+        raise ExtractionError(
+            "Converted document contains more than "
+            f"{MAX_ANYDOC_OUTPUT_CHARS:,} characters"
+        )
     return text
 
 
@@ -555,16 +572,14 @@ def _extract_anydoc_bytes(data: bytes, path: str) -> str:
         text = mod.to_markdown_bytes(data)
     except Exception as exc:
         raise ExtractionError(f"{type(exc).__name__}: {exc}") from exc
-    if not isinstance(text, str) or not text.strip():
-        raise ExtractionError("Document contains no extractable text")
-    text = text.rstrip("\n") + "\n"
+    text = _bounded_anydoc_markdown(text)
     if Path(path).suffix.lower() == ".pdf":
         note = _pdf_coverage_note_from_bytes(data, path)
         if note:
             # Prepend: read_file paginates the extraction, so a footer on a
             # long document would sit on a page the model may never fetch.
             text = note + text
-    return text
+    return _bounded_anydoc_markdown(text)
 
 
 def _pdf_coverage_note_from_bytes(data: bytes, display_path: str) -> str:
