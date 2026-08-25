@@ -25,6 +25,11 @@ Behaviour (all behaviours selectable via env var ``MOCK_LSP_SCRIPT``):
   ``didChange`` sleeps ``MOCK_LSP_PUSH_DELAY`` seconds (default 1.0)
   and then pushes EMPTY diagnostics.  Models a server that fixes
   the ghost if you actually wait for it.  Pull endpoint rejects.
+- ``"delayed_exit"`` — exits cleanly after a short bounded delay and
+  writes ``MOCK_LSP_EXIT_MARKER``.  Models a cooperative server that
+  needs a moment to finish teardown after receiving ``exit``.
+- ``"ignore_exit"`` — accepts ``exit`` but deliberately remains alive.
+  Models a server that requires the client's SIGTERM/SIGKILL fallback.
 
 The script writes JSON-RPC framed messages to stdout and reads from
 stdin.  No third-party dependencies — uses only stdlib so it runs
@@ -36,6 +41,7 @@ import json
 import os
 import sys
 import time
+from pathlib import Path
 
 
 def read_message():
@@ -188,6 +194,11 @@ def main():
             continue
 
         if msg.get("method") == "exit":
+            if script == "delayed_exit":
+                time.sleep(float(os.environ.get("MOCK_LSP_EXIT_DELAY", "0.1")))
+                Path(os.environ["MOCK_LSP_EXIT_MARKER"]).write_text("clean\n")
+            if script == "ignore_exit":
+                time.sleep(30.0)
             return 0
 
         # Unknown request: respond with method-not-found.

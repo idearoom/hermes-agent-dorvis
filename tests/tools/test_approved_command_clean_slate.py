@@ -223,14 +223,22 @@ def test_execute_code_non_approved_still_interrupts_on_stale_bit(monkeypatch):
         "tools.approval.check_execute_code_guard",
         lambda *a, **k: {"approved": True},  # approved, but NOT user_approved
     )
+    # Keep the child alive until the poll loop observes the stale bit.  A
+    # short sleep-and-print script can finish before the worker is rescheduled
+    # when the full test suite saturates the host, making output timing an
+    # unreliable proxy for the interrupt semantics under test.  The bounded
+    # timeout keeps a broken interrupt path from hanging this regression.
+    monkeypatch.setattr(
+        "tools.code_execution_tool._load_config",
+        lambda: {"timeout": 1, "max_tool_calls": 5},
+    )
     set_interrupt(True)
 
     result = json.loads(execute_code(
-        code='import time; time.sleep(0.5); print("CODE_DONE")',
+        code="import time\nwhile True:\n    time.sleep(1)",
         task_id="test-clean-slate-2",
     ))
 
-    # Killed on the first poll before the script can print.
-    assert "CODE_DONE" not in result["output"], result
-
+    assert result["status"] == "interrupted", result
+    assert "execution interrupted" in result["output"], result
 

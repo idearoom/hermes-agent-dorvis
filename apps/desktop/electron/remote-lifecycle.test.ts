@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { exec as execCallback, spawn } from 'node:child_process'
-import { chmod, mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { promisify } from 'node:util'
@@ -342,8 +342,15 @@ test.skipIf(process.platform === 'win32')(
     const tokenPath = path.join(os.homedir(), spawnTokenPath(OWNERSHIP_ID, SPAWN_NONCE).replace(/^~\//, ''))
 
     await mkdir(venvBin, { recursive: true })
-    await symlink(python, pythonLink)
-    await writeFile(entrypoint, 'import time\ntime.sleep(30)\n', 'utf8')
+    // On macOS, /usr/bin/python3 changes behavior when invoked through a
+    // symlink whose basename is `python`: the developer-tools shim exits 72
+    // before the fixture reaches its entrypoint.  A tiny exec wrapper models
+    // the venv launcher without relying on that platform-specific argv[0]
+    // behavior; the long-lived process still becomes python3 + entrypoint,
+    // which is the ownership shape this regression exercises.
+    await writeFile(pythonLink, `#!/bin/bash\nexec "${python}" "$@"\n`, 'utf8')
+    await chmod(pythonLink, 0o755)
+    await writeFile(entrypoint, 'import time\nprint("HERMES_FIXTURE_READY", flush=True)\ntime.sleep(30)\n', 'utf8')
     await writeFile(launcher, `#!/bin/bash\nexec "${pythonLink}" "${entrypoint}" "$@"\n`, 'utf8')
     await chmod(launcher, 0o755)
 
@@ -361,7 +368,7 @@ test.skipIf(process.platform === 'win32')(
     const children: ReturnType<typeof spawn>[] = []
 
     const spawnInstaller = (args: string[]) => {
-      const process = spawn(launcher, args, { stdio: 'ignore' })
+      const process = spawn(launcher, args, { stdio: ['ignore', 'pipe', 'ignore'] })
 
       children.push(process)
 
@@ -375,17 +382,48 @@ test.skipIf(process.platform === 'win32')(
     }
 
     const waitForEntrypoint = async (process: ReturnType<typeof spawn>) => {
-      for (let attempt = 0; attempt < 40; attempt += 1) {
-        const command = (await exec(`ps -ww -o command= -p ${process.pid}`)).stdout
+      const ready = await new Promise<boolean>(resolve => {
+        let output = ''
+        let settled = false
+        let timer: ReturnType<typeof setTimeout>
 
-        if (command.includes(entrypoint)) {
-          return true
+        const finish = (result: boolean) => {
+          if (settled) {
+            return
+          }
+
+          settled = true
+          clearTimeout(timer)
+          process.stdout?.off('data', onData)
+          process.off('error', onFailure)
+          process.off('exit', onFailure)
+          resolve(result)
         }
 
-        await new Promise(resolve => setTimeout(resolve, 25))
+        const onData = (chunk: Buffer) => {
+          output += chunk.toString('utf8')
+
+          if (output.includes('HERMES_FIXTURE_READY')) {
+            finish(true)
+          }
+        }
+
+        const onFailure = () => finish(false)
+
+        timer = setTimeout(() => finish(false), 10_000)
+
+        process.stdout?.on('data', onData)
+        process.once('error', onFailure)
+        process.once('exit', onFailure)
+      })
+
+      if (!ready) {
+        return false
       }
 
-      return false
+      const command = (await exec(`ps -ww -o command= -p ${process.pid}`)).stdout
+
+      return command.includes(entrypoint)
     }
 
     try {

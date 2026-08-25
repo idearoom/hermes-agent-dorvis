@@ -53,6 +53,7 @@ DELEGATE_BLOCKED_TOOLS = frozenset(
         "clarify",  # no user interaction
         "memory",  # no writes to shared MEMORY.md
         "send_message",  # no cross-platform side effects
+        "execute_code",  # preserve Dorvis child resource/side-effect boundary
         "cronjob",  # no scheduling more work in the parent's name
     ]
 )
@@ -1329,7 +1330,7 @@ def _strip_blocked_tools(toolsets: List[str]) -> List[str]:
     """
     # Composite toolsets that should never pass through to children, even
     # though their individual tools aren't all in DELEGATE_BLOCKED_TOOLS.
-    _COMPOSITE_BLOCKED_TOOLSETS = frozenset({"delegation"})
+    _COMPOSITE_BLOCKED_TOOLSETS = frozenset({"delegation", "code_execution"})
     blocked_toolset_names = {
         name
         for name, defn in TOOLSETS.items()
@@ -4838,9 +4839,8 @@ def _build_top_level_description() -> str:
         "require a verifiable handle (URL, ID, absolute path) and verify it "
         "yourself — fetch the URL, stat the file, read back the content — "
         "before telling the user the operation succeeded.\n"
-        "- Leaf children (the default) cannot call delegate_task, clarify, "
-        "memory, send_message, or cronjob; orchestrators regain only "
-        "delegate_task.\n"
+        "- Children cannot call clarify, memory, send_message, execute_code, "
+        "or cronjob; leaf children also cannot call delegate_task.\n"
         "- Children inherit the parent model and fallback chain unless pinned "
         "globally via delegation.provider / delegation.model in config.yaml. "
         "Results are returned as an array, one entry per task."

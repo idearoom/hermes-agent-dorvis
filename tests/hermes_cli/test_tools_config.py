@@ -1073,6 +1073,22 @@ def test_agent_disabled_toolsets_still_wins():
     assert not (_RECENTLY_SHIPPED_TOOLSETS & enabled)
 
 
+@pytest.mark.parametrize("platform", ["cli", "api_server"])
+def test_agent_disabled_bfl_wins_for_full_agent_surfaces(platform):
+    """A global BFL denial applies to both interactive agent entry points."""
+    config = {"agent": {"disabled_toolsets": ["bfl"]}}
+
+    default_enabled = _get_platform_tools(
+        {}, platform, include_default_mcp_servers=False
+    )
+    enabled = _get_platform_tools(
+        config, platform, include_default_mcp_servers=False
+    )
+
+    assert "bfl" in default_enabled
+    assert "bfl" not in enabled
+
+
 @_requires_recently_shipped
 def test_agent_disabled_toolsets_json_array_string_form_still_wins():
     """#86661: the suppression list may arrive as a JSON-array string (e.g.

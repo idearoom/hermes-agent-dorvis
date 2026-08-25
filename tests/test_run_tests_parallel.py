@@ -100,6 +100,139 @@ def test_progress_output_tolerates_legacy_stdout_encoding(tmp_path: Path) -> Non
     assert "1 tests passed" in proc.stdout
 
 
+def test_each_file_gets_an_isolated_pytest_temp_root(tmp_path: Path) -> None:
+    """Parallel pytest processes must not share cleanup symlink state."""
+    repo_root = Path(__file__).resolve().parent.parent
+    runner = repo_root / "scripts" / "run_tests_parallel.py"
+    probe_dir = tmp_path / "probes"
+    record_dir = tmp_path / "records"
+    probe_dir.mkdir()
+    record_dir.mkdir()
+
+    for index in range(2):
+        record = record_dir / f"base-{index}.txt"
+        (probe_dir / f"test_temp_root_{index}.py").write_text(
+            textwrap.dedent(
+                f"""
+                from pathlib import Path
+
+                def test_records_base_temp(tmp_path_factory):
+                    Path({str(record)!r}).write_text(
+                        str(tmp_path_factory.getbasetemp()),
+                        encoding="utf-8",
+                    )
+                """
+            ),
+            encoding="utf-8",
+        )
+
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(runner),
+            "--paths",
+            str(probe_dir),
+            "-j",
+            "2",
+            "--file-timeout",
+            "30",
+            "--file-retries",
+            "0",
+            "-q",
+        ],
+        cwd=repo_root,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        timeout=60,
+    )
+
+    assert proc.returncode == 0, proc.stdout
+    base_temps = [
+        Path((record_dir / f"base-{index}.txt").read_text(encoding="utf-8"))
+        for index in range(2)
+    ]
+    assert base_temps[0].parent != base_temps[1].parent, (
+        "per-file pytest subprocesses shared a temp-root parent, so their "
+        f"session cleanup can race: {base_temps!r}"
+    )
+    assert all(not base_temp.parent.exists() for base_temp in base_temps), (
+        f"runner leaked its process-private temp roots: {base_temps!r}"
+    )
+
+
+def test_parallel_pytest_session_cleanup_survives_repeated_barriers(
+    tmp_path: Path,
+) -> None:
+    """Synchronized pytest teardowns remain race-free without retries."""
+    repo_root = Path(__file__).resolve().parent.parent
+    runner = repo_root / "scripts" / "run_tests_parallel.py"
+    process_count = 12
+
+    for round_index in range(3):
+        probe_dir = tmp_path / f"round-{round_index}" / "probes"
+        ready_dir = tmp_path / f"round-{round_index}" / "ready"
+        probe_dir.mkdir(parents=True)
+        ready_dir.mkdir()
+        (probe_dir / "conftest.py").write_text(
+            textwrap.dedent(
+                f"""
+                import os
+                import time
+                from pathlib import Path
+
+                import pytest
+
+                READY_DIR = Path({str(ready_dir)!r})
+                PROCESS_COUNT = {process_count}
+
+                @pytest.hookimpl(tryfirst=True)
+                def pytest_sessionfinish(session, exitstatus):
+                    (READY_DIR / str(os.getpid())).write_text("ready")
+                    deadline = time.monotonic() + 10.0
+                    while len(list(READY_DIR.iterdir())) < PROCESS_COUNT:
+                        if time.monotonic() >= deadline:
+                            raise RuntimeError("session-finish barrier timed out")
+                        time.sleep(0.01)
+                """
+            ),
+            encoding="utf-8",
+        )
+        for index in range(process_count):
+            (probe_dir / f"test_cleanup_{index}.py").write_text(
+                "def test_passes():\n    assert True\n",
+                encoding="utf-8",
+            )
+
+        proc = subprocess.run(
+            [
+                sys.executable,
+                str(runner),
+                "--paths",
+                str(probe_dir),
+                "-j",
+                str(process_count),
+                "--file-timeout",
+                "30",
+                "--file-retries",
+                "0",
+                "-q",
+            ],
+            cwd=repo_root,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=60,
+        )
+
+        assert proc.returncode == 0, proc.stdout
+        assert len(list(ready_dir.iterdir())) == process_count, (
+            f"not every pytest process reached the teardown barrier: {proc.stdout}"
+        )
+        assert "FLAKY" not in proc.stdout
+        assert "pytest-current" not in proc.stdout
+
+
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX-only probe")
 @pytest.mark.live_system_guard_bypass
 def test_grandchild_leak_is_killed_by_runner(tmp_path: Path) -> None:

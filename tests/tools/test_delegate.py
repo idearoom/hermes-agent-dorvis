@@ -159,7 +159,7 @@ class TestChildSystemPrompt(unittest.TestCase):
 class TestStripBlockedTools(unittest.TestCase):
     def test_removes_blocked_toolsets(self):
         result = _strip_blocked_tools(["terminal", "file", "delegation", "clarify", "memory", "code_execution"])
-        self.assertEqual(sorted(result), ["code_execution", "file", "terminal"])
+        self.assertEqual(sorted(result), ["file", "terminal"])
 
     def test_strips_cronjob_toolset(self):
         """Regression for issue #43466: child subagents must not inherit
@@ -208,14 +208,12 @@ class TestStripBlockedTools(unittest.TestCase):
         self.assertIn("browser", disabled)
         for toolset_name in (
             "clarify",
+            "code_execution",
             "cronjob",
             "delegation",
             "memory",
         ):
             self.assertIn(toolset_name, disabled)
-        # code_execution is deliberately NOT denied — children keep
-        # execute_code for programmatic tool calling (Teknium, Jul 2026).
-        self.assertNotIn("code_execution", disabled)
 
         definitions = model_tools.get_tool_definitions(
             enabled_toolsets=kwargs["enabled_toolsets"],
@@ -255,6 +253,7 @@ class TestStripBlockedTools(unittest.TestCase):
         _, kwargs = MockAgent.call_args
         disabled = kwargs["disabled_toolsets"]
         self.assertNotIn("delegation", disabled)
+        self.assertIn("code_execution", disabled)
         definitions = model_tools.get_tool_definitions(
             enabled_toolsets=kwargs["enabled_toolsets"],
             disabled_toolsets=disabled,
@@ -988,11 +987,9 @@ class TestSubagentCostRollup(unittest.TestCase):
 
 class TestBlockedTools(unittest.TestCase):
 
-    def test_execute_code_not_blocked(self):
-        """Children retain execute_code (programmatic tool calling) so they
-        can batch mechanical work instead of burning reasoning iterations
-        (Teknium, Jul 2026)."""
-        self.assertNotIn("execute_code", DELEGATE_BLOCKED_TOOLS)
+    def test_execute_code_remains_blocked_for_dorvis_children(self):
+        """Delegated code execution remains a separately evaluated capability."""
+        self.assertIn("execute_code", DELEGATE_BLOCKED_TOOLS)
 
 class TestDelegationCredentialResolution(unittest.TestCase):
     """Tests for provider:model credential resolution in delegation config."""

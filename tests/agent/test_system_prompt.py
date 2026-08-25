@@ -155,6 +155,14 @@ class TestExecutionGuidanceInjection:
     def test_gpt_still_gets_guidance(self):
         assert "Execution discipline" in self._prompt("openai/gpt-5.5")
 
+    def test_gpt_56_gets_exactly_one_guidance_block(self):
+        """A family match must not duplicate the cached prompt block."""
+        from agent.prompt_builder import OPENAI_MODEL_EXECUTION_GUIDANCE
+
+        stable = self._prompt("openai/gpt-5.6-sol")
+
+        assert stable.count(OPENAI_MODEL_EXECUTION_GUIDANCE) == 1
+
     def test_grok_still_gets_guidance(self):
         assert "Execution discipline" in self._prompt("xai/grok-4")
 

@@ -1022,6 +1022,44 @@ class TestSchemas:
             assert entry.toolset == "bfl"
             assert entry.check_fn is flux3.check_bfl_requirements
 
+    def test_disabled_bfl_removes_all_schemas_from_hermes_cli(self):
+        """The denylist wins even when a Nous login makes every schema viable."""
+        import model_tools
+        from tools.registry import invalidate_check_fn_cache
+
+        bfl_names = {
+            "bfl_flux3_text_to_video",
+            "bfl_flux3_image_to_video",
+            "bfl_flux3_keyframes_to_video",
+            "bfl_flux3_video_continuation",
+            "bfl_flux3_get_result",
+            "bfl_flux3_prompting_guide",
+        }
+
+        with patch.object(flux3, "peek_nous_access_token", return_value="nous-token"):
+            invalidate_check_fn_cache()
+            model_tools._clear_tool_defs_cache()
+            visible = {
+                schema["function"]["name"]
+                for schema in model_tools.get_tool_definitions(
+                    enabled_toolsets=["hermes-cli"],
+                    quiet_mode=True,
+                    skip_tool_search_assembly=True,
+                )
+            }
+            hidden = {
+                schema["function"]["name"]
+                for schema in model_tools.get_tool_definitions(
+                    enabled_toolsets=["hermes-cli"],
+                    disabled_toolsets=["bfl"],
+                    quiet_mode=True,
+                    skip_tool_search_assembly=True,
+                )
+            }
+
+        assert bfl_names <= visible
+        assert bfl_names.isdisjoint(hidden)
+
     def test_generate_tools_point_at_the_guide_and_the_poll_tool(self):
         # Descriptions are the only text guaranteed to be in context when a
         # model picks a tool, so the pointers live there.

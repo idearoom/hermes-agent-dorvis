@@ -124,25 +124,44 @@ def test_run_stdio_malware_check_does_not_block_event_loop():
 def test_run_stdio_malware_check_times_out_fail_open():
     """A check that hangs past the timeout must NOT freeze startup: it times
     out, logs, and proceeds (fail-open) so the server still starts."""
-    import time
     mock_stdio_cm, mock_session_cm = _stdio_mocks()
 
-    def hung_check(_command, _args):
-        time.sleep(0.5)  # outlasts the 0.2s timeout 2.5x; short enough not to stall teardown
-        return "MALWARE"  # would block startup if awaited to completion
+    check_started = asyncio.Event()
+    check_cancelled = asyncio.Event()
+    real_to_thread = asyncio.to_thread
+
+    async def controlled_to_thread(func, *args, **kwargs):
+        """Model a worker that cannot finish before wait_for cancels it.
+
+        This avoids a wall-clock assertion whose scheduling budget can be
+        consumed by unrelated workers when the full suite saturates the host.
+        The adjacent regression still exercises a real blocking function via
+        asyncio.to_thread and proves that the event loop remains responsive.
+        """
+        if func.__name__ != "check_package_for_malware":
+            return await real_to_thread(func, *args, **kwargs)
+
+        command, package_args = args
+        assert os.path.basename(command) == "npx"
+        assert package_args == ["-y", "pkg"]
+        check_started.set()
+        try:
+            await asyncio.Future()
+        finally:
+            check_cancelled.set()
 
     async def _test():
-        with patch("tools.osv_check.check_package_for_malware", side_effect=hung_check), \
-             patch("tools.mcp_tool._OSV_MALWARE_CHECK_TIMEOUT_S", 0.2), \
+        with patch("tools.mcp_tool.asyncio.to_thread", side_effect=controlled_to_thread), \
+             patch("tools.mcp_tool._OSV_MALWARE_CHECK_TIMEOUT_S", 0.01), \
              patch("tools.mcp_tool.StdioServerParameters"), \
              patch("tools.mcp_tool.stdio_client", return_value=mock_stdio_cm), \
              patch("tools.mcp_tool.ClientSession", return_value=mock_session_cm):
             server = MCPServerTask("srv")
-            start = time.monotonic()
             await server.start({"command": "npx", "args": ["-y", "pkg"]})
-            elapsed = time.monotonic() - start
             await server.shutdown()
-        # Returned shortly after the 0.2s timeout (fail-open), not the 0.5s hang.
-        assert elapsed < 1.0, f"startup did not fail-open promptly ({elapsed:.1f}s)"
+        # wait_for cancelled the stalled check and start continued fail-open.
+        assert check_started.is_set()
+        assert check_cancelled.is_set()
+        assert mock_stdio_cm.__aenter__.await_count == 1
 
     asyncio.run(_test())
