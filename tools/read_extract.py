@@ -249,9 +249,17 @@ def _anydoc_disabled() -> bool:
     Any non-empty value other than a conventional false token opts out.
     """
     value = os.environ.get("HERMES_DISABLE_ANYDOC")
-    if value is None:
+    if value is not None:
+        return value.strip().lower() not in {"", "0", "false", "no", "off"}
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        security = load_config_readonly().get("security") or {}
+        return not bool(security.get("allow_anydoc", True))
+    except Exception:
+        # Preserve the upstream default if config is unavailable. The managed
+        # runtime seal above remains a fail-closed pre-import override.
         return False
-    return value.strip().lower() not in {"", "0", "false", "no", "off"}
 
 
 def _anydoc() -> Optional[Any]:
@@ -947,10 +955,16 @@ _END_DIRECTORY_SIGNATURE = b"PK\x05\x06"
 
 def _preflight_office_zip(raw: BinaryIO, label: str) -> int:
     """Validate the bounded central directory before ZipFile allocates it."""
+    end_record_reader = getattr(zipfile, "_EndRecData", None)
+    if not callable(end_record_reader):
+        raise ExtractionError(
+            f"Cannot safely read {label}: this Python runtime lacks the "
+            "bounded ZIP preflight API"
+        )
     try:
         # This stdlib helper reads only the fixed EOCD/tail window and expands
         # valid ZIP64 metadata without constructing ZipInfo objects.
-        end = zipfile._EndRecData(raw)  # type: ignore[attr-defined]
+        end = end_record_reader(raw)
     except (OSError, struct.error, zipfile.BadZipFile) as exc:
         raise ExtractionError(f"Not a valid {label}: {exc}") from exc
     if end is None:

@@ -18,15 +18,21 @@ on:
     # No path filter on purpose: idearoom-agents derives its base-image tag
     # from the reference/hermes-agent-dorvis submodule gitlink, so every commit
     # on the carried dorvis/runtime branch must publish a sha-<commit> image or
-    # a pin could 404. Main is retained as a second trusted integration branch;
-    # the publisher is idempotent when both branches reach the same commit.
-    branches: [dorvis/runtime, main]
+    # a pin could 404. Keep exactly one automatic publisher for a commit: main
+    # may point at the same SHA, and rebuilding there could race an immutable
+    # tag with different build output.
+    branches: [dorvis/runtime]
   pull_request:
     # PR builds are validation-only (no push). Keep this unfiltered: the image
     # context includes runtime config, plugins, skills, shell scripts, the TUI,
     # and the web app in addition to Python. A hand-maintained path allowlist
     # silently loses coverage whenever that context grows.
     branches: [dorvis/runtime, main]
+  # Manual re-arm for a dropped push event. The job condition below limits a
+  # dispatch to one of the two trusted integration branch heads and exposes no
+  # caller-controlled revision input. Rebuilding an already-published SHA may
+  # fail closed on a config-digest mismatch; that leaves the registry untouched.
+  workflow_dispatch:
 # Key publishing work by the exact push commit so GitHub concurrency cannot
 # replace an already-pending main image. PR validation runs still collapse to
 # the latest commit for that pull request.
@@ -124,9 +130,11 @@ jobs:
     # (including NousResearch, were this file ever to reach it via a merge).
     if: >-
       github.repository == 'idearoom/hermes-agent-dorvis' &&
-      github.event_name == 'push' &&
-      (github.ref == 'refs/heads/dorvis/runtime' ||
-       github.ref == 'refs/heads/main')
+      ((github.event_name == 'push' &&
+        github.ref == 'refs/heads/dorvis/runtime') ||
+       (github.event_name == 'workflow_dispatch' &&
+        (github.ref == 'refs/heads/dorvis/runtime' ||
+         github.ref == 'refs/heads/main')))
     permissions:
       contents: read
       packages: write

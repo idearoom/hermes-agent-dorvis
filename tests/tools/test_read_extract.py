@@ -311,6 +311,15 @@ class TestAnydocManagedQuarantine(unittest.TestCase):
             read_extract._anydoc_module = saved_module
             read_extract._anydoc_failed_at = saved_failed_at
 
+    def test_security_config_can_disable_anydoc_without_internal_env(self):
+        from tools import read_extract
+
+        with mock.patch.dict(os.environ, {}, clear=True), mock.patch(
+            "hermes_cli.config.load_config_readonly",
+            return_value={"security": {"allow_anydoc": False}},
+        ):
+            self.assertTrue(read_extract._anydoc_disabled())
+
 
 class TestAnydocInitLifecycle(unittest.TestCase):
     """First-load lifecycle: one failed load must not disable extraction
@@ -1088,6 +1097,15 @@ class TestDocxExtraction(unittest.TestCase):
             side_effect=AssertionError("central directory must not load"),
         ):
             with self.assertRaisesRegex(ExtractionError, "ZIP64.*not supported"):
+                extract_document_text(p)
+
+    def test_missing_private_zip_preflight_api_fails_cleanly(self):
+        p = os.path.join(self.tmp, "runtime-compat.docx")
+        _write_docx(p, self._doc("<w:p/>"))
+        with mock.patch.object(zipfile, "_EndRecData", None):
+            with self.assertRaisesRegex(
+                ExtractionError, "runtime lacks the bounded ZIP preflight API"
+            ):
                 extract_document_text(p)
 
     def test_multidisk_metadata_is_rejected_before_zipfile_construction(self):

@@ -519,6 +519,7 @@ class _CatalogConn:
         wrong_constraint=None,
         include_optional_index=False,
         extra_index=None,
+        pg18_not_null_constraints=False,
     ):
         self.executed = []
         self.version = version
@@ -532,6 +533,7 @@ class _CatalogConn:
         self.wrong_constraint = wrong_constraint
         self.include_optional_index = include_optional_index
         self.extra_index = extra_index
+        self.pg18_not_null_constraints = pg18_not_null_constraints
 
     def execute(self, sql, params=None):
         self.executed.append((sql, params))
@@ -645,6 +647,28 @@ class _CatalogConn:
                 )
             if self.extra_constraint is not None:
                 rows.append(self.extra_constraint)
+            if (
+                self.pg18_not_null_constraints
+                and "constraint_catalog.contype in ('p', 'f', 'u', 'c', 'x')"
+                not in " ".join(sql.lower().split())
+            ):
+                rows.append(
+                    (
+                        "sessions",
+                        "sessions_id_not_null",
+                        "n",
+                        False,
+                        False,
+                        True,
+                        ("id",),
+                        None,
+                        None,
+                        (),
+                        " ",
+                        " ",
+                        " ",
+                    )
+                )
             return _RowsResult(rows)
         if "SELECT id, system_prompt" in sql:
             return _RowsResult(self.prompt_rows)
@@ -752,6 +776,12 @@ def test_catalog_verification_rejects_unexpected_constraint():
 
     with pytest.raises(RuntimeError, match="sessions_source_check"):
         PgSessionDB._verify_catalog(conn)
+
+
+def test_catalog_verification_ignores_postgres18_not_null_catalog_rows():
+    PgSessionDB._verify_catalog(
+        _CatalogConn(catalog_version=26, pg18_not_null_constraints=True)
+    )
 
 
 def test_catalog_verification_rejects_wrong_foreign_key_delete_action():

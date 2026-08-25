@@ -815,6 +815,24 @@ class TestBoundedBinaryRead:
         assert result.base64_content == "MDEyMzQ1Njc4OQ=="
         assert any("head -c 11" in command for command in commands)
 
+    def test_nonempty_file_rejects_masked_empty_transport(self, mock_env):
+        """A failed ``head`` must not look like a successful empty read.
+
+        POSIX pipelines report the final ``base64`` status unless pipefail is
+        active.  A read failure can therefore return exit zero and no bytes.
+        The prior size probe gives us enough evidence to reject that result.
+        """
+        commands, dispatch = self._bounded_dispatch(10, b"")
+        mock_env.execute.side_effect = dispatch
+
+        result = ShellFileOperations(mock_env).read_file_bytes(
+            "/tmp/unreadable", max_bytes=10
+        )
+
+        assert result.base64_content is None
+        assert "failed to read binary file" in (result.error or "").lower()
+        assert any("head -c 11" in command for command in commands)
+
     def test_real_shell_handles_spaced_and_quoted_path_at_limit(self, tmp_path):
         path = tmp_path / "quoted ' binary.bin"
         payload = bytes(range(64))

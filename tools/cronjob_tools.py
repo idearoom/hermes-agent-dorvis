@@ -14,6 +14,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
+from gateway.drain_mode import TaskProtectionUnavailableError
 from hermes_constants import display_hermes_home
 
 logger = logging.getLogger(__name__)
@@ -47,6 +48,7 @@ from cron.jobs import (
     mark_job_run,
     parse_schedule,
     pause_job,
+    release_fire_claim,
     remove_job,
     resolve_job_ref,
     resume_job,
@@ -746,7 +748,8 @@ def _run_claimed_job(
     """
     job_id = job["id"]
     _registered = False
-    fire_owner = None
+    claim = job.get("fire_claim")
+    fire_owner = str(claim.get("by") or "") if isinstance(claim, dict) else None
     try:
         from cron.scheduler import (
             release_running_job,
@@ -771,9 +774,6 @@ def _run_claimed_job(
                 ),
             }
         _registered = True
-
-        claim = job.get("fire_claim")
-        fire_owner = str(claim.get("by") or "") if isinstance(claim, dict) else None
 
         # run_one_job records last_run_at/last_status via mark_job_run (which
         # also clears the fire claim) and returns True iff it processed the job.
@@ -872,6 +872,26 @@ def _run_claimed_job(
             "error": refreshed.get("last_error"),
         }
 
+    except TaskProtectionUnavailableError as e:
+        logger.warning(
+            "Cron job %s was not admitted because task protection is unavailable: %s",
+            job_id,
+            e,
+        )
+        if fire_owner:
+            try:
+                if not release_fire_claim(job_id, expected_owner=fire_owner):
+                    logger.warning(
+                        "Could not release unstarted fire claim for cron job %s",
+                        job_id,
+                    )
+            except Exception:
+                logger.warning(
+                    "Failed to release unstarted fire claim for cron job %s",
+                    job_id,
+                    exc_info=True,
+                )
+        return {"claimed": True, "success": False, "error": str(e)}
     except Exception as e:
         logger.error("Failed to execute cron job %s immediately: %s", job_id, e)
         if _registered:

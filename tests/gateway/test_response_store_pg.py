@@ -17,6 +17,7 @@ import json
 import os
 import pathlib
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
@@ -169,6 +170,35 @@ def test_owned_terminal_transition_and_delete_are_monotonic(store):
     )
 
 
+def test_stale_owned_response_is_recovered_but_live_heartbeat_is_not(store):
+    for response_id in ("orphan", "live"):
+        assert store.claim(
+            response_id,
+            {"response": {"id": response_id, "status": "in_progress"}},
+            owner_id=f"owner-{response_id}",
+            owner_epoch=f"epoch-{response_id}",
+        )
+
+    assert store.heartbeat(
+        "live", owner_id="owner-live", owner_epoch="epoch-live"
+    )
+    with psycopg.connect(_DSN, autocommit=True) as conn:
+        conn.execute(
+            """UPDATE hermes_gw.responses
+               SET owner_heartbeat_at = 1
+               WHERE response_id = 'orphan'"""
+        )
+
+    assert store.recover_stale_owned("orphan", stale_before=2)
+    assert not store.recover_stale_owned("live", stale_before=2)
+    assert store.get("orphan")["response"]["status"] == "incomplete"
+    assert store.get("orphan")["response"]["incomplete_details"] == {
+        "reason": "owner_lost"
+    }
+    assert store.get_control("orphan")["terminal"] is True
+    assert store.get_control("live")["terminal"] is False
+
+
 def test_existing_tables_are_migrated_and_fk_is_validated():
     with psycopg.connect(_DSN, autocommit=True) as conn:
         conn.execute("DROP SCHEMA IF EXISTS hermes_gw CASCADE")
@@ -211,6 +241,9 @@ def test_existing_tables_are_migrated_and_fk_is_validated():
     try:
         assert migrated.get_control("legacy-complete")["terminal"] is True
         assert migrated.get_control("legacy-active")["terminal"] is False
+        assert migrated.recover_stale_owned("legacy-active", stale_before=time.time() + 1)
+        assert migrated.get("legacy-active")["response"]["status"] == "incomplete"
+        assert migrated.delete_terminal("legacy-active") == "deleted"
         assert migrated.get_conversation("valid") == "legacy-complete"
         assert migrated.get_conversation("dangling") is None
         with psycopg.connect(_DSN, autocommit=True) as conn:

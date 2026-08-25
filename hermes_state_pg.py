@@ -2368,7 +2368,8 @@ class PgSessionDB(SessionDB):
             "ON referenced_table.oid = constraint_catalog.confrelid "
             "LEFT JOIN pg_namespace AS referenced_schema "
             "ON referenced_schema.oid = referenced_table.relnamespace "
-            "WHERE table_schema.nspname = %s",
+            "WHERE table_schema.nspname = %s "
+            "AND constraint_catalog.contype IN ('p', 'f', 'u', 'c', 'x')",
             (_SCHEMA,),
         ).fetchall()
         actual_constraint_specs: Dict[

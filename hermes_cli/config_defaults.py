@@ -2467,6 +2467,9 @@ DEFAULT_CONFIG = {
         # for restricted networks, audited environments, or air-gapped
         # systems where any runtime install is unacceptable.
         "allow_lazy_installs": True,
+        # Optional generic document conversion. Native bounded DOCX, XLSX,
+        # and notebook readers remain available when this is disabled.
+        "allow_anydoc": True,
     },
 
     "cron": {
@@ -2901,6 +2904,13 @@ DEFAULT_CONFIG = {
         # internal HERMES_GATEWAY_PLATFORM_CONNECT_TIMEOUT env var, which still
         # works as a manual override and wins if set explicitly.
         "platform_connect_timeout": 30,
+
+        # Runtime safety leases used by managed gateways. These are bridged to
+        # internal env vars only when explicitly present in config.yaml.
+        "task_protection_http_timeout_seconds": 3.0,
+        "task_protection_failure_backoff_seconds": 2.0,
+        "response_owner_heartbeat_seconds": 15.0,
+        "response_owner_stale_seconds": 300.0,
 
         # In-process event-loop liveness watchdog (#69089). A daemon OS thread
         # probes the gateway asyncio loop; after consecutive missed probes it

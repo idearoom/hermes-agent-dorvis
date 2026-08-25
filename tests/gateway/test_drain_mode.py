@@ -10,9 +10,11 @@ Covers:
 """
 
 import asyncio
+import concurrent.futures
 import threading
 import time
 from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -426,6 +428,45 @@ class TestEcsTaskProtection:
             "task-protection PUT failed" in r.getMessage() for r in caplog.records
         )
 
+    def test_failed_admission_uses_bounded_backoff_without_failing_open(
+        self, monkeypatch
+    ):
+        calls = []
+        clock = {"now": 100.0}
+
+        def _boom(_url, payload):
+            calls.append(dict(payload))
+            raise TimeoutError("agent unavailable")
+
+        monkeypatch.setenv("HERMES_TASK_PROTECTION_FAILURE_BACKOFF_SECONDS", "2")
+        monkeypatch.setattr(drain_mode.time, "monotonic", lambda: clock["now"])
+        protection = EcsTaskProtection(
+            agent_uri="http://ecs-agent.local", http_call=_boom
+        )
+
+        assert not protection.ensure_protected_sync()
+        assert not protection.ensure_protected_sync()
+        assert len(calls) == 1
+        assert protection.protected is False
+
+        clock["now"] += 2.1
+        assert not protection.ensure_protected_sync()
+        assert len(calls) == 2
+        assert protection.protected is False
+
+    def test_default_http_call_uses_bounded_configurable_timeout(self, monkeypatch):
+        response = MagicMock()
+        response.__enter__.return_value = response
+        response.__exit__.return_value = False
+        monkeypatch.setenv("HERMES_TASK_PROTECTION_HTTP_TIMEOUT_SECONDS", "2.5")
+        with patch.object(
+            drain_mode.urllib.request, "urlopen", return_value=response
+        ) as urlopen:
+            protection = EcsTaskProtection(agent_uri="http://ecs-agent.local")
+            assert protection.set_protection_sync(True)
+
+        assert urlopen.call_args.kwargs["timeout"] == 2.5
+
     def test_ambiguous_release_forces_next_admission_to_reprotect(self):
         """A lost release response cannot leave a stale protected belief.
 
@@ -598,6 +639,32 @@ class TestEcsTaskProtection:
         ]
         assert protection.protected is True
         assert callback_threads == [event_loop_thread]
+
+    @pytest.mark.asyncio
+    async def test_protection_admission_does_not_wait_for_default_executor(self):
+        """Agent work may saturate the default pool without starving leases."""
+        loop = asyncio.get_running_loop()
+        blocked = threading.Event()
+        release = threading.Event()
+        default_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        replacement_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        loop.set_default_executor(default_executor)
+        blocker = loop.run_in_executor(
+            None,
+            lambda: (blocked.set(), release.wait()),
+        )
+        assert blocked.wait(timeout=1)
+        protection = EcsTaskProtection(
+            agent_uri="http://ecs-agent.local",
+            http_call=lambda _url, _payload: None,
+        )
+        try:
+            assert await asyncio.wait_for(protection.ensure_protected(), timeout=1)
+        finally:
+            release.set()
+            await blocker
+            loop.set_default_executor(replacement_executor)
+            default_executor.shutdown(wait=True)
 
     def test_stale_idle_snapshot_cannot_release_after_new_admission(self):
         """An admission that wins the transition lock fences an idle snapshot."""

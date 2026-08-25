@@ -2535,6 +2535,10 @@ if _config_path.exists():
             _redact = _security_cfg.get("redact_secrets")
             if _redact is not None:
                 os.environ["HERMES_REDACT_SECRETS"] = str(_redact).lower()
+            if "allow_anydoc" in _security_cfg:
+                os.environ["HERMES_DISABLE_ANYDOC"] = str(
+                    not bool(_security_cfg["allow_anydoc"])
+                ).lower()
         # Gateway settings (media delivery allowlist + recency trust + strict mode)
         # Delegated to the shared bridge so standalone delivery entrypoints
         # (manual `hermes cron run`, ticks without the gateway) apply the SAME
@@ -2559,6 +2563,25 @@ if _config_path.exists():
                 os.environ["HERMES_GATEWAY_PLATFORM_CONNECT_TIMEOUT"] = str(
                     _gateway_cfg["platform_connect_timeout"]
                 )
+            # Internal runtime bridges. config.yaml is the documented surface;
+            # a managed image may still supply these env vars directly when no
+            # user-authored key is present.
+            for _cfg_key, _env_var in {
+                "task_protection_http_timeout_seconds": (
+                    "HERMES_TASK_PROTECTION_HTTP_TIMEOUT_SECONDS"
+                ),
+                "task_protection_failure_backoff_seconds": (
+                    "HERMES_TASK_PROTECTION_FAILURE_BACKOFF_SECONDS"
+                ),
+                "response_owner_heartbeat_seconds": (
+                    "HERMES_RESPONSE_OWNER_HEARTBEAT_SECONDS"
+                ),
+                "response_owner_stale_seconds": (
+                    "HERMES_RESPONSE_OWNER_STALE_SECONDS"
+                ),
+            }.items():
+                if _cfg_key in _gateway_cfg:
+                    os.environ[_env_var] = str(_gateway_cfg[_cfg_key])
     except Exception as _bridge_err:
         # Previously this was silent (`except Exception: pass`), which
         # hid partial bridge failures and let .env defaults shadow
@@ -18018,8 +18041,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # (D4a: stop accepting new turns FIRST, then NAS polls until
         # active_agents==0). In-flight turns are untouched; this only blocks the
         # claim of a NEW session slot. Internal/system events (restart-recovery
-        # replays, background-process completions) bypass the gate — they are
-        # not user-initiated new work and must still flow during a drain.
+        # replays, background-process completions) bypass this user-facing gate
+        # so they are not answered with a maintenance message. The universal
+        # task-protection admission latch below still refuses them once a
+        # one-way drain has started.
         # Reversible: once the marker is removed the gate opens again.
         if self._external_drain_active and not is_internal:
             logger.info(
@@ -18074,6 +18099,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "protection could not be acknowledged",
                 _quick_key,
             )
+            if is_internal:
+                # There is no human sender to retry this notification. A
+                # user-facing refusal would instead be persisted/routed as an
+                # agent response. Drop it while preserving the closed latch.
+                return None
             return (
                 "⏳ This agent could not reserve a protected execution slot. "
                 "Please resend in a moment."

@@ -1856,6 +1856,12 @@ class ShellFileOperations(FileOperations):
         decoded_length = _strict_base64_decoded_length(compact)
         if decoded_length is None:
             return ReadResult(error=f"Backend returned invalid binary data for: {path}")
+        # Without shell pipefail, ``head`` can fail while the trailing base64
+        # process exits successfully and emits nothing. A file that was just
+        # probed as nonempty cannot legitimately produce an empty bounded read;
+        # report the transport failure instead of fabricating an empty file.
+        if file_size > 0 and decoded_length == 0:
+            return ReadResult(error=f"Failed to read binary file: {path}")
         if max_bytes is not None and decoded_length > max_bytes:
             return ReadResult(
                 file_size=max(file_size, decoded_length),
