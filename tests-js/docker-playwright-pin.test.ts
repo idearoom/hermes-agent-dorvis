@@ -42,13 +42,23 @@ test('Docker Playwright CLI is an exact root dependency with lock integrity', ()
   assert.match(core?.integrity ?? '', /^sha512-/)
 })
 
-test('Docker invokes only the installed Playwright binary', () => {
+test('Docker invokes the installed Playwright CLI with ephemeral Node 22', () => {
   const dockerfile = fs.readFileSync(path.join(REPO_ROOT, 'Dockerfile'), 'utf-8')
 
   assert.match(
     dockerfile,
-    /\.\/node_modules\/\.bin\/playwright install --with-deps chromium --only-shell/,
-    'Docker must invoke the lock-installed root binary directly',
+    /\/opt\/playwright-installer-node\/bin\/node \.\/node_modules\/playwright\/cli\.js\s*\\\s+install --with-deps chromium --only-shell/,
+    'Docker must invoke the lock-installed root CLI under the compatible extractor runtime',
+  )
+  assert.match(
+    dockerfile,
+    /FROM node:22-bookworm-slim@sha256:[0-9a-f]{64} AS playwright_installer_node/,
+    'the extraction-only Node image must be immutable',
+  )
+  assert.match(
+    dockerfile,
+    /RUN --mount=from=playwright_installer_node,source=\/usr\/local,target=\/opt\/playwright-installer-node,ro/,
+    'Node 22 must be mounted for the install layer instead of copied into the runtime image',
   )
   assert.ok(
     !/\bnpx\s+playwright\s+install\b/.test(dockerfile),

@@ -49,6 +49,12 @@ FROM ghcr.io/astral-sh/uv:0.11.6-python3.13-trixie@sha256:b3c543b6c4f23a5f2df228
 # 2.41) runtime.  Bumping to a new Node major is a one-line ARG change; see
 # #4977.
 FROM node:26-bookworm-slim@sha256:9e6f9357d371591e32ab6f2d8a26d63bdd0d17c29eee3f4f3e7e454d9634bf73 AS node_source
+# Playwright 1.58.2's vendored yauzl/fd-slicer hangs while extracting browser
+# archives under Node 26 (microsoft/playwright#40724). Keep the reviewed
+# Playwright and Chromium versions stable, but run that one build-time install
+# under pinned Node 22, where the extraction lifecycle is sound. The stage is
+# mounted read-only below, so this compatibility runtime is not shipped.
+FROM node:22-bookworm-slim@sha256:83f487e0a63425e5b4d146fb5e5be574bcbe1b7b843d3ebafdd95eaf7767a7e5 AS playwright_installer_node
 FROM debian:13.4@sha256:e2d08da6f42ef4b09b165d55528a12727aeed8240dc9edf888e3ec07e10ef9da
 
 # Disable Python stdout buffering to ensure logs are printed immediately.
@@ -186,7 +192,7 @@ COPY apps/shared/ apps/shared/
 
 # `npm_config_install_links=false` forces npm to install `file:` deps as
 # symlinks instead of copies.  This is the default since npm 10+, which is
-# what the image ships now (via the node:22 source stage).  We set it
+# what the image ships now (via the Node 26 source stage). We set it
 # explicitly anyway as defense-in-depth: the previous Debian-bundled npm
 # 9.x defaulted to install-as-copy, which produced a hidden
 # node_modules/.package-lock.json that permanently disagreed with the root
@@ -196,9 +202,14 @@ COPY apps/shared/ apps/shared/
 # guards against a future regression if the source npm version changes.
 ENV npm_config_install_links=false
 
-RUN npm install --prefer-offline --no-audit --fetch-retries=5 && \
+# BuildKit exposes pinned Node 22 only for this instruction. The final image
+# keeps Node 26 exclusively; process.execPath also ensures Playwright's forked
+# archive extractor inherits Node 22 rather than falling back to PATH.
+RUN --mount=from=playwright_installer_node,source=/usr/local,target=/opt/playwright-installer-node,ro \
+    npm install --prefer-offline --no-audit --fetch-retries=5 && \
     for i in 1 2 3; do \
-        ./node_modules/.bin/playwright install --with-deps chromium --only-shell && break || \
+        /opt/playwright-installer-node/bin/node ./node_modules/playwright/cli.js \
+            install --with-deps chromium --only-shell && break || \
         { [ "$i" = 3 ] && exit 1; echo "playwright install failed (attempt $i); retrying in 10s"; sleep 10; }; \
     done && \
     npm cache clean --force
