@@ -23,9 +23,10 @@ def test_browser_cli_engine_is_exactly_pinned_and_exposed_under_expected_name():
     assert "--resolution lowest-direct" in dockerfile
     assert "ln -sf /opt/hermes/bin/browser-harness /opt/hermes/bin/browser-use" in dockerfile
     assert (
-        '/opt/hermes/bin/browser-use --version | grep -Fx "${BROWSER_HARNESS_VERSION}"'
+        'browser_harness_version="$(/opt/hermes/bin/browser-use --version)"'
         in dockerfile
     )
+    assert 'test "${browser_harness_version}" = "${BROWSER_HARNESS_VERSION}"' in dockerfile
     assert version == "0.1.9"
 
 
