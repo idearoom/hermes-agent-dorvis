@@ -27,6 +27,7 @@ docker/entrypoint.sh text eol=lf
 *.yaml  text eol=lf
 *.yml   text eol=lf
 *.toml  text eol=lf
+*.sql   text eol=lf
 *.md    text eol=lf
 *.css   text eol=lf
 *.html  text eol=lf
