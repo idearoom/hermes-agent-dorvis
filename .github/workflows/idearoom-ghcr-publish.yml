@@ -53,7 +53,10 @@ jobs:
       github.event_name == 'pull_request'
     permissions:
       contents: read
-    runs-on: ubuntu-24.04
+    # The runtime image is arm64-only. Building it natively avoids compiling
+    # SQLite and unpacking Playwright Chromium through QEMU, which became
+    # prohibitively slow after the v2026.8.19 image expansion.
+    runs-on: blacksmith-4vcpu-ubuntu-2404-arm
     timeout-minutes: 45
     steps:
       - name: Checkout candidate code without retaining credentials
@@ -83,16 +86,11 @@ jobs:
             echo "local_image=${IMAGE_NAME}:pr-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           } >> "${GITHUB_OUTPUT}"
 
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130  # v3
-        with:
-          platforms: arm64
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f  # v3
+      - name: Set up Blacksmith Builder
+        uses: useblacksmith/setup-docker-builder@9309da73a81f66976a6d750572e221508b1e2682  # v1.12.0
 
       - name: Build final validation image (arm64, loaded for smoke test)
-        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f  # v7.1.0
+        uses: useblacksmith/build-push-action@9b0579bbec7a6cad2f171596c57e7ac1e7658850  # v2.3.0
         with:
           context: .
           file: Dockerfile
@@ -106,7 +104,6 @@ jobs:
             HERMES_GIT_SHA=${{ steps.image.outputs.revision }}
           provenance: false
           sbom: false
-          cache-from: type=gha,scope=ghcr-arm64
 
       - name: Install uv for docker tests
         uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39  # 8.2.0
@@ -137,9 +134,10 @@ jobs:
     permissions:
       contents: read
       packages: write
-    # Build linux/arm64 through QEMU on the standard hosted pool rather than
-    # depending on scarce native arm64 runners.
-    runs-on: ubuntu-24.04
+    # Match the AWS Fargate target architecture without QEMU. The IdeaRoom
+    # deployment repository uses the same native ARM Blacksmith runner and
+    # builder for its runtime and review images.
+    runs-on: blacksmith-4vcpu-ubuntu-2404-arm
     timeout-minutes: 45
     outputs:
       digest: ${{ steps.publish.outputs.digest }}
@@ -194,20 +192,15 @@ jobs:
             echo "immutable_image=${IMAGE_NAME}:sha-${revision}"
           } >> "${GITHUB_OUTPUT}"
 
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130  # v3
-        with:
-          platforms: arm64
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f  # v3
+      - name: Set up Blacksmith Builder
+        uses: useblacksmith/setup-docker-builder@9309da73a81f66976a6d750572e221508b1e2682  # v1.12.0
 
       # This is the one and only image build. OCI labels and the in-image build
       # SHA are present before it is loaded and smoked. Publishing below tags
       # and pushes this exact local image; it never invokes BuildKit again.
       - name: Build final image (arm64, loaded for smoke test)
         id: build
-        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f  # v7.1.0
+        uses: useblacksmith/build-push-action@9b0579bbec7a6cad2f171596c57e7ac1e7658850  # v2.3.0
         with:
           context: candidate
           file: candidate/Dockerfile
@@ -221,8 +214,6 @@ jobs:
             HERMES_GIT_SHA=${{ steps.image.outputs.revision }}
           provenance: false
           sbom: false
-          cache-from: type=gha,scope=ghcr-arm64
-          cache-to: type=gha,mode=max,scope=ghcr-arm64
 
       - name: Install uv for docker tests
         uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39  # 8.2.0
