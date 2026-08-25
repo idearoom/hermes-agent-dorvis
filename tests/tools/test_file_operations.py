@@ -770,6 +770,64 @@ class TestByteLayerBinaryDetection:
         ops = ShellFileOperations(mock_env)
         assert ops._sample_file_bytes("/tmp/x.txt") is None
 
+
+class TestBoundedBinaryRead:
+    """The byte transport must remain bounded if a file grows after stat."""
+
+    @staticmethod
+    def _bounded_dispatch(stat_size: int, payload: bytes):
+        import base64 as b64
+
+        commands = []
+
+        def side_effect(command, **kwargs):
+            commands.append(command)
+            if command.startswith("if [ -f ") or command.startswith("wc -c"):
+                return {"output": f"{stat_size}\n", "returncode": 0}
+            if "| base64" in command:
+                return {
+                    "output": b64.b64encode(payload).decode("ascii") + "\n",
+                    "returncode": 0,
+                }
+            return {"output": "", "returncode": 0}
+
+        return commands, side_effect
+
+    def test_growth_after_stat_is_rejected_from_bounded_transport(self, mock_env):
+        commands, dispatch = self._bounded_dispatch(10, b"x" * 11)
+        mock_env.execute.side_effect = dispatch
+        result = ShellFileOperations(mock_env).read_file_bytes("/tmp/growing", max_bytes=10)
+
+        assert result.base64_content is None
+        assert result.file_size == 11
+        assert "too large" in (result.error or "").lower()
+        assert any("head -c 11" in command and "| base64" in command for command in commands)
+        assert not any(command.startswith("base64 <") for command in commands)
+
+    def test_file_at_limit_returns_valid_base64(self, mock_env):
+        payload = b"0123456789"
+        commands, dispatch = self._bounded_dispatch(len(payload), payload)
+        mock_env.execute.side_effect = dispatch
+        result = ShellFileOperations(mock_env).read_file_bytes("/tmp/exact", max_bytes=10)
+
+        assert result.error is None
+        assert result.file_size == len(payload)
+        assert result.base64_content == "MDEyMzQ1Njc4OQ=="
+        assert any("head -c 11" in command for command in commands)
+
+    def test_real_shell_handles_spaced_and_quoted_path_at_limit(self, tmp_path):
+        path = tmp_path / "quoted ' binary.bin"
+        payload = bytes(range(64))
+        path.write_bytes(payload)
+        ops = ShellFileOperations(make_real_subprocess_env(str(tmp_path)))
+
+        result = ops.read_file_bytes(str(path), max_bytes=len(payload))
+
+        assert result.error is None
+        assert result.file_size == len(payload)
+        import base64 as b64
+        assert b64.b64decode(result.base64_content or "", validate=True) == payload
+
     # --- integration: read_file over the mocked terminal ------------------
 
     def _dispatch(self, cjk_bytes):

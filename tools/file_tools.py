@@ -133,6 +133,162 @@ def _truncate_to_char_budget(content: str, max_chars: int) -> tuple[str, int, bo
     return "\n".join(kept), len(kept), True
 
 
+_EXTRACTED_LINE_CONTINUATION_PREFIX = "↳ "
+
+
+def _document_page_lines(
+    text: str,
+    offset: int,
+    limit: int,
+    *,
+    max_line_length: int,
+) -> tuple[list[str], int, int, int, str]:
+    """Return a lossless display page for bounded extracted document text.
+
+    ``ShellFileOperations._add_line_numbers`` clamps every logical line at
+    ``tool_output.max_line_length``.  That behavior is useful for arbitrary
+    text files, whose remainder is still available from the underlying file,
+    but it is destructive for an in-memory DOCX/XLSX/IPYNB extraction:
+    ``offset`` pages logical lines and can never recover a clamped tail.
+
+    Split wide logical lines into display continuation lines *before*
+    pagination.  Offset/limit then address the lossless display-line stream,
+    and every line handed to ``_add_line_numbers`` is already within its cap.
+    Only the requested page is retained, so even a deliberately tiny configured
+    line limit cannot turn a two-million-character extraction into a second
+    multi-million-object allocation.
+    """
+    logical_lines = text.splitlines()
+    selected: list[str] = []
+    display_line = 0
+    wrapped_logical_lines = 0
+    end_line = offset + limit - 1
+    continuation_prefix = _EXTRACTED_LINE_CONTINUATION_PREFIX
+    if max_line_length <= len(continuation_prefix):
+        # Preserve bytes under unusually small user-configured limits.  The
+        # metadata still identifies wrapping even when no prefix can fit.
+        continuation_prefix = ""
+    continuation_width = max(1, max_line_length - len(continuation_prefix))
+
+    for logical_line in logical_lines:
+        if len(logical_line) <= max_line_length:
+            segments = (logical_line,)
+        else:
+            wrapped_logical_lines += 1
+
+            def _segments():
+                yield logical_line[:max_line_length]
+                cursor = max_line_length
+                while cursor < len(logical_line):
+                    yield (
+                        continuation_prefix
+                        + logical_line[cursor:cursor + continuation_width]
+                    )
+                    cursor += continuation_width
+
+            segments = _segments()
+
+        for segment in segments:
+            display_line += 1
+            if offset <= display_line <= end_line:
+                selected.append(segment)
+
+    return (
+        selected,
+        display_line,
+        len(logical_lines),
+        wrapped_logical_lines,
+        continuation_prefix,
+    )
+
+
+def _document_page_result(
+    text: str,
+    file_ops,
+    offset: int,
+    limit: int,
+    file_size: int,
+    *,
+    extracted_document: bool,
+    fallback_note: str | None = None,
+) -> dict:
+    """Paginate a bounded document snapshot without reading its path again."""
+    from tools.tool_output_limits import get_max_line_length
+
+    # Redact the bounded extraction snapshot before introducing continuation
+    # boundaries.  Redacting only the rendered page can split a credential
+    # such as ``sk-...`` across two display lines and make the prefix matcher
+    # miss it.  Native readers impose hard extraction/raw-fallback bounds, so
+    # this remains a bounded pass while protecting every paginated segment.
+    text = redact_sensitive_text(text, file_read=True)
+    max_chars = _get_max_read_chars()
+    # Include enough room for the largest possible gutter.  A display stream
+    # cannot have more lines than text characters plus one, even at a one-char
+    # line cap, so this bound is independent of the wrapping pass.
+    gutter_chars = len(str(max(1, len(text) + 1))) + 1
+    max_line_length = max(
+        1,
+        min(get_max_line_length(), max(1, max_chars - gutter_chars)),
+    )
+    (
+        page_lines,
+        total_lines,
+        logical_total_lines,
+        wrapped_logical_lines,
+        continuation_prefix,
+    ) = _document_page_lines(
+        text,
+        offset,
+        limit,
+        max_line_length=max_line_length,
+    )
+    end_line = offset + limit - 1
+    page_text = "\n".join(page_lines)
+    result_dict = {
+        "content": file_ops._add_line_numbers(page_text, offset) if page_text else "",
+        "total_lines": total_lines,
+        "logical_total_lines": logical_total_lines,
+        "wrapped_logical_lines": wrapped_logical_lines,
+        "file_size": file_size,
+        "truncated": total_lines > end_line,
+    }
+    if wrapped_logical_lines:
+        prefix_description = repr(continuation_prefix) if continuation_prefix else "none"
+        result_dict["line_wrapping"] = (
+            "Wide extracted logical lines were split into lossless display "
+            f"continuation lines (continuation prefix: {prefix_description}); "
+            "offset/limit address these display lines."
+        )
+    if extracted_document:
+        result_dict["extracted_document"] = True
+    if fallback_note is not None:
+        result_dict["raw_notebook_fallback"] = True
+        result_dict["note"] = fallback_note
+    if result_dict["truncated"]:
+        result_dict["hint"] = (
+            f"Use offset={end_line + 1} to continue reading "
+            f"(showing {offset}-{min(end_line, total_lines)} of {total_lines} lines)"
+        )
+
+    if len(result_dict["content"]) > max_chars:
+        trimmed, lines_kept, _ = _truncate_to_char_budget(
+            result_dict["content"], max_chars
+        )
+        next_offset = offset + lines_kept
+        shown_end = offset + lines_kept - 1
+        result_dict["content"] = trimmed
+        result_dict["truncated"] = True
+        result_dict["truncated_by"] = "characters"
+        result_dict["next_offset"] = next_offset
+        result_dict["hint"] = (
+            f"Output truncated at the {max_chars:,}-char read budget "
+            f"after {lines_kept} line(s) (showing lines {offset}-"
+            f"{shown_end} of {total_lines}). Use offset={next_offset} "
+            "to continue."
+        )
+    return result_dict
+
+
 # If the total file size exceeds this AND the caller didn't specify a narrow
 # range (limit <= 200), we include a hint encouraging targeted reads.
 _LARGE_FILE_HINT_BYTES = 512_000  # 512 KB
@@ -1258,6 +1414,136 @@ def _cap_read_tracker_data(task_data: dict) -> None:
                 break
 
 
+def _ensure_read_tracker_data(task_id: str) -> dict:
+    """Return current-shape tracker state while ``_read_tracker_lock`` is held."""
+    task_data = _read_tracker.setdefault(task_id, {
+        "last_key": None,
+        "consecutive": 0,
+        "read_history": set(),
+        "dedup": {},
+        "dedup_hits": {},
+        "read_timestamps": {},
+    })
+    # Long-lived conversations can cross an in-process upgrade from tracker
+    # states created before these fields existed.
+    task_data.setdefault("read_history", set())
+    task_data.setdefault("dedup", {})
+    task_data.setdefault("dedup_hits", {})
+    task_data.setdefault("read_timestamps", {})
+    return task_data
+
+
+def _unchanged_read_response(
+    *,
+    path: str,
+    resolved_str: str,
+    offset: int,
+    limit: int,
+    task_id: str,
+) -> str | None:
+    """Apply the shared unchanged-file dedup/loop contract before a read."""
+    dedup_key = (resolved_str, offset, limit)
+    with _read_tracker_lock:
+        task_data = _ensure_read_tracker_data(task_id)
+        cached_mtime = task_data["dedup"].get(dedup_key)
+
+    if cached_mtime is None:
+        return None
+    try:
+        current_mtime = os.path.getmtime(resolved_str)
+    except OSError:
+        return None
+    if current_mtime != cached_mtime:
+        return None
+
+    # Count repeated stub returns so weak tool-followers cannot burn their
+    # iteration budget retrying a result that explicitly says it is current.
+    with _read_tracker_lock:
+        task_data = _ensure_read_tracker_data(task_id)
+        hits = task_data["dedup_hits"].get(dedup_key, 0) + 1
+        task_data["dedup_hits"][dedup_key] = hits
+        _cap_read_tracker_data(task_data)
+
+    if hits >= 2:
+        return tool_error(
+            f"BLOCKED: You have called read_file on this exact region "
+            f"{hits + 1} times and the file has NOT changed. STOP calling "
+            "read_file for this path — the content from your earlier "
+            "read_file result in this conversation is still current. "
+            "Proceed with your task using the information you already have.",
+            path=path,
+            already_read=hits + 1,
+        )
+
+    return json.dumps({
+        "status": "unchanged",
+        "message": _READ_DEDUP_STATUS_MESSAGE,
+        "path": path,
+        "dedup": True,
+        "content_returned": False,
+    }, ensure_ascii=False)
+
+
+def _finish_tracked_read(
+    result_dict: dict,
+    *,
+    path: str,
+    resolved_str: str,
+    offset: int,
+    limit: int,
+    task_id: str,
+) -> str:
+    """Record one completed text or structured read and serialize its result."""
+    dedup_key = (resolved_str, offset, limit)
+    read_key = ("read", path, offset, limit)
+    with _read_tracker_lock:
+        task_data = _ensure_read_tracker_data(task_id)
+        # A real read resets any unchanged-stub loop for this region.  The file
+        # either changed or its prior stat failed and we deliberately reread it.
+        task_data["dedup_hits"].pop(dedup_key, None)
+        task_data["read_history"].add((path, offset, limit))
+        if task_data["last_key"] == read_key:
+            task_data["consecutive"] += 1
+        else:
+            task_data["last_key"] = read_key
+            task_data["consecutive"] = 1
+        count = task_data["consecutive"]
+
+        try:
+            mtime_now = os.path.getmtime(resolved_str)
+            task_data["dedup"][dedup_key] = mtime_now
+            task_data["read_timestamps"][resolved_str] = mtime_now
+        except OSError:
+            pass
+        _cap_read_tracker_data(task_data)
+
+    # Cross-agent coordination is intentionally separate from the per-task
+    # loop tracker.  A structured document page is partial under exactly the
+    # same offset/truncation conditions as an ordinary text-file page.
+    try:
+        partial = (offset > 1) or bool(result_dict.get("truncated"))
+        file_state.record_read(task_id, resolved_str, partial=partial)
+    except Exception:
+        logger.debug("file_state.record_read failed", exc_info=True)
+
+    if count >= 4:
+        return tool_error(
+            f"BLOCKED: You have read this exact file region {count} times in "
+            "a row. The content has NOT changed. You already have this "
+            "information. STOP re-reading and proceed with your task.",
+            path=path,
+            already_read=count,
+        )
+    if count >= 3:
+        result_dict["_warning"] = (
+            f"You have read this exact file region {count} times consecutively. "
+            "The content has not changed since your last read. Use the "
+            "information you already have. If you are stuck in a loop, stop "
+            "reading and proceed with writing or responding."
+        )
+    return json.dumps(result_dict, ensure_ascii=False)
+
+
 def _check_not_found_cache(op: str, resolved_str: str, task_id: str) -> str | None:
     """Return cached not-found JSON for *(op, resolved_str)* if still fresh.
 
@@ -1629,7 +1915,11 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 2000, task_id: str =
         # ── Device path guard ─────────────────────────────────────────
         # Block paths that would hang the process (infinite output,
         # blocking on input).  Pure path check — no I/O.
-        device_base = None if Path(path).expanduser().is_absolute() else _resolve_base_dir(task_id)
+        # ``Path.expanduser`` raises for a valid remote ``~user/...`` path when
+        # that account does not exist on the gateway host.  Keep this pure
+        # guard host-tolerant; the target backend expands the path later.
+        device_path = _expand_tilde(path)
+        device_base = None if Path(device_path).is_absolute() else _resolve_base_dir(task_id)
         if _is_blocked_device(path, base_dir=device_base):
             return tool_error(
                 f"Cannot read '{path}': this is a device file that would "
@@ -1655,47 +1945,147 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 2000, task_id: str =
                     ),
                 })
 
+        # ── Hermes internal path guard ────────────────────────────────
+        # Run before every content-reading path, including structured
+        # document byte transport. Otherwise a blocked credential/cache file
+        # with a supported extension could bypass the canonical denylist.
+        block_error = get_read_block_error(str(_resolved))
+        if block_error:
+            return tool_error(block_error)
+
         # ── Structured-document extraction ────────────────────────────
         # Try before the binary-extension guard so .docx/.xlsx can render as text.
-        # Malformed documents fall through to the normal path/binary guard.
+        # Binary-document failures are surfaced; notebook JSON syntax/decode
+        # failures alone paginate the already-bounded byte snapshot rather than
+        # retaining a parsed object or re-reading a path.
         from tools.read_extract import (
             ANYDOC_EXTENSIONS,
             EXTRACTABLE_EXTENSIONS,
-            MAX_DOCUMENT_BYTES,
+            ExtractionBusyError,
             ExtractionError,
+            NotebookSyntaxError,
+            document_size_limit,
             extract_document_bytes,
             is_extractable_document,
+            native_extraction_slot,
         )
 
-        if is_extractable_document(str(_resolved)):
+        resolved_str = str(_resolved)
+        if is_extractable_document(resolved_str):
+            unchanged = _unchanged_read_response(
+                path=path,
+                resolved_str=resolved_str,
+                offset=offset,
+                limit=limit,
+                task_id=task_id,
+            )
+            if unchanged is not None:
+                return unchanged
             file_ops = _get_file_ops(task_id)
+            _doc_ext = _resolved.suffix.lower()
             try:
-                binary = file_ops.read_file_bytes(
-                    str(_resolved), max_bytes=MAX_DOCUMENT_BYTES
-                )
-                if binary.error or binary.base64_content is None:
-                    raise ExtractionError(binary.error or "Document bytes unavailable")
-                document_bytes = base64.b64decode(
-                    binary.base64_content, validate=True
-                )
-                extracted_text = extract_document_bytes(
-                    document_bytes, str(_resolved)
-                )
+                # Acquire before backend/base64 transport so rejected overflow
+                # calls cannot consume the memory this guard is meant to cap.
+                with native_extraction_slot(path):
+                    binary = file_ops.read_file_bytes(
+                        path,
+                        max_bytes=document_size_limit(path),
+                    )
+                    if binary.error or binary.base64_content is None:
+                        raise ExtractionError(
+                            binary.error or "Document bytes unavailable"
+                        )
+                    document_bytes = base64.b64decode(
+                        binary.base64_content, validate=True
+                    )
+                    try:
+                        extracted_text = extract_document_bytes(
+                            document_bytes, path
+                        )
+                    except NotebookSyntaxError as extraction_exc:
+                        # Syntax/decode failures occur before a parsed notebook
+                        # object exists. They may use the already-bounded byte
+                        # snapshot without overlapping the parser's high-
+                        # expansion object graph. Clear chained tracebacks so
+                        # the failed parser frame is not retained during raw
+                        # decode, pagination, redaction, and serialization.
+                        fallback_reason = str(extraction_exc)
+                        extraction_exc.__traceback__ = None
+                        extraction_exc.__cause__ = None
+                        extraction_exc.__context__ = None
+                        raw_notebook = document_bytes.decode(
+                            "utf-8-sig", errors="replace"
+                        )
+                        result_dict = _document_page_result(
+                            raw_notebook,
+                            file_ops,
+                            offset,
+                            limit,
+                            binary.file_size,
+                            extracted_document=False,
+                            fallback_note=(
+                                "Notebook syntax extraction failed; showing the "
+                                "bounded raw snapshot instead: "
+                                f"{fallback_reason}"
+                            ),
+                        )
+                        return _finish_tracked_read(
+                            result_dict,
+                            path=path,
+                            resolved_str=resolved_str,
+                            offset=offset,
+                            limit=limit,
+                            task_id=task_id,
+                        )
+                    # Keep the native-reader allocation slot through
+                    # redaction, lossless pagination, and serialization. The
+                    # per-request working-set proof includes these phases;
+                    # releasing immediately after parsing would let an
+                    # unbounded tail of completed parsers overlap the next ten
+                    # transports while still retaining decoded/extracted data.
+                    result_dict = _document_page_result(
+                        extracted_text,
+                        file_ops,
+                        offset,
+                        limit,
+                        binary.file_size,
+                        extracted_document=True,
+                    )
+                    return _finish_tracked_read(
+                        result_dict,
+                        path=path,
+                        resolved_str=resolved_str,
+                        offset=offset,
+                        limit=limit,
+                        task_id=task_id,
+                    )
             except (ExtractionError, ValueError, base64.binascii.Error) as exc:
                 logger.debug("document extraction failed for %s", path, exc_info=True)
+                if isinstance(exc, ExtractionBusyError):
+                    return tool_error(f"Cannot read '{path}': {exc}.")
+                if not isinstance(exc, ExtractionError):
+                    return tool_error(
+                        f"Cannot read '{path}' ({_doc_ext}): bounded document "
+                        f"transport returned invalid byte data — {exc}. Retry "
+                        "if the file or backend is changing."
+                    )
                 # For binary document formats, surface the specific failure
                 # (size cap, encrypted, malformed…) instead of falling through
                 # — the fallthrough path can only produce a generic
                 # binary-file error or garbage raw bytes, hiding the
                 # actionable reason (e.g. "Document too large to convert").
-                # .ipynb stays on the fallthrough path: it is plain JSON text
-                # and a raw read is genuinely useful.  Byte-transport issues
-                # (ValueError / binascii) keep the fallthrough too — only a
-                # specific ExtractionError carries an actionable reason.
-                _doc_ext = _resolved.suffix.lower()
+                # Malformed notebooks use the bounded snapshot above. Any
+                # transport, size, or base64 failure is surfaced so no path
+                # can fall through to an uncapped second read.
                 _binary_doc = _doc_ext in ANYDOC_EXTENSIONS or (
                     _doc_ext in EXTRACTABLE_EXTENSIONS and _doc_ext != ".ipynb"
                 )
+                if _doc_ext == ".ipynb":
+                    return tool_error(
+                        f"Cannot read '{path}' (.ipynb): bounded notebook "
+                        f"transport/extraction failed — {exc}. Retry if the "
+                        "file is changing, or inspect a smaller copy."
+                    )
                 if (
                     _binary_doc
                     and isinstance(exc, ExtractionError)
@@ -1706,54 +2096,6 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 2000, task_id: str =
                         f"extraction failed — {exc}. Use terminal utilities "
                         "to inspect or convert the file."
                     )
-            else:
-                lines = extracted_text.splitlines()
-                total_lines = len(lines)
-                end_line = offset + limit - 1
-                page_text = "\n".join(lines[offset - 1:end_line])
-                result_dict = {
-                    "content": file_ops._add_line_numbers(page_text, offset) if page_text else "",
-                    "total_lines": total_lines,
-                    "file_size": binary.file_size,
-                    "truncated": total_lines > end_line,
-                    "extracted_document": True,
-                }
-                if result_dict["truncated"]:
-                    result_dict["hint"] = (
-                        f"Use offset={end_line + 1} to continue reading "
-                        f"(showing {offset}-{min(end_line, total_lines)} of {total_lines} lines)"
-                    )
-                content_len = len(result_dict["content"])
-                max_chars = _get_max_read_chars()
-                if content_len > max_chars:
-                    # Graceful char-budget truncation (nearai/ironclaw#5029):
-                    # trim to the last complete line that fits and offer a
-                    # next_offset rather than rejecting the whole extraction.
-                    trimmed, lines_kept, _ = _truncate_to_char_budget(
-                        result_dict["content"], max_chars
-                    )
-                    next_offset = offset + lines_kept
-                    shown_end = offset + lines_kept - 1
-                    result_dict["content"] = trimmed
-                    result_dict["truncated"] = True
-                    result_dict["truncated_by"] = "bytes"
-                    result_dict["next_offset"] = next_offset
-                    result_dict["hint"] = (
-                        f"Output truncated at the {max_chars:,}-char read budget "
-                        f"after {lines_kept} line(s) (showing lines {offset}-"
-                        f"{shown_end} of {total_lines}). Use offset={next_offset} "
-                        "to continue."
-                    )
-                    if len(trimmed.split("\n", 1)[0]) >= max_chars:
-                        result_dict["hint"] += (
-                            " Note: the first line alone exceeded the budget and "
-                            "was clamped mid-line; its remainder is not "
-                            "retrievable via offset."
-                        )
-                if result_dict["content"]:
-                    result_dict["content"] = redact_sensitive_text(result_dict["content"], file_read=True)
-                return json.dumps(result_dict, ensure_ascii=False)
-
         # ── Binary file guard ─────────────────────────────────────────
         # Block binary files by extension (no I/O). Name what we know:
         # the extension is a claim, so keep this branch's message to the
@@ -1765,17 +2107,6 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 2000, task_id: str =
                 f"Cannot read binary file '{path}' ({_ext}). "
                 "Use vision_analyze for images, or terminal to inspect binary files."
             )
-
-        # ── Hermes internal path guard ────────────────────────────────
-        # Prevent prompt injection via catalog or hub metadata files,
-        # and block credential stores under HERMES_HOME.  Pass the
-        # already-resolved path so a relative-path read against
-        # TERMINAL_CWD == HERMES_HOME (e.g. "auth.json") still hits the
-        # denylist — get_read_block_error's own resolve() runs against
-        # the Python process cwd, which can differ.
-        block_error = get_read_block_error(str(_resolved))
-        if block_error:
-            return tool_error(block_error)
 
         # ── Negative-result cache ─────────────────────────────────────
         # If we already discovered this path doesn't exist (within TTL),
@@ -1790,59 +2121,15 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 2000, task_id: str =
         # If we already read this exact (path, offset, limit) and the
         # file hasn't been modified since, return a lightweight stub
         # instead of re-sending the same content.  Saves context tokens.
-        resolved_str = str(_resolved)
-        dedup_key = (resolved_str, offset, limit)
-        with _read_tracker_lock:
-            task_data = _read_tracker.setdefault(task_id, {
-                "last_key": None, "consecutive": 0,
-                "read_history": set(), "dedup": {},
-                "dedup_hits": {}, "read_timestamps": {},
-            })
-            # Backward-compat for pre-existing tracker entries that predate
-            # dedup_hits/read_timestamps (long-lived task or crossed an
-            # upgrade boundary).
-            if "dedup_hits" not in task_data:
-                task_data["dedup_hits"] = {}
-            if "read_timestamps" not in task_data:
-                task_data["read_timestamps"] = {}
-            cached_mtime = task_data.get("dedup", {}).get(dedup_key)
-
-        if cached_mtime is not None:
-            try:
-                current_mtime = os.path.getmtime(resolved_str)
-                if current_mtime == cached_mtime:
-                    # Count repeated stub returns so weak tool-followers that
-                    # ignore the "refer to earlier result" hint don't burn
-                    # their iteration budget in an infinite read loop.  After
-                    # 2 stubs for the same key we escalate to a hard block
-                    # mirroring the count>=4 path on real reads.
-                    with _read_tracker_lock:
-                        hits = task_data["dedup_hits"].get(dedup_key, 0) + 1
-                        task_data["dedup_hits"][dedup_key] = hits
-                        _cap_read_tracker_data(task_data)
-
-                    if hits >= 2:
-                        return tool_error(
-                            f"BLOCKED: You have called read_file on this "
-                            f"exact region {hits + 1} times and the file "
-                            "has NOT changed. STOP calling read_file for "
-                            "this path — the content from your earlier "
-                            "read_file result in this conversation is "
-                            "still current. Proceed with your task using "
-                            "the information you already have.",
-                            path=path,
-                            already_read=hits + 1,
-                        )
-
-                    return json.dumps({
-                        "status": "unchanged",
-                        "message": _READ_DEDUP_STATUS_MESSAGE,
-                        "path": path,
-                        "dedup": True,
-                        "content_returned": False,
-                    }, ensure_ascii=False)
-            except OSError:
-                pass  # stat failed — fall through to full read
+        unchanged = _unchanged_read_response(
+            path=path,
+            resolved_str=resolved_str,
+            offset=offset,
+            limit=limit,
+            task_id=task_id,
+        )
+        if unchanged is not None:
+            return unchanged
 
         # ── Perform the read ──────────────────────────────────────────
         file_ops = _get_file_ops(task_id)
@@ -1921,72 +2208,14 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 2000, task_id: str =
                 "to keep context usage efficient."
             ))
 
-        # ── Track for consecutive-loop detection ──────────────────────
-        read_key = ("read", path, offset, limit)
-        with _read_tracker_lock:
-            # Ensure "dedup" / "dedup_hits" keys exist (backward compat with
-            # old tracker state from pre-dedup-guard sessions).
-            if "dedup" not in task_data:
-                task_data["dedup"] = {}
-            if "dedup_hits" not in task_data:
-                task_data["dedup_hits"] = {}
-            # Real read succeeded — this key is no longer in a stub-loop, so
-            # reset its hit counter.  (File either changed or stat failed
-            # earlier and we fell through.)
-            task_data["dedup_hits"].pop(dedup_key, None)
-            task_data["read_history"].add((path, offset, limit))
-            if task_data["last_key"] == read_key:
-                task_data["consecutive"] += 1
-            else:
-                task_data["last_key"] = read_key
-                task_data["consecutive"] = 1
-            count = task_data["consecutive"]
-
-            # Store mtime at read time for two purposes:
-            # 1. Dedup: skip identical re-reads of unchanged files.
-            # 2. Staleness: warn on write/patch if the file changed since
-            #    the agent last read it (external edit, concurrent agent, etc.).
-            try:
-                _mtime_now = os.path.getmtime(resolved_str)
-                task_data["dedup"][dedup_key] = _mtime_now
-                task_data.setdefault("read_timestamps", {})[resolved_str] = _mtime_now
-            except OSError:
-                pass  # Can't stat — skip tracking for this entry
-
-            # Bound the per-task containers so a long CLI session doesn't
-            # accumulate megabytes of dict/set state.  See _cap_read_tracker_data.
-            _cap_read_tracker_data(task_data)
-
-        # Cross-agent file-state registry (separate from per-task read
-        # tracker above): records that THIS agent has read this path so
-        # write/patch can detect sibling-subagent writes that happened
-        # after our read.  Partial read when offset>1 or the read was
-        # truncated (large file with more content than limit covered).
-        # Outside the _read_tracker_lock so the registry's own locking
-        # isn't nested under ours.
-        try:
-            _partial = (offset > 1) or bool(result_dict.get("truncated"))
-            file_state.record_read(task_id, resolved_str, partial=_partial)
-        except Exception:
-            logger.debug("file_state.record_read failed", exc_info=True)
-
-        if count >= 4:
-            # Hard block: stop returning content to break the loop
-            return tool_error(
-                f"BLOCKED: You have read this exact file region {count} times in a row. "
-                "The content has NOT changed. You already have this information. "
-                "STOP re-reading and proceed with your task.",
-                path=path,
-                already_read=count,
-            )
-        elif count >= 3:
-            result_dict["_warning"] = (
-                f"You have read this exact file region {count} times consecutively. "
-                "The content has not changed since your last read. Use the information you already have. "
-                "If you are stuck in a loop, stop reading and proceed with writing or responding."
-            )
-
-        return json.dumps(result_dict, ensure_ascii=False)
+        return _finish_tracked_read(
+            result_dict,
+            path=path,
+            resolved_str=resolved_str,
+            offset=offset,
+            limit=limit,
+            task_id=task_id,
+        )
     except Exception as e:
         return tool_error(str(e))
 
@@ -2651,7 +2880,7 @@ def _check_file_reqs():
 
 READ_FILE_SCHEMA = {
     "name": "read_file",
-    "description": "Read a text file with line numbers and pagination. Use this instead of cat/head/tail in terminal. Output format: 'LINE_NUM|CONTENT'. Suggests similar filenames if not found. Use offset and limit for large files. Reads exceeding ~100K characters are truncated on a line boundary and return a next_offset; continue with offset to read the rest. Jupyter notebooks (.ipynb), Word documents (.docx), and Excel workbooks (.xlsx) are auto-extracted to readable text; PDF, legacy Office (.doc/.ppt/.xls), OpenDocument, RTF, and EPUB convert too when the optional anydoc converter is available (auto-installed on first use where installs are permitted). PDF conversion reads the text layer only: scanned/image pages yield no text, and when many pages come back empty the output ends with an EXTRACTION COVERAGE WARNING listing the affected pages — follow its instructions (render pages with pdftoppm and inspect via vision_analyze, or OCR) instead of treating the extraction as complete. NOTE: Cannot read images or other binary files — use vision_analyze for images.",
+    "description": "Read a text file with line numbers and pagination. Use this instead of cat/head/tail in terminal. Output format: 'LINE_NUM|CONTENT'. Suggests similar filenames if not found. Use offset and limit for large files. Reads exceeding ~100K characters are truncated on a line boundary and return a next_offset; continue with offset to read the rest. Jupyter notebooks (.ipynb), Word documents (.docx), and Excel workbooks (.xlsx) are auto-extracted to readable text; PDF, legacy Office (.doc/.ppt/.xls), OpenDocument, RTF, and EPUB convert too when the optional anydoc converter is available (auto-installed on first use where installs are permitted). PDF conversion reads the text layer only: scanned/image pages yield no text, and when many pages come back empty the output begins with an EXTRACTION COVERAGE WARNING listing the affected pages — follow its instructions (render pages with pdftoppm and inspect via vision_analyze, or OCR) instead of treating the extraction as complete. NOTE: Cannot read images or other binary files — use vision_analyze for images.",
     "parameters": {
         "type": "object",
         "properties": {

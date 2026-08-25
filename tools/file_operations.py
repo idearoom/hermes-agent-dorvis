@@ -60,6 +60,8 @@ WRITE_DENIED_PREFIXES = build_write_denied_prefixes(_HOME)
 
 _OSC_SEQUENCE_RE = re.compile(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
 _FENCE_MARKER_RE = re.compile(r"'?\x07?__HERMES_FENCE_[A-Za-z0-9]+__\x07?'?")
+_BASE64_RE = re.compile(r"[A-Za-z0-9+/]*={0,2}\Z")
+_BASE64_WHITESPACE_DELETE = str.maketrans("", "", " \t\r\n\v\f")
 
 
 def _strip_terminal_fence_leaks(text: str) -> str:
@@ -77,6 +79,14 @@ def _strip_terminal_fence_leaks(text: str) -> str:
             continue
         cleaned_lines.append(cleaned)
     return "".join(cleaned_lines)
+
+
+def _strict_base64_decoded_length(encoded: str) -> Optional[int]:
+    """Return decoded byte length without allocating the decoded payload."""
+    if len(encoded) % 4 or _BASE64_RE.fullmatch(encoded) is None:
+        return None
+    padding = 2 if encoded.endswith("==") else 1 if encoded.endswith("=") else 0
+    return (len(encoded) // 4) * 3 - padding
 
 
 def _detect_line_ending(sample: str) -> Optional[str]:
@@ -1818,17 +1828,45 @@ class ShellFileOperations(FileOperations):
                 error=f"File is too large ({file_size:,} bytes, limit is {max_bytes:,})",
             )
 
-        encoded = self._exec(f"base64 < {self._escape_shell_arg(path)}")
+        # The stat above is only an early rejection: a regular file can grow
+        # before this second command. When a caller supplies a cap, read at
+        # most cap+1 bytes so the terminal/backend can never buffer the whole
+        # raced file. ``head -c`` is available in every shell backend Hermes
+        # supports (including its Git Bash Windows terminal).
+        if max_bytes is None:
+            read_cmd = f"base64 < {self._escape_shell_arg(path)}"
+        else:
+            read_cmd = (
+                f"head -c {max_bytes + 1} {self._escape_shell_arg(path)} "
+                "2>/dev/null | base64"
+            )
+        encoded = self._exec(read_cmd)
         if encoded.exit_code != 0:
             return ReadResult(error=f"Failed to read binary file: {encoded.stdout}")
-        compact = "".join(_strip_terminal_fence_leaks(encoded.stdout).split())
-        try:
-            base64.b64decode(compact, validate=True)
-        except (ValueError, base64.binascii.Error):
+
+        transport = encoded.stdout
+        del encoded
+        # Normal base64 output contains no terminal framing; avoid the generic
+        # line-splitting sanitizer's large temporary list on multi-megabyte
+        # documents. Fall back to it only when a wrapper marker is present.
+        if "__HERMES_FENCE_" in transport or "\x1b]" in transport or "\x07" in transport:
+            transport = _strip_terminal_fence_leaks(transport)
+        compact = transport.translate(_BASE64_WHITESPACE_DELETE)
+        del transport
+        decoded_length = _strict_base64_decoded_length(compact)
+        if decoded_length is None:
             return ReadResult(error=f"Backend returned invalid binary data for: {path}")
+        if max_bytes is not None and decoded_length > max_bytes:
+            return ReadResult(
+                file_size=max(file_size, decoded_length),
+                error=(
+                    f"File is too large ({max(file_size, decoded_length):,} bytes, "
+                    f"limit is {max_bytes:,}); it grew while being read"
+                ),
+            )
         return ReadResult(
             base64_content=compact,
-            file_size=file_size,
+            file_size=decoded_length,
             is_binary=True,
         )
 

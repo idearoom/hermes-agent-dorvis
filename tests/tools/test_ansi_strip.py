@@ -54,6 +54,25 @@ class TestStripAnsiOSC:
             "\x1b]8;;https://example.com\x1b\\click\x1b]8;;\x1b\\"
         ) == "click"
 
+    def test_unterminated_osc_is_dropped_instead_of_rescanned_or_leaked(self):
+        assert strip_ansi("visible\x1b]" + ("untrusted" * 1_000)) == "visible"
+
+    def test_repeated_unterminated_osc_has_a_single_pass_work_bound(self):
+        class CountingText(str):
+            inspections = 0
+
+            def __getitem__(self, key):
+                if isinstance(key, int):
+                    self.inspections += 1
+                return super().__getitem__(key)
+
+        raw = CountingText("\x1b]" * 50_000)
+
+        assert strip_ansi(raw) == ""
+        # A stateful scanner inspects characters monotonically. This bound is
+        # deterministic and catches a fallback to suffix-rescanning regexes.
+        assert 0 < raw.inspections <= 2 * len(raw) + 8
+
 
 class TestStripAnsiDECPrivate:
     """DEC private / Fp escape sequences."""
@@ -94,6 +113,18 @@ class TestStripAnsiDCS:
     def test_dcs(self):
         assert strip_ansi("\x1bP+q\x1b\\") == ""
 
+    def test_all_control_string_families_and_partial_sequences(self):
+        for introducer in "PX^_":  # DCS, SOS, PM, APC
+            assert strip_ansi(f"left\x1b{introducer}payload\x1b\\right") == "leftright"
+            assert strip_ansi(f"left\x1b{introducer}unterminated") == "left"
+
+    def test_partial_csi_and_nf_sequences_are_not_leaked(self):
+        assert strip_ansi("left\x1b[38;2") == "left"
+        assert strip_ansi("left\x1b(") == "left"
+
+    def test_bare_escape_removal_preserves_unrelated_following_control(self):
+        assert strip_ansi("left\x1b\nright") == "left\nright"
+
 
 class TestStripAnsi8BitC1:
     """8-bit C1 control characters."""
@@ -106,6 +137,13 @@ class TestStripAnsi8BitC1:
         assert strip_ansi("\x9c") == ""
         assert strip_ansi("\x9d") == ""
         assert strip_ansi("\x90") == ""
+
+    def test_8bit_string_controls_complete_and_partial(self):
+        for introducer in ("\x90", "\x98", "\x9e", "\x9f"):
+            assert strip_ansi(f"left{introducer}payload\x9cright") == "leftright"
+            assert strip_ansi(f"left{introducer}unterminated") == "left"
+        assert strip_ansi("left\x9dtitle\x07right") == "leftright"
+        assert strip_ansi("left\x9dunterminated") == "left"
 
 
 class TestStripAnsiRealWorld:
