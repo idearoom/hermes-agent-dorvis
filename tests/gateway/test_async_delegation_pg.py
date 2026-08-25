@@ -15,6 +15,7 @@ recreates the ``hermes_state`` schema.
 import json
 import os
 import queue
+import time
 
 import pytest
 
@@ -149,7 +150,7 @@ def test_completion_round_trip_and_exclusive_claim(pg_store):
     ad._persist_completion(
         {
             "type": "async_delegation", "delegation_id": "deleg_claim",
-            "status": "completed", "completed_at": 2.0, "summary": "done",
+            "status": "completed", "completed_at": time.time(), "summary": "done",
         },
         {"status": "completed", "summary": "done"},
     )
