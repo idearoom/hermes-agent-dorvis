@@ -22,59 +22,60 @@ on:
     # blobs.
     branches: [main]
   pull_request:
-    # PR builds are validation-only (no push), so only run them when the change
-    # can actually affect the image. Mirrors docker-publish.yml's filter. The
-    # image bakes source via `COPY . .`, hence **/*.py; web/ui-tui- or docs-only
-    # PRs skip pre-merge validation and are covered by the unfiltered main build
-    # on merge (or a manual workflow_dispatch).
+    # PR builds are validation-only (no push). Keep this unfiltered: the image
+    # context includes runtime config, plugins, skills, shell scripts, the TUI,
+    # and the web app in addition to Python. A hand-maintained path allowlist
+    # silently loses coverage whenever that context grows.
     branches: [main]
-    paths:
-      - '**/*.py'
-      - 'pyproject.toml'
-      - 'uv.lock'
-      - 'Dockerfile'
-      - 'docker/**'
-      - '.github/workflows/idearoom-ghcr-publish.yml'
-      - '.github/actions/hermes-smoke-test/**'
-  workflow_dispatch:
-    inputs:
-      sha:
-        description: >-
-          Exact hermes-agent-dorvis commit to build and publish as sha-<commit>
-          (e.g. the reference/hermes-agent-dorvis gitlink idearoom-agents pins).
-          Leave blank to publish this branch's HEAD.
-        required: false
-        type: string
-
-permissions:
-  contents: read
-  packages: write
-
-# Never cancel a push/dispatch build: idearoom-agents pins the base image by
-# `sha-<commit>`, so every commit on main must get its own immutable tag. PR
-# runs (build + smoke only, no push) collapse to the latest commit.
+# Key publishing work by the exact push commit so GitHub concurrency cannot
+# replace an already-pending main image. PR validation runs still collapse to
+# the latest commit for that pull request.
 concurrency:
-  group: idearoom-ghcr-${{ github.event.pull_request.number || github.ref }}
+  group: idearoom-ghcr-${{ github.event.pull_request.number || github.sha }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   IMAGE_NAME: ghcr.io/idearoom/hermes-agent-dorvis
 
 jobs:
-  build-publish:
-    # Only the IdeaRoom fork publishes to its GHCR namespace; a no-op elsewhere
-    # (including NousResearch, were this file ever to reach it via a merge).
-    if: github.repository == 'idearoom/hermes-agent-dorvis'
-    # Build linux/arm64 images through QEMU on the standard hosted pool so
-    # manual SHA backfills do not depend on scarce native arm64 runners.
+  # PR code is intentionally isolated in a read-only job. A same-repository PR
+  # can execute its Dockerfile and smoke-test scripts, so it must never share a
+  # job token that can write packages.
+  validate-pr:
+    if: >-
+      github.repository == 'idearoom/hermes-agent-dorvis' &&
+      github.event_name == 'pull_request'
+    permissions:
+      contents: read
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
-      - name: Checkout code
+      - name: Checkout candidate code without retaining credentials
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
         with:
-          ref: ${{ inputs.sha || github.sha }}
+          ref: ${{ github.sha }}
           submodules: recursive
+          persist-credentials: false
+
+      - name: Resolve validation image identity
+        id: image
+        env:
+          EVENT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          revision="$(git rev-parse HEAD)"
+          if ! [[ "${revision}" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ ]]; then
+            echo "::error::Checkout did not resolve to a full lowercase Git SHA: ${revision}"
+            exit 1
+          fi
+          if [ "${EVENT_SHA}" != "${revision}" ]; then
+            echo "::error::PR event SHA ${EVENT_SHA} does not match checked-out commit ${revision}"
+            exit 1
+          fi
+          {
+            echo "revision=${revision}"
+            echo "local_image=${IMAGE_NAME}:pr-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          } >> "${GITHUB_OUTPUT}"
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130  # v3
@@ -84,19 +85,22 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f  # v3
 
-      # Build once for arm64 and load into the local daemon so the smoke tests
-      # run against the exact image before anything is pushed. The push step
-      # below is a cache hit on every layer.
-      - name: Build image (arm64, for smoke test)
+      - name: Build final validation image (arm64, loaded for smoke test)
         uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f  # v7.1.0
         with:
           context: .
           file: Dockerfile
           load: true
           platforms: linux/arm64
-          tags: ${{ env.IMAGE_NAME }}:smoke
+          tags: ${{ steps.image.outputs.local_image }}
+          labels: |
+            org.opencontainers.image.revision=${{ steps.image.outputs.revision }}
+            org.opencontainers.image.source=https://github.com/idearoom/hermes-agent-dorvis
+          build-args: |
+            HERMES_GIT_SHA=${{ steps.image.outputs.revision }}
+          provenance: false
+          sbom: false
           cache-from: type=gha,scope=ghcr-arm64
-          cache-to: type=gha,mode=max,scope=ghcr-arm64
 
       - name: Install uv for docker tests
         uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39  # 8.2.0
@@ -109,10 +113,126 @@ jobs:
 
       - name: Run docker smoke tests
         env:
-          HERMES_TEST_IMAGE: ${{ env.IMAGE_NAME }}:smoke
+          HERMES_TEST_IMAGE: ${{ steps.image.outputs.local_image }}
           OPENROUTER_API_KEY: ""
           OPENAI_API_KEY: ""
           NOUS_API_KEY: ""
+        run: scripts/run_tests.sh tests/docker/test_smoke.py --file-timeout 300 -- -v --tb=short
+
+  build-publish:
+    # Only the IdeaRoom fork publishes to its GHCR namespace; a no-op elsewhere
+    # (including NousResearch, were this file ever to reach it via a merge).
+    if: >-
+      github.repository == 'idearoom/hermes-agent-dorvis' &&
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
+      packages: write
+    # Build linux/arm64 through QEMU on the standard hosted pool rather than
+    # depending on scarce native arm64 runners.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    outputs:
+      digest: ${{ steps.publish.outputs.digest }}
+      image: ${{ steps.publish.outputs.image }}
+      revision: ${{ steps.image.outputs.revision }}
+      tag: ${{ steps.publish.outputs.tag }}
+    steps:
+      # Keep the workflow controller separate from the image source so the
+      # package-writing phase has an explicit trusted-code boundary.
+      - name: Checkout trusted workflow controller
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          ref: ${{ github.sha }}
+          path: .ci-control
+          fetch-depth: 1
+          persist-credentials: false
+          submodules: false
+
+      - name: Checkout candidate image source without retaining credentials
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          ref: ${{ github.sha }}
+          path: candidate
+          fetch-depth: 1
+          persist-credentials: false
+          submodules: recursive
+
+      - name: Resolve exact image identity
+        id: image
+        env:
+          EVENT_SHA: ${{ github.sha }}
+        working-directory: candidate
+        run: |
+          set -euo pipefail
+          revision="$(git rev-parse HEAD)"
+          controller_revision="$(git -C ../.ci-control rev-parse HEAD)"
+          if ! [[ "${revision}" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ ]]; then
+            echo "::error::Checkout did not resolve to a full lowercase Git SHA: ${revision}"
+            exit 1
+          fi
+          if [ "${controller_revision}" != "${EVENT_SHA}" ]; then
+            echo "::error::Trusted controller ${controller_revision} does not match event SHA ${EVENT_SHA}"
+            exit 1
+          fi
+          if [ "${EVENT_SHA}" != "${revision}" ]; then
+            echo "::error::Event SHA ${EVENT_SHA} does not match checked-out commit ${revision}"
+            exit 1
+          fi
+          {
+            echo "revision=${revision}"
+            echo "local_image=${IMAGE_NAME}:candidate-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+            echo "immutable_image=${IMAGE_NAME}:sha-${revision}"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130  # v3
+        with:
+          platforms: arm64
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f  # v3
+
+      # This is the one and only image build. OCI labels and the in-image build
+      # SHA are present before it is loaded and smoked. Publishing below tags
+      # and pushes this exact local image; it never invokes BuildKit again.
+      - name: Build final image (arm64, loaded for smoke test)
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f  # v7.1.0
+        with:
+          context: candidate
+          file: candidate/Dockerfile
+          load: true
+          platforms: linux/arm64
+          tags: ${{ steps.image.outputs.local_image }}
+          labels: |
+            org.opencontainers.image.revision=${{ steps.image.outputs.revision }}
+            org.opencontainers.image.source=https://github.com/idearoom/hermes-agent-dorvis
+          build-args: |
+            HERMES_GIT_SHA=${{ steps.image.outputs.revision }}
+          provenance: false
+          sbom: false
+          cache-from: type=gha,scope=ghcr-arm64
+          cache-to: type=gha,mode=max,scope=ghcr-arm64
+
+      - name: Install uv for docker tests
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39  # 8.2.0
+
+      - name: Set up Python 3.11 for docker tests
+        working-directory: candidate
+        run: uv python install 3.11
+
+      - name: Install Python dependencies for docker tests
+        working-directory: candidate
+        run: uv sync --locked --python 3.11 --extra dev
+
+      - name: Run docker smoke tests
+        env:
+          HERMES_TEST_IMAGE: ${{ steps.image.outputs.local_image }}
+          OPENROUTER_API_KEY: ""
+          OPENAI_API_KEY: ""
+          NOUS_API_KEY: ""
+        working-directory: candidate
         run: scripts/run_tests.sh tests/docker/test_smoke.py --file-timeout 300 -- -v --tb=short
 
       # Everything below pushes -- skipped on pull_request (build + smoke only).
@@ -124,39 +244,32 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # `sha-<full-sha>` on every push/dispatch (immutable -- what idearoom-agents
-      # pins to). On a manual dispatch the SHA is the `sha` input when given (so
-      # an explicit pin can be backfilled), else the checked-out commit. `latest`
-      # only advances on an actual push to main -- never on a manual backfill,
-      # which would otherwise point latest at an old commit.
-      - name: Compute tags
-        id: tags
+      # The helper fails closed unless a pre-existing sha-* tag resolves to the
+      # same image config digest as the local image. When absent, it pushes the
+      # already-smoked local image once, reads the registry manifest back, and
+      # exports its distinct registry digest for parent-repo pinning.
+      - name: Publish immutable image and attest registry digest
+        id: publish
         if: github.event_name != 'pull_request'
         env:
-          TARGET_SHA: ${{ inputs.sha || github.sha }}
-          EVENT_NAME: ${{ github.event_name }}
+          LOCAL_IMAGE: ${{ steps.image.outputs.local_image }}
+          IMMUTABLE_IMAGE: ${{ steps.image.outputs.immutable_image }}
+          REVISION: ${{ steps.image.outputs.revision }}
+        working-directory: candidate
         run: |
           set -euo pipefail
-          {
-            echo "tags<<EOF"
-            echo "${IMAGE_NAME}:sha-${TARGET_SHA}"
-            if [ "${EVENT_NAME}" = "push" ] && [ "${GITHUB_REF}" = "refs/heads/main" ]; then
-              echo "${IMAGE_NAME}:latest"
-            fi
-            echo "EOF"
-          } >> "$GITHUB_OUTPUT"
+          python3 -I ../.ci-control/scripts/ci/publish_immutable_image.py \
+            --local-image "${LOCAL_IMAGE}" \
+            --immutable-image "${IMMUTABLE_IMAGE}" \
+            --expected-revision "${REVISION}" \
+            --expected-source "https://github.com/idearoom/hermes-agent-dorvis" \
+            --artifact-file ghcr-image.json
 
-      - name: Build + push (arm64, cache hit from smoke build)
+      - name: Upload immutable image identity
         if: github.event_name != 'pull_request'
-        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f  # v7.1.0
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7
         with:
-          context: .
-          file: Dockerfile
-          push: true
-          platforms: linux/arm64
-          labels: |
-            org.opencontainers.image.revision=${{ inputs.sha || github.sha }}
-            org.opencontainers.image.source=https://github.com/idearoom/hermes-agent-dorvis
-          tags: ${{ steps.tags.outputs.tags }}
-          cache-from: type=gha,scope=ghcr-arm64
-          cache-to: type=gha,mode=max,scope=ghcr-arm64
+          name: ghcr-image-${{ steps.image.outputs.revision }}
+          path: candidate/ghcr-image.json
+          if-no-files-found: error
+          retention-days: 30
