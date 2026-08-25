@@ -127,11 +127,12 @@ def test_write_large_output_handoff_falls_back_when_first_dir_is_unwritable(
 
 
 @pytest.mark.parametrize("error_type", [OSError, ImportError, KeyError])
+@pytest.mark.windows_only
 def test_temporary_handoff_owner_falls_back_when_username_is_unavailable(
     monkeypatch,
     error_type,
 ):
-    monkeypatch.delattr(large_output_handoff.os, "getuid", raising=False)
+    assert not hasattr(large_output_handoff.os, "getuid")
     monkeypatch.setattr(
         getpass,
         "getuser",
