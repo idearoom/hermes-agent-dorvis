@@ -6,7 +6,9 @@ converter, the rebase-drift schema guard, the row shim, and the
 lives in ``test_session_store_pg.py`` (guarded by HERMES_STATE_TEST_DSN).
 """
 
+import hashlib
 import inspect
+from pathlib import Path
 import sqlite3
 import threading
 
@@ -26,6 +28,20 @@ from hermes_state_pg import (
     assert_schema_compat,
     schema_surface_hash,
 )
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+_V22_SCHEMA_FIXTURE = _REPO_ROOT / "tests" / "fixtures" / "hermes_state_pg_v22.sql"
+_V22_SCHEMA_FIXTURE_SHA256 = (
+    "f6ab4089f35bfc5d022cc967339d6cd3d831c5591d7f669d53eb46ee17289894"
+)
+
+
+def test_frozen_v22_schema_fixture_is_pinned():
+    fixture = _V22_SCHEMA_FIXTURE.read_bytes()
+
+    assert hashlib.sha256(fixture).hexdigest() == _V22_SCHEMA_FIXTURE_SHA256
+    assert fixture.count(b"-- hermes-v22-statement\n") == 29
+    assert b"2c3c480648fc0455c2ef6948f5d5451e38f83c12" in fixture
 
 
 # ── Statement translator ────────────────────────────────────────────────────

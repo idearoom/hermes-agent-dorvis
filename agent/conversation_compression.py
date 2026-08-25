@@ -1174,6 +1174,8 @@ def _emit_compression_attempt_telemetry(
         payload["split_status"] = split_status
         if failure_class:
             payload["failure_class"] = failure_class
+        else:
+            payload.pop("failure_class", None)
         payload.setdefault("chunking", False)
         payload.setdefault("chunk_count", 0)
         payload["fallback_used"] = bool(
@@ -3055,7 +3057,12 @@ def compress_context(
             # completed boundary while a true no-op becomes a soft defer.
             agent._compression_skipped_due_to_lock = existing or True
 
-            def _finish_lock_contention_attempt() -> None:
+            def _finish_lock_contention_attempt(
+                *,
+                commit_status: str = "aborted",
+                split_status: str = "aborted",
+                failure_class: str | None = "lock_contended",
+            ) -> None:
                 try:
                     begin_telemetry = getattr(
                         agent.context_compressor,
@@ -3069,9 +3076,9 @@ def compress_context(
                 _emit_compression_attempt_telemetry(
                     agent,
                     started_at=_attempt_started_at,
-                    commit_status="aborted",
-                    split_status="aborted",
-                    failure_class="lock_contended",
+                    commit_status=commit_status,
+                    split_status=split_status,
+                    failure_class=failure_class,
                 )
                 _complete_compaction_lifecycle()
 
@@ -3211,7 +3218,15 @@ def compress_context(
                                     waited_seconds=round(_waited, 3),
                                     **_compression_diagnostics(agent),
                                 )
-                                _finish_lock_contention_attempt()
+                                _finish_lock_contention_attempt(
+                                    commit_status="committed",
+                                    split_status=(
+                                        "in_place_adopted"
+                                        if _adopted_in_place
+                                        else "rotated_adopted"
+                                    ),
+                                    failure_class=None,
+                                )
                                 return _adopted, _existing_sp
                         finally:
                             if _adoption_fence_entered:

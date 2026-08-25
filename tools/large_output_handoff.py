@@ -133,7 +133,11 @@ def _temporary_handoff_owner() -> str:
     getuid = getattr(os, "getuid", None)
     if callable(getuid):
         return str(getuid())
-    return _safe_component(getpass.getuser())
+    try:
+        username = getpass.getuser()
+    except (OSError, ImportError, KeyError):
+        username = "default"
+    return _safe_component(username)
 
 
 def _safe_component(value: str) -> str:

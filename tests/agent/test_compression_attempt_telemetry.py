@@ -3,7 +3,10 @@ import logging
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from agent.conversation_compression import compress_context
+from agent.conversation_compression import (
+    _emit_compression_attempt_telemetry,
+    compress_context,
+)
 from agent.context_compressor import ContextCompressor
 
 
@@ -59,6 +62,28 @@ def _extract_telemetry(caplog):
     ]
     assert len(records) == 1
     return json.loads(records[0].split("context compression attempt telemetry: ", 1)[1])
+
+
+def test_successful_compression_telemetry_clears_stale_failure_class(caplog):
+    agent = SimpleNamespace(
+        session_id="session-telemetry-test",
+        context_compressor=SimpleNamespace(
+            _last_compression_telemetry={"failure_class": "stale_failure"},
+            _last_summary_fallback_used=False,
+            _last_aux_model_failure_model=None,
+        ),
+    )
+
+    with caplog.at_level(logging.INFO, logger="agent.conversation_compression"):
+        _emit_compression_attempt_telemetry(
+            agent,
+            started_at=0.0,
+            commit_status="committed",
+            split_status="in_place_adopted",
+            failure_class=None,
+        )
+
+    assert "failure_class" not in _extract_telemetry(caplog)
 
 
 def test_compression_attempt_telemetry_is_metadata_only(caplog):

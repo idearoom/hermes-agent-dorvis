@@ -41,6 +41,9 @@ import hermes_state_pg
 from hermes_state_pg import _SCHEMA, EXPECTED_SCHEMA_VERSION, PgSessionDB
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
+_V22_SCHEMA_FIXTURE = _REPO_ROOT / "tests" / "fixtures" / "hermes_state_pg_v22.sql"
+_V22_SURFACE_MARKER = "ffb802aede5aab2e95d1eb46188864c11b4b8e290c538ada64c06b9a14747654"
+_V22_STATEMENT_DELIMITER = "-- hermes-v22-statement\n"
 
 
 def _drop_schema():
@@ -380,64 +383,23 @@ def test_boot_fails_on_persisted_surface_mismatch(pg_db):
 # ── drained v22 → v26 explicit migration ────────────────────────────────────
 
 
-_V26_ONLY_COLUMNS = {
-    "sessions": (
-        "system_prompt_hash",
-        "git_metadata_generation",
-        "title_source",
-        "last_activity_at",
-        "last_activity_description",
-        "last_activity_provenance",
-        "compression_ineffective_count",
-        "pinned",
-        "hidden",
-        "last_read_at",
-    ),
-    "messages": ("display_kind", "display_metadata"),
-    "async_delegations": ("origin_session_id",),
-}
-_V26_ONLY_INDEXES = (
-    "idx_messages_session_id",
-    "idx_messages_assistant_calls_by_session",
-    "idx_session_turn_leases_expires",
-    "idx_sessions_system_prompt_hash",
-    "idx_sessions_title_unique",
-)
-_V26_ONLY_TABLES = (
-    "gateway_hygiene_state",
-    "session_turn_leases",
-    "system_prompts",
-)
-
-
-def _rewind_store_to_v22(conn):
-    """Restore the exact audited Postgres catalog that production v22 uses."""
-    # v26 moved inline prompts into the content-addressed table. Rehydrate the
-    # predecessor column before dropping that table and its reference.
+def _create_frozen_v22_store(conn):
+    """Create the exact predecessor catalog without consulting v26 DDL."""
+    fixture = _V22_SCHEMA_FIXTURE.read_text(encoding="utf-8")
+    statements = [
+        statement.strip()
+        for statement in fixture.split(_V22_STATEMENT_DELIMITER)[1:]
+        if statement.strip()
+    ]
+    assert statements, "frozen v22 schema fixture contains no statements"
+    for statement in statements:
+        conn.execute(statement)
     conn.execute(
-        f"UPDATE {_SCHEMA}.sessions AS session "
-        f"SET system_prompt = prompt.prompt "
-        f"FROM {_SCHEMA}.system_prompts AS prompt "
-        "WHERE session.system_prompt_hash = prompt.hash"
+        f"INSERT INTO {_SCHEMA}.schema_version (version) VALUES (22)"
     )
     conn.execute(
-        f"ALTER TABLE {_SCHEMA}.sessions "
-        "DROP CONSTRAINT IF EXISTS sessions_system_prompt_hash_fkey"
-    )
-    for index in _V26_ONLY_INDEXES:
-        conn.execute(f"DROP INDEX IF EXISTS {_SCHEMA}.{index}")
-    for table, columns in _V26_ONLY_COLUMNS.items():
-        for column in columns:
-            conn.execute(
-                f"ALTER TABLE {_SCHEMA}.{table} DROP COLUMN IF EXISTS {column}"
-            )
-    for table in _V26_ONLY_TABLES:
-        conn.execute(f"DROP TABLE IF EXISTS {_SCHEMA}.{table}")
-    conn.execute(f"UPDATE {_SCHEMA}.schema_version SET version = 22")
-    conn.execute(
-        f"UPDATE {_SCHEMA}.state_meta SET value = %s "
-        "WHERE key = 'pg_backend_schema_surface_sha256'",
-        (hermes_state_pg._V22_SCHEMA_SURFACE_SHA256,),
+        f"INSERT INTO {_SCHEMA}.state_meta (key, value) VALUES (%s, %s)",
+        ("pg_backend_schema_surface_sha256", _V22_SURFACE_MARKER),
     )
 
 
@@ -489,36 +451,39 @@ def test_migration_mode_refuses_absent_schema_without_initializing_it():
         ).fetchone()[0] is None
 
 
-def test_v22_requires_explicit_migration_and_preserves_rows(pg_db):
-    old = pg_db.create_session(
-        "sess-v22-old",
-        "webui",
-        model="m1",
-        system_prompt="shared legacy prompt",
-    )
-    new = pg_db.create_session(
-        "sess-v22-new",
-        "webui",
-        model="m1",
-        system_prompt="shared legacy prompt",
-    )
-    pg_db.append_message(old, "user", "written before the migration")
-    pg_db.update_token_counts(old, input_tokens=10, output_tokens=5)
-    pg_db.close()
-
+def test_v22_requires_explicit_migration_and_preserves_rows():
+    old = "sess-v22-old"
+    new = "sess-v22-new"
+    _drop_schema()
     with psycopg.connect(_DSN, autocommit=True) as conn:
-        _rewind_store_to_v22(conn)
-        # v22 had no title provenance/unique index. Exercise deterministic
-        # duplicate repair: the newest row keeps the title.
+        _create_frozen_v22_store(conn)
         conn.execute(
-            f"UPDATE {_SCHEMA}.sessions SET started_at = %s, title = %s "
-            "WHERE id = %s",
-            (10.0, "duplicate", old),
+            f"INSERT INTO {_SCHEMA}.sessions "
+            "(id, source, model, system_prompt, started_at, title, "
+            "message_count, input_tokens, output_tokens) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
+            (
+                old,
+                "webui",
+                "m1",
+                "shared legacy prompt",
+                10.0,
+                "duplicate",
+                1,
+                10,
+                5,
+            ),
         )
         conn.execute(
-            f"UPDATE {_SCHEMA}.sessions SET started_at = %s, title = %s "
-            "WHERE id = %s",
-            (20.0, "duplicate", new),
+            f"INSERT INTO {_SCHEMA}.sessions "
+            "(id, source, model, system_prompt, started_at, title) "
+            "VALUES (%s, %s, %s, %s, %s, %s)",
+            (new, "webui", "m1", "shared legacy prompt", 20.0, "duplicate"),
+        )
+        conn.execute(
+            f"INSERT INTO {_SCHEMA}.messages "
+            "(session_id, role, content, timestamp) VALUES (%s, %s, %s, %s)",
+            (old, "user", "written before the migration", 11.0),
         )
         before = _catalog_signature(conn)
 
@@ -596,10 +561,10 @@ def test_v22_requires_explicit_migration_and_preserves_rows(pg_db):
     assert "requires schema_version 22 exactly" in replay.stderr
 
 
-def test_migration_preflight_rejects_partial_v22_without_widening(pg_db):
-    pg_db.close()
+def test_migration_preflight_rejects_partial_v22_without_widening():
+    _drop_schema()
     with psycopg.connect(_DSN, autocommit=True) as conn:
-        _rewind_store_to_v22(conn)
+        _create_frozen_v22_store(conn)
         conn.execute(
             f"ALTER TABLE {_SCHEMA}.sessions DROP COLUMN compression_fallback_streak"
         )
@@ -847,7 +812,7 @@ def test_concurrent_cold_boot_bootstrap(tmp_path):
     check-then-insert."""
     _drop_schema()
     worker = tmp_path / "cold_boot_worker.py"
-    worker.write_text(_COLD_BOOT_WORKER_SRC)
+    worker.write_text(_COLD_BOOT_WORKER_SRC, encoding="utf-8")
     start_at = time.time() + 1.5
     procs = [
         subprocess.Popen(
@@ -878,7 +843,7 @@ def test_two_process_concurrent_smoke(pg_db, tmp_path):
     distinct sessions plus lock contention on a shared session."""
     shared = pg_db.create_session("proc-shared", "webui")
     worker = tmp_path / "worker.py"
-    worker.write_text(_WORKER_SRC)
+    worker.write_text(_WORKER_SRC, encoding="utf-8")
     procs = [
         subprocess.Popen(
             [sys.executable, str(worker), _DSN, name, shared, str(_REPO_ROOT)],

@@ -126,5 +126,20 @@ def test_write_large_output_handoff_falls_back_when_first_dir_is_unwritable(
     assert json.loads(full_output_path.read_text(encoding="utf-8")) == [{"row": 1}]
 
 
+@pytest.mark.parametrize("error_type", [OSError, ImportError, KeyError])
+def test_temporary_handoff_owner_falls_back_when_username_is_unavailable(
+    monkeypatch,
+    error_type,
+):
+    monkeypatch.delattr(large_output_handoff.os, "getuid", raising=False)
+    monkeypatch.setattr(
+        getpass,
+        "getuser",
+        lambda: (_ for _ in ()).throw(error_type("no user identity")),
+    )
+
+    assert large_output_handoff._temporary_handoff_owner() == "default"
+
+
 def test_sanitize_output_text_keeps_small_clean_text_unchanged():
     assert sanitize_output_text("plain output") == "plain output"

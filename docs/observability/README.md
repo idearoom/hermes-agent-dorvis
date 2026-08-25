@@ -281,6 +281,18 @@ are intentionally excluded.
 Observers can use these hooks to model nested trajectories while keeping child
 agent execution linked to the parent turn that spawned it.
 
+### Compression Attempt Log Events
+
+Each context-compression attempt emits one content-free
+`compression_attempt` JSON log event. `commit_status` is `committed` when the
+live transcript is durably compacted and `aborted` otherwise. `split_status`
+distinguishes `not_applicable`, `pending`, `in_place_committed`,
+`rotated_committed`, `in_place_adopted`, `rotated_adopted`,
+`failed_not_indexed`, and `aborted`. The `*_adopted` outcomes mean this agent
+lost the compression lock but converged on the winner's durable transcript;
+they do not represent a second summarizer run. Successful events omit
+`failure_class`.
+
 ## Payload Safety
 
 Observer payloads are designed for telemetry consumers, not raw object access.

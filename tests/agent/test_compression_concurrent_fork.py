@@ -1943,7 +1943,7 @@ def _seed_history(db: SessionDB, session_id: str, count: int) -> list:
     return history
 
 
-def test_race_loser_adopts_winner_compacted_state(tmp_path: Path) -> None:
+def test_race_loser_adopts_winner_compacted_state(tmp_path: Path, caplog) -> None:
     """Two real threads race one session: the loser must adopt, not double.
 
     The winner compacts in place; the loser (mid-turn, holding the same
@@ -2003,10 +2003,11 @@ def test_race_loser_adopts_winner_compacted_state(tmp_path: Path) -> None:
         threading.Thread(target=_run_winner, name="winner"),
         threading.Thread(target=_run_loser, name="loser"),
     ]
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join(timeout=30)
+    with caplog.at_level(logging.INFO, logger="agent.conversation_compression"):
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=30)
     assert not any(thread.is_alive() for thread in threads)
 
     assert winner_result and loser_result
@@ -2049,10 +2050,20 @@ def test_race_loser_adopts_winner_compacted_state(tmp_path: Path) -> None:
     #    transcript we just adopted.
     assert loser.context_compressor.last_prompt_tokens == -1
     assert loser.context_compressor.awaiting_real_usage_after_compression is True
+    adopted_telemetry = [
+        json.loads(record.getMessage().split(": ", 1)[1])
+        for record in caplog.records
+        if "context compression attempt telemetry:" in record.getMessage()
+        and '"split_status":"in_place_adopted"' in record.getMessage()
+    ]
+    assert len(adopted_telemetry) == 1
+    assert adopted_telemetry[0]["commit_status"] == "committed"
+    assert adopted_telemetry[0].get("failure_class") is None
 
 
 def test_race_loser_adopts_rotated_child_and_preserves_live_tail(
     tmp_path: Path,
+    caplog,
 ) -> None:
     """A lock loser follows a rotating winner without dropping its live turn.
 
@@ -2095,11 +2106,12 @@ def test_race_loser_adopts_rotated_child_and_preserves_live_tail(
     messages.append({"role": "user", "content": "preserve this live turn"})
     loser._persist_user_message_idx = len(history)
 
-    adopted, _system_prompt = loser._compress_context(
-        messages,
-        "sys",
-        approx_tokens=120_000,
-    )
+    with caplog.at_level(logging.INFO, logger="agent.conversation_compression"):
+        adopted, _system_prompt = loser._compress_context(
+            messages,
+            "sys",
+            approx_tokens=120_000,
+        )
     publisher.join(timeout=5)
     assert not publisher.is_alive()
 
@@ -2128,6 +2140,16 @@ def test_race_loser_adopts_rotated_child_and_preserves_live_tail(
     ]
     assert _count_children(db, parent_sid) == 1
     assert db.get_compression_lock_holder(parent_sid) is None
+
+    telemetry_records = [
+        json.loads(record.getMessage().split(": ", 1)[1])
+        for record in caplog.records
+        if "context compression attempt telemetry:" in record.getMessage()
+    ]
+    assert len(telemetry_records) == 1
+    assert telemetry_records[0]["commit_status"] == "committed"
+    assert telemetry_records[0]["split_status"] == "rotated_adopted"
+    assert telemetry_records[0].get("failure_class") is None
 
 
 def test_lock_wait_cancellation_prevents_late_adoption(
