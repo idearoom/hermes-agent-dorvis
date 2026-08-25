@@ -74,10 +74,15 @@ Environment contract (all optional):
   PUT (default 15).
 * ``HERMES_TASK_PROTECTION_RENEW_SECONDS`` — renew cadence while runs are
   active (default 300).
+* ``HERMES_TASK_PROTECTION_HTTP_TIMEOUT_SECONDS`` — bounded ECS-agent request
+  timeout (default 3; clamped to 0.1–10 seconds).
+* ``HERMES_TASK_PROTECTION_FAILURE_BACKOFF_SECONDS`` — fail-closed admission
+  backoff after a protection request fails (default 2).
 """
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import inspect
 import json
 import logging
@@ -89,6 +94,11 @@ import urllib.request
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
+
+_TASK_PROTECTION_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+    max_workers=1,
+    thread_name_prefix="hermes-task-protection",
+)
 
 # Programmatically detectable refusal contract: HTTP 503 with an OpenAI-style
 # error envelope carrying this code. Clients (Hermes web, the agent-platform
@@ -103,6 +113,8 @@ DEFAULT_FORCE_GRACE_SECONDS = 30.0
 DEFAULT_PROTECTION_EXPIRES_MINUTES = 15
 DEFAULT_PROTECTION_RENEW_SECONDS = 300.0
 DEFAULT_PROTECTION_CHECK_SECONDS = 15.0
+DEFAULT_TASK_PROTECTION_HTTP_TIMEOUT_SECONDS = 3.0
+DEFAULT_TASK_PROTECTION_FAILURE_BACKOFF_SECONDS = 2.0
 
 
 def _positive_float_env(name: str, default: float) -> float:
@@ -360,9 +372,27 @@ class EcsTaskProtection:
                 )
             )
         self._expires_minutes = max(1, int(expires_minutes))
+        self._http_timeout_seconds = min(
+            10.0,
+            max(
+                0.1,
+                _positive_float_env(
+                    "HERMES_TASK_PROTECTION_HTTP_TIMEOUT_SECONDS",
+                    DEFAULT_TASK_PROTECTION_HTTP_TIMEOUT_SECONDS,
+                ),
+            ),
+        )
+        self._failure_backoff_seconds = max(
+            0.0,
+            _positive_float_env(
+                "HERMES_TASK_PROTECTION_FAILURE_BACKOFF_SECONDS",
+                DEFAULT_TASK_PROTECTION_FAILURE_BACKOFF_SECONDS,
+            ),
+        )
         self._http_call = http_call or self._default_http_call
         self._protected = False
         self._last_set_monotonic = 0.0
+        self._last_protect_failure_monotonic = 0.0
         # Incremented under _operation_lock for every admitted work item,
         # including admissions that reuse a fresh SET acknowledgement. An idle
         # snapshot taken on the asyncio owner thread carries this fence into
@@ -402,8 +432,7 @@ class EcsTaskProtection:
     def endpoint(self) -> str:
         return f"{self._agent_uri}/task-protection/v1/state"
 
-    @staticmethod
-    def _default_http_call(url: str, payload: Dict[str, Any]) -> None:
+    def _default_http_call(self, url: str, payload: Dict[str, Any]) -> None:
         data = json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(
             url,
@@ -411,7 +440,9 @@ class EcsTaskProtection:
             method="PUT",
             headers={"Content-Type": "application/json"},
         )
-        with urllib.request.urlopen(req, timeout=10) as resp:  # nosec B310 - link-local ECS agent URI from the task metadata contract
+        with urllib.request.urlopen(  # nosec B310 - link-local ECS agent URI from the task metadata contract
+            req, timeout=self._http_timeout_seconds
+        ) as resp:
             resp.read()
 
     def _log_noop_once(self) -> None:
@@ -425,6 +456,19 @@ class EcsTaskProtection:
 
     def _set_protection_locked(self, protect: bool) -> bool:
         """Perform one blocking PUT while ``_operation_lock`` is held."""
+        now = time.monotonic()
+        if (
+            protect
+            and self._last_protect_failure_monotonic > 0
+            and now - self._last_protect_failure_monotonic
+            < self._failure_backoff_seconds
+        ):
+            logger.debug(
+                "drain-mode: task-protection admission remains in %.1fs "
+                "failure backoff; refusing without another blocking PUT",
+                self._failure_backoff_seconds,
+            )
+            return False
         payload: Dict[str, Any] = {"ProtectionEnabled": bool(protect)}
         if protect:
             payload["ExpiresInMinutes"] = self._expires_minutes
@@ -439,6 +483,8 @@ class EcsTaskProtection:
             # every subsequent admission must obtain a fresh SET response.
             self._protected = False
             self._last_set_monotonic = 0.0
+            if protect:
+                self._last_protect_failure_monotonic = time.monotonic()
             # Loud but non-fatal: without protection ECS may scale this task
             # in mid-run, but crashing the gateway here would kill the runs
             # immediately and for certain.
@@ -448,6 +494,7 @@ class EcsTaskProtection:
                 protect, self.endpoint, exc,
             )
             return False
+        self._last_protect_failure_monotonic = 0.0
         self._protected = bool(protect)
         self._last_set_monotonic = time.monotonic()
         logger.info(
@@ -525,13 +572,22 @@ class EcsTaskProtection:
         if not self.enabled:
             self._log_noop_once()
             return True
-        return await asyncio.to_thread(self.set_protection_sync, protect)
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            _TASK_PROTECTION_EXECUTOR,
+            self.set_protection_sync,
+            protect,
+        )
 
     async def ensure_protected(self) -> bool:
         if not self.enabled:
             self._log_noop_once()
             return True
-        return await asyncio.to_thread(self.ensure_protected_sync)
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            _TASK_PROTECTION_EXECUTOR,
+            self.ensure_protected_sync,
+        )
 
     async def reconcile(
         self,
@@ -555,11 +611,14 @@ class EcsTaskProtection:
                 exc_info=True,
             )
             active = 1
-        return await asyncio.to_thread(
-            self.reconcile_sync,
-            active,
-            renew_seconds=renew_seconds,
-            observed_admission_epoch=observed_admission_epoch,
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            _TASK_PROTECTION_EXECUTOR,
+            lambda: self.reconcile_sync(
+                active,
+                renew_seconds=renew_seconds,
+                observed_admission_epoch=observed_admission_epoch,
+            ),
         )
 
 

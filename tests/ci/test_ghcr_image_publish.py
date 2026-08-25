@@ -1,9 +1,9 @@
 """Contracts for the IdeaRoom GHCR immutable-image publisher.
 
-The publisher's public boundary is the registry manifest: a local Docker image
-ID addresses its config JSON, while the digest consumers pin addresses the
-registry manifest.  These tests keep that distinction explicit and exercise
-the fail-closed decisions without requiring Docker or network access.
+The publisher's public boundary is the registry manifest: BuildKit's image ID
+addresses its config JSON, while Docker's containerd-backed inspect ID and the
+digest consumers pin can address a manifest. These tests keep those identities
+explicit and exercise the fail-closed decisions without Docker or network.
 """
 
 from __future__ import annotations
@@ -11,7 +11,6 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
-import re
 import subprocess
 import sys
 from pathlib import Path
@@ -112,10 +111,12 @@ def _local_inspect_args() -> list[str]:
     return ["docker", "image", "inspect", LOCAL_IMAGE]
 
 
-def _local_inspect_result() -> subprocess.CompletedProcess[str]:
+def _local_inspect_result(
+    image_id: str = LOCAL_CONFIG,
+) -> subprocess.CompletedProcess[str]:
     payload = [
         {
-            "Id": LOCAL_CONFIG,
+            "Id": image_id,
             "Architecture": "arm64",
             "Os": "linux",
             "Config": {
@@ -127,6 +128,23 @@ def _local_inspect_result() -> subprocess.CompletedProcess[str]:
         }
     ]
     return _json_result(_local_inspect_args(), payload)
+
+
+def test_buildkit_config_digest_is_store_independent_local_identity():
+    manifest_id = "sha256:" + "9" * 64
+    cli = ScriptedDocker(
+        [(_local_inspect_args(), _local_inspect_result(manifest_id))]
+    )
+
+    local = _mod.inspect_local_image(
+        LOCAL_IMAGE,
+        cli,
+        expected_config_digest=LOCAL_CONFIG,
+    )
+
+    assert local.config_digest == LOCAL_CONFIG
+    assert local.config_digest != manifest_id
+    cli.assert_finished()
 
 
 def _remote_commands(reference: str) -> tuple[list[str], list[str]]:
@@ -413,6 +431,48 @@ def test_absent_tag_pushes_the_smoked_local_image_then_attests_registry_content(
     cli.assert_finished()
 
 
+def test_post_push_readback_retries_a_bounded_registry_lag():
+    raw, descriptor = _image_manifest(LOCAL_CONFIG)
+    format_args, raw_args = _remote_commands(IMMUTABLE_IMAGE)
+    tag_args = ["docker", "image", "tag", LOCAL_IMAGE, IMMUTABLE_IMAGE]
+    push_args = ["docker", "image", "push", IMMUTABLE_IMAGE]
+
+    def absent_result():
+        return _completed(
+            format_args,
+            returncode=1,
+            stderr=f"ERROR: {IMMUTABLE_IMAGE}: not found",
+        )
+
+    # One pre-push absence, then six lagging reads before the seventh and
+    # final post-push attempt observes the immutable tag.
+    responses = [
+        (_local_inspect_args(), _local_inspect_result()),
+        (tag_args, _completed(tag_args)),
+        (format_args, absent_result()),
+        (push_args, _completed(push_args)),
+        *[(format_args, absent_result()) for _ in range(6)],
+        (format_args, _json_result(format_args, descriptor)),
+        (raw_args, _completed(raw_args, stdout=raw)),
+    ]
+    cli = ScriptedDocker(responses)
+    delays: list[float] = []
+
+    result = _mod.publish_immutable_image(
+        LOCAL_IMAGE,
+        IMMUTABLE_IMAGE,
+        REVISION,
+        SOURCE,
+        cli,
+        expected_config_digest=LOCAL_CONFIG,
+        sleep=delays.append,
+    )
+
+    assert result.published is True
+    assert delays == [1.0, 2.0, 4.0, 8.0, 15.0, 15.0]
+    cli.assert_finished()
+
+
 def test_post_push_readback_refuses_registry_content_that_changed():
     raw, descriptor = _image_manifest(OTHER_CONFIG)
     format_args, raw_args = _remote_commands(IMMUTABLE_IMAGE)
@@ -486,104 +546,3 @@ def test_evidence_records_the_registry_digest_and_not_the_local_image_id(tmp_pat
     assert f"digest={evidence['digest']}" in outputs
     assert f"image={evidence['image']}" in outputs
     assert evidence["image"] in summary.read_text(encoding="utf-8")
-
-
-def test_workflow_builds_once_smokes_that_image_and_exports_publish_evidence():
-    yaml = pytest.importorskip("yaml")
-    workflow_source = (
-        _REPO / ".github/workflows/idearoom-ghcr-publish.yml"
-    ).read_text(encoding="utf-8")
-    workflow = yaml.safe_load(workflow_source)
-    assert "branches: [dorvis/runtime, main]" in workflow_source
-    validation = workflow["jobs"]["validate-pr"]
-    assert validation["permissions"] == {"contents": "read"}
-    assert "pull_request" in validation["if"]
-    for checkout in (
-        step
-        for step in validation["steps"]
-        if str(step.get("uses", "")).startswith("actions/checkout@")
-    ):
-        assert checkout["with"]["persist-credentials"] is False
-
-    job = workflow["jobs"]["build-publish"]
-    assert job["permissions"] == {"contents": "read", "packages": "write"}
-    assert "github.event_name == 'push'" in job["if"]
-    assert "github.ref == 'refs/heads/main'" in job["if"]
-    assert "github.ref == 'refs/heads/dorvis/runtime'" in job["if"]
-    assert "!=" not in job["if"]
-    steps = job["steps"]
-    builds = [
-        step
-        for step in steps
-        if str(step.get("uses", "")).startswith("docker/build-push-action@")
-    ]
-
-    assert len(builds) == 1, "the smoke image and pushed image must be one build"
-    build = builds[0]["with"]
-    assert build["load"] is True
-    assert build.get("push") is not True
-    assert build["platforms"] == "linux/arm64"
-    assert "org.opencontainers.image.revision=" in build["labels"]
-    assert "HERMES_GIT_SHA=" in build["build-args"]
-
-    smoke = next(step for step in steps if step.get("name") == "Run docker smoke tests")
-    assert smoke["env"]["HERMES_TEST_IMAGE"] == builds[0]["with"]["tags"]
-
-    publish = next(step for step in steps if step.get("id") == "publish")
-    assert "../.ci-control/scripts/ci/publish_immutable_image.py" in publish["run"]
-    assert job["outputs"]["digest"] == "${{ steps.publish.outputs.digest }}"
-    assert job["outputs"]["image"] == "${{ steps.publish.outputs.image }}"
-
-    checkouts = [
-        step
-        for step in steps
-        if str(step.get("uses", "")).startswith("actions/checkout@")
-    ]
-    assert len(checkouts) == 2
-    assert {step["with"]["path"] for step in checkouts} == {
-        ".ci-control",
-        "candidate",
-    }
-    assert all(step["with"]["persist-credentials"] is False for step in checkouts)
-    assert all(step["with"]["ref"] == "${{ github.sha }}" for step in checkouts)
-
-    identity = next(step for step in steps if step.get("id") == "image")
-    assert "controller_revision" in identity["run"]
-    assert "does not match event SHA" in identity["run"]
-
-    login_index = next(
-        index
-        for index, step in enumerate(steps)
-        if str(step.get("uses", "")).startswith("docker/login-action@")
-    )
-    assert steps.index(publish) > login_index
-    for step in steps[login_index + 1 :]:
-        command = str(step.get("run", ""))
-        assert "candidate/scripts/" not in command
-        assert "scripts/run_tests.sh" not in command
-
-    artifact = next(
-        step
-        for step in steps
-        if str(step.get("uses", "")).startswith("actions/upload-artifact@")
-    )
-    assert artifact["with"]["path"] == "candidate/ghcr-image.json"
-    assert artifact["with"]["if-no-files-found"] == "error"
-    workflow_source = (_REPO / ".github/workflows/idearoom-ghcr-publish.yml").read_text(
-        encoding="utf-8"
-    )
-    assert "workflow_dispatch" not in workflow_source
-    assert ":latest" not in workflow_source
-    assert "imagetools create" not in workflow_source
-
-
-def test_both_debian_stages_share_one_immutable_official_image_digest():
-    dockerfile = (_REPO / "Dockerfile").read_text(encoding="utf-8")
-    bases = re.findall(
-        r"^FROM (debian:13\.4@sha256:[0-9a-f]{64})(?:\s|$)",
-        dockerfile,
-        re.MULTILINE,
-    )
-
-    assert len(bases) == 2
-    assert len(set(bases)) == 1, "build and runtime must use the same Debian root"

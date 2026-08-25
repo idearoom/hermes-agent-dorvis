@@ -132,6 +132,22 @@ def test_fire_claim_heartbeat_refreshes_only_expected_owner(temp_home, monkeypat
     ) is False
 
 
+def test_unstarted_fire_release_is_owner_fenced_and_preserves_status(temp_home):
+    import cron.jobs as jobs
+
+    job = jobs.create_job(prompt="x", schedule="every 5m", name="not-admitted")
+    claimed = jobs.claim_job_for_fire(job["id"], return_job=True)
+    owner = claimed["fire_claim"]["by"]
+
+    assert not jobs.release_fire_claim(job["id"], expected_owner="stale-owner")
+    assert jobs.get_job(job["id"])["fire_claim"]["by"] == owner
+    assert jobs.release_fire_claim(job["id"], expected_owner=owner)
+    persisted = jobs.get_job(job["id"])
+    assert persisted["fire_claim"] is None
+    assert persisted.get("last_status") is None
+    assert persisted.get("last_run_at") is None
+
+
 def test_reclaimed_fire_uses_new_owner_token(temp_home, monkeypatch):
     from datetime import datetime, timedelta
 

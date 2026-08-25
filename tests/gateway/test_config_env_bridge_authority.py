@@ -49,6 +49,11 @@ def _run_gateway_import(hermes_home: Path, initial_env: dict[str, str]) -> dict[
             "HERMES_GATEWAY_BUSY_INPUT_MODE",
             "HERMES_GATEWAY_BUSY_TEXT_MODE",
             "HERMES_GATEWAY_PLATFORM_CONNECT_TIMEOUT",
+            "HERMES_TASK_PROTECTION_HTTP_TIMEOUT_SECONDS",
+            "HERMES_TASK_PROTECTION_FAILURE_BACKOFF_SECONDS",
+            "HERMES_RESPONSE_OWNER_HEARTBEAT_SECONDS",
+            "HERMES_RESPONSE_OWNER_STALE_SECONDS",
+            "HERMES_DISABLE_ANYDOC",
             "HERMES_TIMEZONE",
         ):
             v = os.environ.get(k)
@@ -99,7 +104,8 @@ def _run_gateway_import(hermes_home: Path, initial_env: dict[str, str]) -> dict[
 
 
 def _write_config(home: Path, agent_cfg: dict | None = None, display_cfg: dict | None = None,
-                  timezone: str | None = None, gateway_cfg: dict | None = None) -> None:
+                  timezone: str | None = None, gateway_cfg: dict | None = None,
+                  security_cfg: dict | None = None) -> None:
     import yaml
     cfg: dict = {}
     if agent_cfg:
@@ -108,6 +114,8 @@ def _write_config(home: Path, agent_cfg: dict | None = None, display_cfg: dict |
         cfg["display"] = display_cfg
     if gateway_cfg:
         cfg["gateway"] = gateway_cfg
+    if security_cfg:
+        cfg["security"] = security_cfg
     if timezone:
         cfg["timezone"] = timezone
     (home / "config.yaml").write_text(yaml.safe_dump(cfg), encoding="utf-8")
@@ -214,3 +222,77 @@ def test_env_platform_connect_timeout_wins_over_config(hermes_home: Path) -> Non
     )
 
     assert env.get("HERMES_GATEWAY_PLATFORM_CONNECT_TIMEOUT") == "120"
+
+
+def test_gateway_runtime_safety_config_bridges_internal_env(hermes_home: Path) -> None:
+    """Behavioral runtime knobs are configured in YAML, not in .env."""
+    _write_config(
+        hermes_home,
+        gateway_cfg={
+            "task_protection_http_timeout_seconds": 1.5,
+            "task_protection_failure_backoff_seconds": 4,
+            "response_owner_heartbeat_seconds": 20,
+            "response_owner_stale_seconds": 180,
+        },
+    )
+
+    env = _run_gateway_import(hermes_home, initial_env={})
+
+    assert env["HERMES_TASK_PROTECTION_HTTP_TIMEOUT_SECONDS"] == "1.5"
+    assert env["HERMES_TASK_PROTECTION_FAILURE_BACKOFF_SECONDS"] == "4"
+    assert env["HERMES_RESPONSE_OWNER_HEARTBEAT_SECONDS"] == "20"
+    assert env["HERMES_RESPONSE_OWNER_STALE_SECONDS"] == "180"
+
+
+@pytest.mark.parametrize(("allow_anydoc", "disabled"), [(False, "true"), (True, "false")])
+def test_security_allow_anydoc_bridges_internal_quarantine(
+    hermes_home: Path, allow_anydoc: bool, disabled: str
+) -> None:
+    _write_config(hermes_home, security_cfg={"allow_anydoc": allow_anydoc})
+
+    env = _run_gateway_import(hermes_home, initial_env={})
+
+    assert env["HERMES_DISABLE_ANYDOC"] == disabled
+
+
+def test_managed_anydoc_seal_cannot_be_weakened_by_config(hermes_home: Path) -> None:
+    _write_config(hermes_home, security_cfg={"allow_anydoc": True})
+
+    env = _run_gateway_import(
+        hermes_home,
+        initial_env={"HERMES_DISABLE_ANYDOC": "1"},
+    )
+
+    assert env["HERMES_DISABLE_ANYDOC"] == "1"
+
+
+def test_runtime_safety_defaults_match_runtime_fallbacks() -> None:
+    """Advertised defaults and the two runtime implementations stay aligned."""
+    from gateway.drain_mode import (
+        DEFAULT_TASK_PROTECTION_FAILURE_BACKOFF_SECONDS,
+        DEFAULT_TASK_PROTECTION_HTTP_TIMEOUT_SECONDS,
+    )
+    from gateway.platforms.api_server import (
+        DEFAULT_RESPONSE_OWNER_HEARTBEAT_SECONDS,
+        DEFAULT_RESPONSE_OWNER_STALE_SECONDS,
+    )
+    from hermes_cli.config import DEFAULT_CONFIG
+
+    gateway = DEFAULT_CONFIG["gateway"]
+    assert (
+        gateway["task_protection_http_timeout_seconds"]
+        == DEFAULT_TASK_PROTECTION_HTTP_TIMEOUT_SECONDS
+    )
+    assert (
+        gateway["task_protection_failure_backoff_seconds"]
+        == DEFAULT_TASK_PROTECTION_FAILURE_BACKOFF_SECONDS
+    )
+    assert (
+        gateway["response_owner_heartbeat_seconds"]
+        == DEFAULT_RESPONSE_OWNER_HEARTBEAT_SECONDS
+    )
+    assert (
+        gateway["response_owner_stale_seconds"]
+        == DEFAULT_RESPONSE_OWNER_STALE_SECONDS
+    )
+    assert DEFAULT_CONFIG["security"]["allow_anydoc"] is True

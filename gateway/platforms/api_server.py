@@ -1136,6 +1136,40 @@ def check_api_server_requirements() -> bool:
 _RESPONSE_TERMINAL_STATUSES = frozenset(
     {"completed", "failed", "cancelled", "canceled", "incomplete"}
 )
+DEFAULT_RESPONSE_OWNER_HEARTBEAT_SECONDS = 15.0
+DEFAULT_RESPONSE_OWNER_STALE_SECONDS = 300.0
+
+
+def _response_owner_heartbeat_seconds() -> float:
+    try:
+        return max(
+            5.0,
+            float(
+                os.environ.get(
+                    "HERMES_RESPONSE_OWNER_HEARTBEAT_SECONDS",
+                    str(DEFAULT_RESPONSE_OWNER_HEARTBEAT_SECONDS),
+                )
+            ),
+        )
+    except (TypeError, ValueError):
+        return DEFAULT_RESPONSE_OWNER_HEARTBEAT_SECONDS
+
+
+def _response_owner_stale_seconds() -> float:
+    """Lease expiry, bounded well above the heartbeat cadence."""
+    minimum = _response_owner_heartbeat_seconds() * 4
+    try:
+        return max(
+            minimum,
+            float(
+                os.environ.get(
+                    "HERMES_RESPONSE_OWNER_STALE_SECONDS",
+                    str(DEFAULT_RESPONSE_OWNER_STALE_SECONDS),
+                )
+            ),
+        )
+    except (TypeError, ValueError):
+        return max(minimum, DEFAULT_RESPONSE_OWNER_STALE_SECONDS)
 
 
 def _response_record_is_terminal(data: Dict[str, Any]) -> bool:
@@ -1188,6 +1222,7 @@ class ResponseStore:
                 accessed_at REAL NOT NULL,
                 owner_id TEXT,
                 owner_epoch TEXT,
+                owner_heartbeat_at REAL,
                 terminal INTEGER NOT NULL DEFAULT 0
             )"""
         )
@@ -1197,6 +1232,7 @@ class ResponseStore:
         for column, ddl in (
             ("owner_id", "TEXT"),
             ("owner_epoch", "TEXT"),
+            ("owner_heartbeat_at", "REAL"),
             ("terminal", "INTEGER NOT NULL DEFAULT 0"),
         ):
             if column not in response_columns:
@@ -1216,6 +1252,15 @@ class ResponseStore:
                     "UPDATE responses SET terminal = 1 WHERE response_id = ?",
                     (existing_id,),
                 )
+        # Every pre-heartbeat nonterminal row gets a full lease window on
+        # upgrade. Legacy ownerless in-progress rows otherwise remain
+        # uncancellable and undeletable forever after their writer exits.
+        self._conn.execute(
+            """UPDATE responses SET owner_heartbeat_at = ?
+               WHERE terminal = 0
+                 AND owner_heartbeat_at IS NULL""",
+            (time.time(),),
+        )
         self._conn.execute(
             """CREATE TABLE IF NOT EXISTS conversations (
                 name TEXT PRIMARY KEY,
@@ -1244,14 +1289,16 @@ class ResponseStore:
         with self._lock, self._conn:
             cursor = self._conn.execute(
                 """INSERT OR IGNORE INTO responses
-                   (response_id, data, accessed_at, owner_id, owner_epoch, terminal)
-                   VALUES (?, ?, ?, ?, ?, ?)""",
+                   (response_id, data, accessed_at, owner_id, owner_epoch,
+                    owner_heartbeat_at, terminal)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
                 (
                     response_id,
                     json.dumps(data, default=str),
                     time.time(),
                     owner_id,
                     owner_epoch,
+                    time.time(),
                     int(terminal),
                 ),
             )
@@ -1300,13 +1347,14 @@ class ResponseStore:
         with self._lock, self._conn:
             cursor = self._conn.execute(
                 """UPDATE responses
-                   SET data = ?, accessed_at = ?, terminal = ?
+                   SET data = ?, accessed_at = ?, owner_heartbeat_at = ?, terminal = ?
                    WHERE response_id = ?
                      AND owner_id = ?
                      AND owner_epoch = ?
                      AND terminal = 0""",
                 (
                     json.dumps(data, default=str),
+                    time.time(),
                     time.time(),
                     int(terminal),
                     response_id,
@@ -1318,6 +1366,77 @@ class ResponseStore:
             if updated and terminal:
                 self._evict_terminal_overflow_locked()
             return updated
+
+    def heartbeat(
+        self, response_id: str, *, owner_id: str, owner_epoch: str
+    ) -> bool:
+        """Renew a live owner's lease without changing response content."""
+        with self._lock, self._conn:
+            cursor = self._conn.execute(
+                """UPDATE responses SET owner_heartbeat_at = ?
+                   WHERE response_id = ?
+                     AND owner_id = ?
+                     AND owner_epoch = ?
+                     AND terminal = 0""",
+                (time.time(), response_id, owner_id, owner_epoch),
+            )
+            return cursor.rowcount == 1
+
+    def recover_stale_owned(self, response_id: str, *, stale_before: float) -> bool:
+        """Atomically terminalize an abandoned owned response lease."""
+        with self._lock, self._conn:
+            row = self._conn.execute(
+                """SELECT data, owner_id, owner_epoch,
+                          owner_heartbeat_at, accessed_at, terminal
+                   FROM responses WHERE response_id = ?""",
+                (response_id,),
+            ).fetchone()
+            if row is None or bool(row[5]):
+                return False
+            heartbeat_at = row[3]
+            legacy_ownerless = (
+                row[1] is None and row[2] is None and heartbeat_at is None
+            )
+            if legacy_ownerless:
+                if float(row[4]) >= stale_before:
+                    return False
+            elif heartbeat_at is None or float(heartbeat_at) >= stale_before:
+                return False
+            try:
+                record = json.loads(row[0])
+                response = record.get("response")
+                if not isinstance(response, dict):
+                    return False
+            except (json.JSONDecodeError, TypeError, AttributeError):
+                return False
+            response["status"] = "incomplete"
+            response["incomplete_details"] = {"reason": "owner_lost"}
+            cursor = self._conn.execute(
+                """UPDATE responses
+                   SET data = ?, accessed_at = ?, terminal = 1
+                   WHERE response_id = ?
+                     AND terminal = 0
+                     AND (
+                         owner_heartbeat_at < ?
+                         OR (
+                             owner_id IS NULL
+                             AND owner_epoch IS NULL
+                             AND owner_heartbeat_at IS NULL
+                             AND accessed_at < ?
+                         )
+                     )""",
+                (
+                    json.dumps(record, default=str),
+                    time.time(),
+                    response_id,
+                    stale_before,
+                    stale_before,
+                ),
+            )
+            if cursor.rowcount == 1:
+                self._evict_terminal_overflow_locked()
+                return True
+            return False
 
     def _evict_terminal_overflow_locked(self) -> None:
         """Bound terminal rows while preserving every active owned response."""
@@ -1416,16 +1535,19 @@ class ResponseStore:
 
     def put(self, response_id: str, data: Dict[str, Any]) -> None:
         """Store a response, evicting the oldest if at capacity."""
+        terminal = _response_record_is_terminal(data)
         with self._lock, self._conn:
             self._conn.execute(
                 """INSERT OR REPLACE INTO responses
-                   (response_id, data, accessed_at, owner_id, owner_epoch, terminal)
-                   VALUES (?, ?, ?, NULL, NULL, ?)""",
+                   (response_id, data, accessed_at, owner_id, owner_epoch,
+                    owner_heartbeat_at, terminal)
+                   VALUES (?, ?, ?, NULL, NULL, ?, ?)""",
                 (
                     response_id,
                     json.dumps(data, default=str),
                     time.time(),
-                    int(_response_record_is_terminal(data)),
+                    None if terminal else time.time(),
+                    int(terminal),
                 ),
             )
             self._evict_terminal_overflow_locked()
@@ -5685,6 +5807,8 @@ class APIServerAdapter(BasePlatformAdapter):
         terminal_snapshot_persisted = False
         response_claimed = False
         response_owner_epoch = uuid.uuid4().hex
+        last_owner_heartbeat = time.monotonic()
+        last_owner_heartbeat_attempt = last_owner_heartbeat
         response_session_id = session_id
         containment_usage: Optional[Dict[str, Any]] = None
 
@@ -5771,6 +5895,62 @@ class APIServerAdapter(BasePlatformAdapter):
                 terminal=str(response_env.get("status") or "")
                 in self._TERMINAL_RESPONSE_STATUSES,
             )
+
+        async def _emit_committed_terminal_after_lost_cas() -> bool:
+            """End this SSE stream with the durable winner's terminal event."""
+            stored = self._get_response_record(response_id)
+            response_env = stored.get("response") if isinstance(stored, dict) else None
+            if not isinstance(response_env, dict):
+                return False
+            status = str(response_env.get("status") or "")
+            if status not in self._TERMINAL_RESPONSE_STATUSES:
+                return False
+            event_type = f"response.{status}"
+            event: Dict[str, Any] = {
+                "type": event_type,
+                "response": response_env,
+            }
+            if status == "failed" and response_env.get("error") is not None:
+                event["error"] = response_env["error"]
+            await _write_event(event_type, event)
+            return True
+
+        def _renew_response_owner_if_due() -> None:
+            nonlocal last_owner_heartbeat, last_owner_heartbeat_attempt
+            if not store or not response_claimed:
+                return
+            now = time.monotonic()
+            if (
+                now - last_owner_heartbeat_attempt
+                < _response_owner_heartbeat_seconds()
+            ):
+                return
+            last_owner_heartbeat_attempt = now
+            heartbeat = getattr(self._response_store, "heartbeat", None)
+            if heartbeat is None:
+                last_owner_heartbeat = now
+                return
+            try:
+                renewed = heartbeat(
+                    response_id,
+                    owner_id=self._response_owner_id,
+                    owner_epoch=response_owner_epoch,
+                )
+            except Exception:
+                if now - last_owner_heartbeat >= _response_owner_stale_seconds():
+                    raise
+                logger.warning(
+                    "[api_server] transient response-owner heartbeat failure "
+                    "for %s; retrying within the lease window",
+                    response_id,
+                    exc_info=True,
+                )
+                return
+            if not renewed:
+                raise RuntimeError(
+                    f"Response owner lease was lost: {response_id}"
+                )
+            last_owner_heartbeat = now
 
         def _best_known_usage() -> Dict[str, Any]:
             """Usage for an envelope written while the agent may still be running.
@@ -6176,6 +6356,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         await _emit_text_delta(combined)
 
             while True:
+                _renew_response_owner_if_due()
                 try:
                     item = await asyncio.wait_for(stream_q.get(), timeout=0.5)
                 except asyncio.TimeoutError:
@@ -6331,6 +6512,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         "[api_server] suppressed stale failed terminal for %s",
                         response_id,
                     )
+                    await _emit_committed_terminal_after_lost_cas()
             else:
                 completed_env = _envelope("completed")
                 completed_env["output"] = final_items
@@ -6362,6 +6544,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         "[api_server] suppressed stale completed terminal for %s",
                         response_id,
                     )
+                    await _emit_committed_terminal_after_lost_cas()
 
         except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError):
             reason = (
@@ -6414,18 +6597,22 @@ class APIServerAdapter(BasePlatformAdapter):
             _persist_incomplete_best_effort()
             agent_error = _redact_api_error_text(_tb.format_exc())
             try:
-                failed_env = _envelope("failed")
-                failed_env["output"] = list(emitted_items)
-                failed_env["error"] = {
-                    "message": _redact_api_error_text(_exc, limit=500),
-                    "type": _responses_error_type(_exc),
-                }
-                failed_env["usage"] = _responses_usage_payload(_best_known_usage())
-                await _write_event("response.failed", {
-                    "type": "response.failed",
-                    "response": failed_env,
-                    "error": failed_env["error"],
-                })
+                emitted_durable = await _emit_committed_terminal_after_lost_cas()
+                if not emitted_durable:
+                    failed_env = _envelope("failed")
+                    failed_env["output"] = list(emitted_items)
+                    failed_env["error"] = {
+                        "message": _redact_api_error_text(_exc, limit=500),
+                        "type": _responses_error_type(_exc),
+                    }
+                    failed_env["usage"] = _responses_usage_payload(
+                        _best_known_usage()
+                    )
+                    await _write_event("response.failed", {
+                        "type": "response.failed",
+                        "response": failed_env,
+                        "error": failed_env["error"],
+                    })
             except Exception:
                 pass
             logger.error("Agent crashed mid-stream for %s: %s", response_id, str(agent_error)[:300])
@@ -6522,7 +6709,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
         stored_session_id = None
         if not conversation_history and previous_response_id:
-            stored = self._response_store.get(previous_response_id)
+            stored = self._get_response_record(previous_response_id)
             if stored is None:
                 return web.json_response(_openai_error(f"Previous response not found: {previous_response_id}"), status=404)
             conversation_history = list(stored.get("conversation_history", []))
@@ -6813,6 +7000,31 @@ class APIServerAdapter(BasePlatformAdapter):
     # SSE disconnect leaves behind after it has already interrupted the agent.
     _TERMINAL_RESPONSE_STATUSES = _RESPONSE_TERMINAL_STATUSES
 
+    def _get_response_record(self, response_id: str) -> Optional[Dict[str, Any]]:
+        """Recover an expired owner lease before exposing stored state."""
+        recover = getattr(self._response_store, "recover_stale_owned", None)
+        if callable(recover):
+            try:
+                recovered = recover(
+                    response_id,
+                    stale_before=time.time() - _response_owner_stale_seconds(),
+                )
+                if recovered:
+                    logger.warning(
+                        "[api_server] recovered abandoned response owner for %s",
+                        response_id,
+                    )
+            except Exception:
+                # Recovery is a convenience on read, not authority to hide a
+                # durable-store outage. The ordinary get below retains the
+                # route's existing error/availability behavior.
+                logger.error(
+                    "[api_server] stale response recovery failed for %s",
+                    response_id,
+                    exc_info=True,
+                )
+        return self._response_store.get(response_id)
+
     async def _handle_get_response(self, request: "web.Request") -> "web.Response":
         """GET /v1/responses/{response_id} — retrieve a stored response."""
         auth_err = self._check_auth(request)
@@ -6820,7 +7032,7 @@ class APIServerAdapter(BasePlatformAdapter):
             return auth_err
 
         response_id = request.match_info["response_id"]
-        stored = self._response_store.get(response_id)
+        stored = self._get_response_record(response_id)
         if stored is None:
             return web.json_response(_openai_error(f"Response not found: {response_id}"), status=404)
 
@@ -6851,7 +7063,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
         response_id = request.match_info["response_id"]
         entry = self._inflight_responses.get(response_id)
-        stored = self._response_store.get(response_id)
+        stored = self._get_response_record(response_id)
 
         if entry is None and stored is None:
             return web.json_response(
@@ -6922,7 +7134,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     exc_info=True,
                 )
         if cancelled_env is None:
-            current = self._response_store.get(response_id)
+            current = self._get_response_record(response_id)
             current_response = current.get("response") if isinstance(current, dict) else None
             current_status = (
                 str(current_response.get("status") or "")
@@ -7004,6 +7216,8 @@ class APIServerAdapter(BasePlatformAdapter):
             return auth_err
 
         response_id = request.match_info["response_id"]
+        # A hard-dead owner must not make this row undeletable forever.
+        self._get_response_record(response_id)
         delete_result = self._response_store.delete_terminal(response_id)
         if delete_result == "not_found":
             return web.json_response(_openai_error(f"Response not found: {response_id}"), status=404)
@@ -8453,7 +8667,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
         stored_session_id = None
         if not conversation_history and previous_response_id:
-            stored = self._response_store.get(previous_response_id)
+            stored = self._get_response_record(previous_response_id)
             if stored:
                 conversation_history = list(stored.get("conversation_history", []))
                 stored_session_id = stored.get("session_id")

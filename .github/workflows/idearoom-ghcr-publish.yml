@@ -18,17 +18,23 @@ on:
     # No path filter on purpose: idearoom-agents derives its base-image tag
     # from the reference/hermes-agent-dorvis submodule gitlink, so every commit
     # on the carried dorvis/runtime branch must publish a sha-<commit> image or
-    # a pin could 404. Main is retained as a second trusted integration branch;
-    # the publisher is idempotent when both branches reach the same commit.
-    branches: [dorvis/runtime, main]
+    # a pin could 404. Keep exactly one automatic publisher for a commit: main
+    # may point at the same SHA, and rebuilding there could race an immutable
+    # tag with different build output.
+    branches: [dorvis/runtime]
   pull_request:
     # PR builds are validation-only (no push). Keep this unfiltered: the image
     # context includes runtime config, plugins, skills, shell scripts, the TUI,
     # and the web app in addition to Python. A hand-maintained path allowlist
     # silently loses coverage whenever that context grows.
     branches: [dorvis/runtime, main]
+  # Manual re-arm for a dropped dorvis/runtime push event. The job condition
+  # exposes no caller-controlled revision input and does not let main become a
+  # second publisher. Rebuilding an already-published SHA may fail closed on a
+  # config-digest mismatch; that leaves the registry untouched.
+  workflow_dispatch:
 # Key publishing work by the exact push commit so GitHub concurrency cannot
-# replace an already-pending main image. PR validation runs still collapse to
+# replace an already-pending runtime image. PR validation runs still collapse to
 # the latest commit for that pull request.
 concurrency:
   group: idearoom-ghcr-${{ github.event.pull_request.number || github.sha }}
@@ -124,9 +130,10 @@ jobs:
     # (including NousResearch, were this file ever to reach it via a merge).
     if: >-
       github.repository == 'idearoom/hermes-agent-dorvis' &&
-      github.event_name == 'push' &&
-      (github.ref == 'refs/heads/dorvis/runtime' ||
-       github.ref == 'refs/heads/main')
+      ((github.event_name == 'push' &&
+        github.ref == 'refs/heads/dorvis/runtime') ||
+       (github.event_name == 'workflow_dispatch' &&
+        github.ref == 'refs/heads/dorvis/runtime'))
     permissions:
       contents: read
       packages: write
@@ -199,6 +206,7 @@ jobs:
       # SHA are present before it is loaded and smoked. Publishing below tags
       # and pushes this exact local image; it never invokes BuildKit again.
       - name: Build final image (arm64, loaded for smoke test)
+        id: build
         uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f  # v7.1.0
         with:
           context: candidate
@@ -256,6 +264,7 @@ jobs:
           LOCAL_IMAGE: ${{ steps.image.outputs.local_image }}
           IMMUTABLE_IMAGE: ${{ steps.image.outputs.immutable_image }}
           REVISION: ${{ steps.image.outputs.revision }}
+          CONFIG_DIGEST: ${{ steps.build.outputs.imageid }}
         working-directory: candidate
         run: |
           set -euo pipefail
@@ -264,6 +273,7 @@ jobs:
             --immutable-image "${IMMUTABLE_IMAGE}" \
             --expected-revision "${REVISION}" \
             --expected-source "https://github.com/idearoom/hermes-agent-dorvis" \
+            --expected-config-digest "${CONFIG_DIGEST}" \
             --artifact-file ghcr-image.json
 
       - name: Upload immutable image identity

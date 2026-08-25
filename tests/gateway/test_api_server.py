@@ -237,6 +237,81 @@ class TestResponseStore:
             canceller.close()
             stale_writer.close()
 
+    def test_stale_owned_response_recovers_to_terminal_incomplete(self):
+        store = ResponseStore(max_size=10)
+        active = {
+            "response": {"id": "resp_orphan", "status": "in_progress"},
+            "conversation_history": [{"role": "user", "content": "hello"}],
+        }
+        assert store.claim(
+            "resp_orphan",
+            active,
+            owner_id="dead-owner",
+            owner_epoch="dead-epoch",
+        )
+
+        assert not store.recover_stale_owned(
+            "resp_orphan", stale_before=time.time() - 60
+        )
+        assert store.recover_stale_owned(
+            "resp_orphan", stale_before=time.time() + 1
+        )
+
+        recovered = store.get("resp_orphan")
+        assert recovered["response"]["status"] == "incomplete"
+        assert recovered["response"]["incomplete_details"] == {
+            "reason": "owner_lost"
+        }
+        assert store.get_control("resp_orphan")["terminal"] is True
+        assert not store.heartbeat(
+            "resp_orphan", owner_id="dead-owner", owner_epoch="dead-epoch"
+        )
+
+    def test_owner_heartbeat_prevents_stale_recovery(self):
+        store = ResponseStore(max_size=10)
+        assert store.claim(
+            "resp_live",
+            {"response": {"id": "resp_live", "status": "in_progress"}},
+            owner_id="live-owner",
+            owner_epoch="live-epoch",
+        )
+        assert store.heartbeat(
+            "resp_live", owner_id="live-owner", owner_epoch="live-epoch"
+        )
+        assert not store.recover_stale_owned(
+            "resp_live", stale_before=time.time() - 1
+        )
+        assert store.get_control("resp_live")["terminal"] is False
+
+    def test_legacy_ownerless_active_response_expires(self):
+        store = ResponseStore(max_size=10)
+        store.put(
+            "resp_legacy",
+            {"response": {"id": "resp_legacy", "status": "in_progress"}},
+        )
+        with store._conn:
+            store._conn.execute(
+                """UPDATE responses
+                   SET owner_heartbeat_at = NULL, accessed_at = 1
+                   WHERE response_id = ?""",
+                ("resp_legacy",),
+            )
+
+        assert store.get_control("resp_legacy") == {
+            "owner_id": None,
+            "owner_epoch": None,
+            "terminal": False,
+        }
+        assert store.recover_stale_owned(
+            "resp_legacy", stale_before=2
+        )
+        assert store.get("resp_legacy")["response"] == {
+            "id": "resp_legacy",
+            "status": "incomplete",
+            "incomplete_details": {"reason": "owner_lost"},
+        }
+        assert store.delete_terminal("resp_legacy") == "deleted"
+
     def test_conversation_mapping_cannot_dangle_after_terminal_delete(self):
         store = ResponseStore(max_size=10)
         store.put(
@@ -3602,6 +3677,63 @@ class TestResponsesStreaming:
                 assert " world" in body
 
     @pytest.mark.asyncio
+    async def test_transient_owner_heartbeat_error_does_not_kill_stream(
+        self, adapter
+    ):
+        app = _create_app(adapter)
+        original_heartbeat = adapter._response_store.heartbeat
+        heartbeat_calls = 0
+
+        def flaky_heartbeat(*args, **kwargs):
+            nonlocal heartbeat_calls
+            heartbeat_calls += 1
+            if heartbeat_calls == 1:
+                raise OSError("transient database disconnect")
+            return original_heartbeat(*args, **kwargs)
+
+        async with TestClient(TestServer(app)) as cli:
+            async def _mock_run_agent(**kwargs):
+                callback = kwargs.get("stream_delta_callback")
+                for part in ("still", " running", " safely"):
+                    await asyncio.sleep(0.02)
+                    callback(part)
+                return (
+                    {
+                        "final_response": "still running safely",
+                        "messages": [],
+                        "api_calls": 1,
+                    },
+                    {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                )
+
+            with (
+                patch.object(adapter, "_run_agent", side_effect=_mock_run_agent),
+                patch.object(
+                    adapter._response_store,
+                    "heartbeat",
+                    side_effect=flaky_heartbeat,
+                ),
+                patch(
+                    "gateway.platforms.api_server._response_owner_heartbeat_seconds",
+                    return_value=0.01,
+                ),
+                patch(
+                    "gateway.platforms.api_server._response_owner_stale_seconds",
+                    return_value=1.0,
+                ),
+            ):
+                resp = await cli.post(
+                    "/v1/responses",
+                    json={"model": "hermes-agent", "input": "hi", "stream": True},
+                )
+                body = await resp.text()
+
+        events = _parse_sse_events(body)
+        assert any(event.get("type") == "response.completed" for event in events)
+        assert not any(event.get("type") == "response.failed" for event in events)
+        assert heartbeat_calls >= 2
+
+    @pytest.mark.asyncio
     async def test_stream_terminal_event_preserves_plugin_metadata(self, adapter):
         metadata = {"dorvis_trace_manifest": {"trace_id": "1" * 32}}
         app = _create_app(adapter)
@@ -4282,6 +4414,39 @@ class TestGetResponse:
             assert data2["object"] == "response"
             assert data2["status"] == "completed"
 
+    @pytest.mark.asyncio
+    async def test_get_recovers_expired_owner_as_terminal_incomplete(self, adapter):
+        """GET never leaves a dead owner's response permanently in progress."""
+        response_id = "resp_expired_owner"
+        assert adapter._response_store.claim(
+            response_id,
+            {
+                "response": {
+                    "id": response_id,
+                    "object": "response",
+                    "status": "in_progress",
+                },
+                "conversation_history": [],
+            },
+            owner_id="dead-owner",
+            owner_epoch="dead-epoch",
+        )
+        with adapter._response_store._conn:
+            adapter._response_store._conn.execute(
+                "UPDATE responses SET owner_heartbeat_at = 1 WHERE response_id = ?",
+                (response_id,),
+            )
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get(f"/v1/responses/{response_id}")
+            body = await resp.json()
+
+        assert resp.status == 200
+        assert body["status"] == "incomplete"
+        assert body["incomplete_details"] == {"reason": "owner_lost"}
+        assert adapter._response_store.get_control(response_id)["terminal"] is True
+
 
 # ---------------------------------------------------------------------------
 # POST /v1/responses/{response_id}/cancel
@@ -4515,6 +4680,7 @@ class TestCancelResponse:
                 "cancelled"
             )
             assert not any("response.completed" in payload for payload in written)
+            assert any("response.cancelled" in payload for payload in written)
         finally:
             release_owner.set()
             if not writer.done():

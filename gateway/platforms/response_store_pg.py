@@ -38,6 +38,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_MAX_STORED_RESPONSES = None
 
 _SCHEMA = "hermes_gw"
+_SCHEMA_CONTRACT_VERSION = 2
 _TERMINAL_STATUSES = frozenset(
     {"completed", "failed", "cancelled", "canceled", "incomplete"}
 )
@@ -194,6 +195,111 @@ class PgResponseStore:
 
     def _init_schema(self) -> None:
         with self._pool.connection() as conn:
+            # Refuse a future contract before touching any version-specific
+            # relation. A newer release may rename or remove those relations;
+            # folding this read into the detailed probe would turn the
+            # resulting UndefinedTable into a false "schema missing" signal
+            # and let an older runtime issue DDL against a future catalog.
+            try:
+                version_row = conn.execute(
+                    f"""SELECT /* hermes_response_schema_contract_version */
+                               contract_version
+                        FROM {_SCHEMA}.schema_contract
+                        WHERE singleton = TRUE"""
+                ).fetchone()
+            except self._schema_recovery_errors:
+                version_row = None
+            if (
+                version_row is not None
+                and version_row[0] is not None
+                and int(version_row[0]) > _SCHEMA_CONTRACT_VERSION
+            ):
+                raise RuntimeError(
+                    "Responses schema contract is newer than this runtime: "
+                    f"installed={version_row[0]} supported={_SCHEMA_CONTRACT_VERSION}"
+                )
+
+            # Ordinary boots must remain read-only with respect to the schema.
+            # The version row is written only after the full migration and its
+            # exact trigger/FK checks commit. Core relation probes keep a stale
+            # marker from hiding a partially removed schema; an operation that
+            # later detects a missing object re-enters this path via the
+            # one-shot schema retry.
+            try:
+                current = conn.execute(
+                    f"""SELECT /* hermes_response_schema_contract_fast_path */
+                               contract_version,
+                               to_regclass('{_SCHEMA}.responses') IS NOT NULL,
+                               to_regclass('{_SCHEMA}.conversations') IS NOT NULL,
+                               to_regprocedure(
+                                   '{_SCHEMA}.sync_legacy_response_terminal()'
+                               ) IS NOT NULL,
+                               EXISTS (
+                                   SELECT 1 FROM pg_trigger
+                                   WHERE tgname = 'sync_legacy_response_terminal'
+                                     AND tgrelid =
+                                         '{_SCHEMA}.responses'::regclass
+                               ),
+                               to_regprocedure(
+                                   '{_SCHEMA}.fence_owned_response()'
+                               ) IS NOT NULL,
+                               EXISTS (
+                                   SELECT 1 FROM pg_trigger
+                                   WHERE tgname = 'fence_owned_response'
+                                     AND tgrelid =
+                                         '{_SCHEMA}.responses'::regclass
+                               ),
+                               to_regprocedure(
+                                   '{_SCHEMA}.fence_owned_response_conversation_delete()'
+                               ) IS NOT NULL,
+                               EXISTS (
+                                   SELECT 1 FROM pg_trigger
+                                   WHERE tgname =
+                                       'fence_owned_response_conversation_delete'
+                                     AND tgrelid =
+                                         '{_SCHEMA}.conversations'::regclass
+                               ),
+                               EXISTS (
+                                   SELECT 1 FROM pg_constraint
+                                   WHERE conname =
+                                       'conversations_response_id_fkey'
+                                     AND conrelid =
+                                         '{_SCHEMA}.conversations'::regclass
+                               ),
+                               to_regclass(
+                                   '{_SCHEMA}.idx_responses_accessed_at'
+                               ) IS NOT NULL,
+                               EXISTS (
+                                   SELECT 1
+                                   FROM pg_attribute
+                                   WHERE attrelid =
+                                       '{_SCHEMA}.responses'::regclass
+                                     AND attname = 'owner_heartbeat_at'
+                                     AND atttypid = 'float8'::regtype
+                                     AND NOT attisdropped
+                               )
+                        FROM {_SCHEMA}.schema_contract
+                        WHERE singleton = TRUE"""
+                ).fetchone()
+            except self._schema_recovery_errors:
+                current = None
+            if (
+                current is not None
+                and current[0] == _SCHEMA_CONTRACT_VERSION
+                and all(bool(value) for value in current[1:])
+            ):
+                # The marker avoids every DDL statement and migration lock,
+                # while these exact read-only checks retain fail-closed
+                # protection against a same-named trigger/FK with altered
+                # semantics.
+                self._ensure_legacy_terminal_function(conn)
+                self._ensure_legacy_terminal_trigger(conn)
+                self._ensure_owned_response_fence_function(conn)
+                self._ensure_owned_response_fence_trigger(conn)
+                self._ensure_conversation_delete_fence_function(conn)
+                self._ensure_conversation_delete_fence_trigger(conn)
+                self._ensure_conversation_response_fk(conn)
+                return
             conn.execute(f"CREATE SCHEMA IF NOT EXISTS {_SCHEMA}")
             conn.execute(
                 f"""CREATE TABLE IF NOT EXISTS {_SCHEMA}.responses (
@@ -202,6 +308,7 @@ class PgResponseStore:
                     accessed_at DOUBLE PRECISION NOT NULL,
                     owner_id TEXT,
                     owner_epoch TEXT,
+                    owner_heartbeat_at DOUBLE PRECISION,
                     terminal BOOLEAN NOT NULL DEFAULT TRUE
                 )"""
             )
@@ -231,6 +338,11 @@ class PgResponseStore:
                 )
                 conn.execute(
                     f"ALTER TABLE {_SCHEMA}.responses "
+                    "ADD COLUMN IF NOT EXISTS owner_heartbeat_at "
+                    "DOUBLE PRECISION"
+                )
+                conn.execute(
+                    f"ALTER TABLE {_SCHEMA}.responses "
                     "ADD COLUMN IF NOT EXISTS terminal "
                     "BOOLEAN NOT NULL DEFAULT TRUE"
                 )
@@ -254,7 +366,26 @@ class PgResponseStore:
                             'completed', 'failed', 'cancelled',
                             'canceled', 'incomplete'
                         )
-                        WHERE owner_id IS NULL AND owner_epoch IS NULL"""
+                        WHERE owner_id IS NULL
+                          AND owner_epoch IS NULL
+                          AND terminal IS DISTINCT FROM (
+                              COALESCE(
+                                  data -> 'response' ->> 'status', 'completed'
+                              ) IN (
+                                  'completed', 'failed', 'cancelled',
+                                  'canceled', 'incomplete'
+                              )
+                          )"""
+                )
+                # Run after terminal classification: columns added to a legacy
+                # table start with terminal=TRUE, so doing this first would
+                # miss every ownerless in-progress row.
+                conn.execute(
+                    f"""UPDATE {_SCHEMA}.responses
+                        SET owner_heartbeat_at = %s
+                        WHERE terminal = FALSE
+                          AND owner_heartbeat_at IS NULL""",
+                    (time.time(),),
                 )
                 conn.execute(
                     f"""DELETE FROM {_SCHEMA}.conversations AS c
@@ -264,6 +395,24 @@ class PgResponseStore:
                         )"""
                 )
                 self._ensure_conversation_response_fk(conn)
+                conn.execute(
+                    f"""CREATE TABLE IF NOT EXISTS {_SCHEMA}.schema_contract (
+                            singleton BOOLEAN PRIMARY KEY DEFAULT TRUE
+                                CHECK (singleton),
+                            contract_version INTEGER NOT NULL
+                        )"""
+                )
+                conn.execute(
+                    f"""INSERT INTO {_SCHEMA}.schema_contract
+                            (singleton, contract_version)
+                        VALUES (TRUE, %s)
+                        ON CONFLICT (singleton) DO UPDATE
+                        SET contract_version = GREATEST(
+                            {_SCHEMA}.schema_contract.contract_version,
+                            EXCLUDED.contract_version
+                        )""",
+                    (_SCHEMA_CONTRACT_VERSION,),
+                )
             # accessed_at remains useful for diagnostics and future explicit
             # retention policies, even though this durable store does not apply
             # automatic LRU eviction.
@@ -575,8 +724,9 @@ class PgResponseStore:
             with self._pool.connection() as conn, conn.transaction():
                 row = conn.execute(
                     f"""INSERT INTO {_SCHEMA}.responses
-                        (response_id, data, accessed_at, owner_id, owner_epoch, terminal)
-                        VALUES (%s, %s, %s, %s, %s, %s)
+                        (response_id, data, accessed_at, owner_id, owner_epoch,
+                         owner_heartbeat_at, terminal)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s)
                         ON CONFLICT (response_id) DO NOTHING
                         RETURNING response_id""",
                     (
@@ -585,6 +735,7 @@ class PgResponseStore:
                         time.time(),
                         owner_id,
                         owner_epoch,
+                        time.time(),
                         terminal,
                     ),
                 ).fetchone()
@@ -649,13 +800,15 @@ class PgResponseStore:
                 )
                 cur = conn.execute(
                     f"""UPDATE {_SCHEMA}.responses
-                        SET data = %s, accessed_at = %s, terminal = %s
+                        SET data = %s, accessed_at = %s,
+                            owner_heartbeat_at = %s, terminal = %s
                         WHERE response_id = %s
                           AND owner_id = %s
                           AND owner_epoch = %s
                           AND terminal = FALSE""",
                     (
                         self._Jsonb(data, dumps=_dumps),
+                        time.time(),
                         time.time(),
                         terminal,
                         response_id,
@@ -666,6 +819,97 @@ class PgResponseStore:
                 return cur.rowcount == 1
 
         return self._with_schema_retry("transition", _transition)
+
+    def heartbeat(
+        self, response_id: str, *, owner_id: str, owner_epoch: str
+    ) -> bool:
+        """Renew a live response owner lease without changing its payload."""
+        def _heartbeat():
+            with self._pool.connection() as conn:
+                cur = conn.execute(
+                    f"""UPDATE {_SCHEMA}.responses
+                        SET owner_heartbeat_at = %s
+                        WHERE response_id = %s
+                          AND owner_id = %s
+                          AND owner_epoch = %s
+                          AND terminal = FALSE""",
+                    (time.time(), response_id, owner_id, owner_epoch),
+                )
+                return cur.rowcount == 1
+
+        return self._with_schema_retry("heartbeat", _heartbeat)
+
+    def recover_stale_owned(self, response_id: str, *, stale_before: float) -> bool:
+        """Fence and terminalize a response whose owner lease expired."""
+        def _recover():
+            with self._pool.connection() as conn, conn.transaction():
+                row = conn.execute(
+                    f"""SELECT /* hermes_response_stale_recovery */
+                               data, owner_id, owner_epoch,
+                               owner_heartbeat_at, accessed_at, terminal
+                        FROM {_SCHEMA}.responses
+                        WHERE response_id = %s
+                        FOR UPDATE""",
+                    (response_id,),
+                ).fetchone()
+                if row is None or bool(row[5]):
+                    return False
+                heartbeat_at = row[3]
+                owner_id, owner_epoch = row[1], row[2]
+                legacy_ownerless = (
+                    owner_id is None and owner_epoch is None and heartbeat_at is None
+                )
+                if legacy_ownerless:
+                    if float(row[4]) >= stale_before:
+                        return False
+                elif heartbeat_at is None or float(heartbeat_at) >= stale_before:
+                    return False
+                record = row[0]
+                response = record.get("response") if isinstance(record, dict) else None
+                if not isinstance(response, dict):
+                    return False
+                response["status"] = "incomplete"
+                response["incomplete_details"] = {"reason": "owner_lost"}
+                conn.execute(
+                    """SELECT
+                           set_config(
+                               'hermes_gw.response_write_owner_id', %s, true
+                           ),
+                           set_config(
+                               'hermes_gw.response_write_owner_epoch', %s, true
+                           )""",
+                    (owner_id or "", owner_epoch or ""),
+                )
+                cur = conn.execute(
+                    f"""UPDATE /* hermes_response_stale_recovery_commit */
+                               {_SCHEMA}.responses
+                        SET data = %s, accessed_at = %s, terminal = TRUE
+                        WHERE response_id = %s
+                          AND owner_id IS NOT DISTINCT FROM %s
+                          AND owner_epoch IS NOT DISTINCT FROM %s
+                          AND (
+                              owner_heartbeat_at < %s
+                              OR (
+                                  owner_id IS NULL
+                                  AND owner_epoch IS NULL
+                                  AND owner_heartbeat_at IS NULL
+                                  AND accessed_at < %s
+                              )
+                          )
+                          AND terminal = FALSE""",
+                    (
+                        self._Jsonb(record, dumps=_dumps),
+                        time.time(),
+                        response_id,
+                        owner_id,
+                        owner_epoch,
+                        stale_before,
+                        stale_before,
+                    ),
+                )
+                return cur.rowcount == 1
+
+        return self._with_schema_retry("stale recovery", _recover)
 
     def delete_terminal(self, response_id: str) -> str:
         """Lock, verify terminality, and delete with FK-cascaded mappings."""
@@ -725,22 +969,27 @@ class PgResponseStore:
     def put(self, response_id: str, data: Dict[str, Any]) -> None:
         """Store a response without automatic eviction."""
         def _put():
+            terminal = _record_is_terminal(data)
             with self._pool.connection() as conn:
                 conn.execute(
                     f"""INSERT INTO {_SCHEMA}.responses
-                        (response_id, data, accessed_at, owner_id, owner_epoch, terminal)
-                        VALUES (%s, %s, %s, NULL, NULL, %s)
+                        (response_id, data, accessed_at, owner_id, owner_epoch,
+                         owner_heartbeat_at, terminal)
+                        VALUES (%s, %s, %s, NULL, NULL, %s, %s)
                         ON CONFLICT (response_id)
                         DO UPDATE SET data = EXCLUDED.data,
                                       accessed_at = EXCLUDED.accessed_at,
                                       owner_id = NULL,
                                       owner_epoch = NULL,
+                                      owner_heartbeat_at =
+                                          EXCLUDED.owner_heartbeat_at,
                                       terminal = EXCLUDED.terminal""",
                     (
                         response_id,
                         self._Jsonb(data, dumps=_dumps),
                         time.time(),
-                        _record_is_terminal(data),
+                        None if terminal else time.time(),
+                        terminal,
                     ),
                 )
 

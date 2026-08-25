@@ -938,6 +938,24 @@ automatically requeue the message because doing so without durable ordering and
 idempotency could process it twice. Non-positive values use the 1800-second
 default.
 
+## Gateway Runtime Safety
+
+Managed gateways can tune their ECS admission and stored-response owner leases
+without placing behavioral settings in `.env`:
+
+```yaml
+gateway:
+  task_protection_http_timeout_seconds: 3
+  task_protection_failure_backoff_seconds: 2
+  response_owner_heartbeat_seconds: 15
+  response_owner_stale_seconds: 300
+```
+
+The task-protection timeout is bounded to 0.1–10 seconds and remains fail
+closed. The response stale window is always at least four heartbeat intervals,
+so a live stream has several renewal opportunities before another process may
+recover its stored row as `incomplete` with reason `owner_lost`.
+
 ## Session Stall Watchdog
 
 The gateway runs a notify-only stall watchdog (`agent.session_stall_timeout`, default `300` seconds, `0` = disabled). When a busy session has a **pending inbound follow-up** and the agent's shared activity clock has been idle for at least this long, the gateway logs a WARNING and sends the user a one-shot notification:
@@ -2379,6 +2397,7 @@ security:
   tirith_path: "tirith"          # Path to tirith binary (default: "tirith" in $PATH)
   tirith_timeout: 5              # Seconds to wait for tirith scan before timing out
   tirith_fail_open: true         # Allow command execution if tirith is unavailable
+  allow_anydoc: true             # Optional generic document converter
   website_blocklist:             # See Website Blocklist section below
     enabled: false
     domains: []
@@ -2390,6 +2409,8 @@ security:
 - `tirith_path` — path to the tirith binary. Set this if tirith is installed in a non-standard location.
 - `tirith_timeout` — maximum seconds to wait for a tirith scan. Commands proceed if the scan times out.
 - `tirith_fail_open` — when `true` (default), commands are allowed to execute if tirith is unavailable or fails. Set to `false` to block commands when tirith cannot verify them.
+
+- `allow_anydoc` — when `false`, disables the optional AnyDoc converter before import or lazy installation. A managed runtime can impose a stricter operator seal; user config cannot re-enable the converter through that seal. The bounded native DOCX, XLSX, and notebook readers remain enabled.
 
 ## Website Blocklist
 

@@ -1392,6 +1392,9 @@ _LIKE_RE = re.compile(r"\bLIKE\b")
 # ``col IS NOT ?`` — has no direct Postgres spelling. Rewrite it only on the
 # parameterized execution path, before the generic qmark conversion.
 _IS_PARAM_RE = re.compile(r"\bIS\s+(NOT\s+)?\?", re.IGNORECASE)
+_LIMIT_OFFSET_PARAM_RE = re.compile(
+    r"\bLIMIT\s+\?\s+OFFSET\s+\?", re.IGNORECASE
+)
 _INSERT_MESSAGES_RE = re.compile(r"^\s*INSERT\s+INTO\s+messages\s*\(", re.IGNORECASE)
 
 # ── Whole-statement overrides ──────────────────────────────────────────────
@@ -1535,6 +1538,10 @@ def _translate_sql(sql: str, *, with_params: bool) -> str:
         r"(COALESCE(\1, '{}')::jsonb ->> '\2')", sql
     )
     sql = _JSON_EXTRACT_PLAIN_RE.sub(r"(COALESCE(\1, '{}')::jsonb ->> '\2')", sql)
+    # SessionDB uses SQLite's sentinel LIMIT -1 for offset-only paging.
+    # Postgres rejects a negative LIMIT; NULL means unbounded and preserves
+    # the same two-parameter shape for both bounded and unbounded callers.
+    sql = _LIMIT_OFFSET_PARAM_RE.sub("LIMIT NULLIF(?, -1) OFFSET ?", sql)
 
     out: List[str] = []
     for is_literal, seg in _split_literals(sql):
@@ -1938,6 +1945,9 @@ class PgSessionDB(SessionDB):
                     "SELECT to_regnamespace(%s)", (_SCHEMA,)
                 ).fetchone()
                 schema_exists = bool(namespace and namespace[0] is not None)
+                install_search_acceleration = (
+                    not schema_exists or self._allow_schema_migration
+                )
 
                 if self._allow_schema_migration and not schema_exists:
                     raise RuntimeError(
@@ -1982,19 +1992,8 @@ class PgSessionDB(SessionDB):
                     "surface_marker": EXPECTED_SCHEMA_SURFACE_SHA256,
                 }
 
-                # Search acceleration is optional and outside the correctness
-                # transaction: an unavailable extension degrades to ILIKE and
-                # can never roll back a verified schema.
-                for stmt in PG_TRGM_SQL:
-                    try:
-                        conn.execute(stmt)
-                    except Exception as exc:
-                        logger.info(
-                            "pg_trgm acceleration unavailable for the session "
-                            "store (CJK search falls back to unindexed ILIKE): %s",
-                            exc,
-                        )
-                        break
+                if install_search_acceleration:
+                    self._ensure_optional_search_acceleration(conn)
             finally:
                 try:
                     conn.execute(
@@ -2021,6 +2020,23 @@ class PgSessionDB(SessionDB):
         )
         self._assert_persisted_schema_markers(conn)
         self._verify_catalog(conn)
+
+    @staticmethod
+    def _ensure_optional_search_acceleration(conn) -> None:
+        """Install optional trigram search only during create/migrate paths."""
+        try:
+            with conn.transaction():
+                for stmt in PG_TRGM_SQL:
+                    conn.execute(stmt)
+        except Exception as exc:
+            # This runs after the correctness transaction. A savepoint keeps an
+            # unavailable extension or index from poisoning the connection;
+            # search then degrades to unindexed ILIKE.
+            logger.info(
+                "pg_trgm acceleration unavailable for the session store "
+                "(CJK search falls back to unindexed ILIKE): %s",
+                exc,
+            )
 
     @staticmethod
     def _read_surface_marker(conn) -> Optional[str]:
@@ -2368,7 +2384,8 @@ class PgSessionDB(SessionDB):
             "ON referenced_table.oid = constraint_catalog.confrelid "
             "LEFT JOIN pg_namespace AS referenced_schema "
             "ON referenced_schema.oid = referenced_table.relnamespace "
-            "WHERE table_schema.nspname = %s",
+            "WHERE table_schema.nspname = %s "
+            "AND constraint_catalog.contype IN ('p', 'f', 'u', 'c', 'x')",
             (_SCHEMA,),
         ).fetchall()
         actual_constraint_specs: Dict[

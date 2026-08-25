@@ -10,6 +10,7 @@ import importlib.util
 import json
 import pathlib
 import sys
+import time
 import types
 
 import pytest
@@ -64,6 +65,13 @@ class _FakeConnection:
         self.fail_next_response_insert = False
         self.schema_init_count = 0
         self.schema_lock_count = 0
+        self.schema_contract_version = None
+        self.raise_on_schema_fast_path = False
+        self.schema_mutation_count = 0
+        self.responses_relation_exists = False
+        self.conversations_relation_exists = False
+        self.access_index_exists = False
+        self.owner_heartbeat_column_exists = True
         self.terminal_default = False
         self.legacy_function_exists = False
         self.legacy_function_definition_valid = True
@@ -85,6 +93,33 @@ class _FakeConnection:
     def execute(self, sql, params=None):
         normalized = " ".join(sql.split()).lower()
         params = params or ()
+        if "hermes_response_schema_contract_version" in normalized:
+            return _FakeCursor(
+                [(self.schema_contract_version,)]
+                if self.schema_contract_version is not None
+                else []
+            )
+        if "hermes_response_schema_contract_fast_path" in normalized:
+            if self.raise_on_schema_fast_path:
+                raise _FakeUndefinedTable()
+            return _FakeCursor(
+                [(
+                    self.schema_contract_version,
+                    self.responses_relation_exists,
+                    self.conversations_relation_exists,
+                    self.legacy_function_exists,
+                    self.trigger_exists,
+                    self.owned_fence_function_exists,
+                    self.owned_fence_trigger_exists,
+                    self.conversation_fence_function_exists,
+                    self.conversation_fence_trigger_exists,
+                    self.fk_exists,
+                    self.access_index_exists,
+                    self.owner_heartbeat_column_exists,
+                )]
+                if self.schema_contract_version is not None
+                else []
+            )
         if "hermes_response_legacy_function_contract" in normalized:
             return _FakeCursor(
                 [(self.legacy_function_definition_valid,)]
@@ -134,6 +169,23 @@ class _FakeConnection:
             return _FakeCursor([(self.response_write_owner_id, self.response_write_owner_epoch)])
         if normalized.startswith("create schema"):
             self.schema_init_count += 1
+            self.schema_mutation_count += 1
+            return _FakeCursor()
+        if normalized.startswith("create table if not exists hermes_gw.responses"):
+            self.responses_relation_exists = True
+            self.schema_mutation_count += 1
+            return _FakeCursor()
+        if normalized.startswith("create table if not exists hermes_gw.conversations"):
+            self.conversations_relation_exists = True
+            self.schema_mutation_count += 1
+            return _FakeCursor()
+        if normalized.startswith("create index if not exists idx_responses_accessed_at"):
+            self.access_index_exists = True
+            self.schema_mutation_count += 1
+            return _FakeCursor()
+        if normalized.startswith("insert into hermes_gw.schema_contract"):
+            self.schema_contract_version = params[0]
+            self.schema_mutation_count += 1
             return _FakeCursor()
         if normalized.startswith(
             "create function hermes_gw.sync_legacy_response_terminal"
@@ -166,6 +218,7 @@ class _FakeConnection:
             self.owned_fence_trigger_definition_valid = True
             return _FakeCursor()
         if normalized.startswith("create "):
+            self.schema_mutation_count += 1
             return _FakeCursor()
         if (
             normalized.startswith("alter table hermes_gw.conversations")
@@ -175,6 +228,7 @@ class _FakeConnection:
             self.fk_definition_valid = True
             return _FakeCursor()
         if normalized.startswith("alter table"):
+            self.schema_mutation_count += 1
             if "alter column terminal set default true" in normalized:
                 self.terminal_default = True
             return _FakeCursor()
@@ -198,6 +252,17 @@ class _FakeConnection:
                     "incomplete",
                 }
             return _FakeCursor()
+        if normalized.startswith(
+            "update hermes_gw.responses set owner_heartbeat_at = %s where terminal = false"
+        ):
+            heartbeat_at = params[0]
+            for row in self.responses.values():
+                if (
+                    not row["terminal"]
+                    and row.get("owner_heartbeat_at") is None
+                ):
+                    row["owner_heartbeat_at"] = heartbeat_at
+            return _FakeCursor()
         if normalized.startswith("delete from hermes_gw.conversations as c"):
             self.conversations = {
                 name: response_id
@@ -208,9 +273,18 @@ class _FakeConnection:
         if normalized.startswith("insert into hermes_gw.responses"):
             if self.fail_next_response_insert:
                 self.fail_next_response_insert = False
+                self.responses_relation_exists = False
                 raise _FakeUndefinedTable("relation hermes_gw.responses does not exist")
             if "do nothing" in normalized:
-                response_id, data, accessed_at, owner_id, owner_epoch, terminal = params
+                (
+                    response_id,
+                    data,
+                    accessed_at,
+                    owner_id,
+                    owner_epoch,
+                    owner_heartbeat_at,
+                    terminal,
+                ) = params
                 if response_id in self.responses:
                     return _FakeCursor(rowcount=0)
             elif len(params) == 3:
@@ -225,10 +299,12 @@ class _FakeConnection:
                     # ownership and terminality remain the target row's values.
                     owner_id = existing["owner_id"]
                     owner_epoch = existing["owner_epoch"]
+                    owner_heartbeat_at = existing.get("owner_heartbeat_at")
                     terminal = existing["terminal"]
                 else:
                     owner_id = None
                     owner_epoch = None
+                    owner_heartbeat_at = None
                     status = decoded.get("response", {}).get("status", "completed")
                     terminal = status in {
                         "completed",
@@ -238,7 +314,7 @@ class _FakeConnection:
                         "incomplete",
                     }
             else:
-                response_id, data, accessed_at, terminal = params
+                response_id, data, accessed_at, owner_heartbeat_at, terminal = params
                 owner_id = None
                 owner_epoch = None
             decoded = data.value if isinstance(data, _FakeJsonb) else data
@@ -262,6 +338,7 @@ class _FakeConnection:
                 "accessed_at": accessed_at,
                 "owner_id": owner_id,
                 "owner_epoch": owner_epoch,
+                "owner_heartbeat_at": owner_heartbeat_at,
                 "terminal": terminal,
             }
             return _FakeCursor([(response_id,)], rowcount=1)
@@ -283,8 +360,69 @@ class _FakeConnection:
             response_id = params[0]
             row = self.responses.get(response_id)
             return _FakeCursor([(row["terminal"],)] if row else [])
+        if normalized.startswith("select /* hermes_response_stale_recovery */"):
+            response_id = params[0]
+            row = self.responses.get(response_id)
+            return _FakeCursor(
+                [(
+                    row["data"],
+                    row["owner_id"],
+                    row["owner_epoch"],
+                    row.get("owner_heartbeat_at"),
+                    row["accessed_at"],
+                    row["terminal"],
+                )]
+                if row
+                else []
+            )
+        if normalized.startswith(
+            "update /* hermes_response_stale_recovery_commit */ hermes_gw.responses"
+        ):
+            (
+                data,
+                accessed_at,
+                response_id,
+                owner_id,
+                owner_epoch,
+                stale_before,
+                legacy_stale_before,
+            ) = params
+            row = self.responses.get(response_id)
+            matches = bool(
+                row
+                and row["owner_id"] == owner_id
+                and row["owner_epoch"] == owner_epoch
+                and not row["terminal"]
+                and (
+                    (
+                        row.get("owner_heartbeat_at") is not None
+                        and row["owner_heartbeat_at"] < stale_before
+                    )
+                    or (
+                        row["owner_id"] is None
+                        and row["owner_epoch"] is None
+                        and row.get("owner_heartbeat_at") is None
+                        and row["accessed_at"] < legacy_stale_before
+                    )
+                )
+            )
+            if matches:
+                row.update(
+                    data=data.value if isinstance(data, _FakeJsonb) else data,
+                    accessed_at=accessed_at,
+                    terminal=True,
+                )
+            return _FakeCursor(rowcount=int(matches))
         if normalized.startswith("update hermes_gw.responses set data"):
-            data, accessed_at, terminal, response_id, owner_id, owner_epoch = params
+            (
+                data,
+                accessed_at,
+                owner_heartbeat_at,
+                terminal,
+                response_id,
+                owner_id,
+                owner_epoch,
+            ) = params
             row = self.responses.get(response_id)
             matches = bool(
                 row
@@ -301,8 +439,23 @@ class _FakeConnection:
                 row.update(
                     data=data.value if isinstance(data, _FakeJsonb) else data,
                     accessed_at=accessed_at,
+                    owner_heartbeat_at=owner_heartbeat_at,
                     terminal=terminal,
                 )
+            return _FakeCursor(rowcount=int(matches))
+        if normalized.startswith(
+            "update hermes_gw.responses set owner_heartbeat_at = %s where response_id = %s"
+        ):
+            heartbeat_at, response_id, owner_id, owner_epoch = params
+            row = self.responses.get(response_id)
+            matches = bool(
+                row
+                and row["owner_id"] == owner_id
+                and row["owner_epoch"] == owner_epoch
+                and not row["terminal"]
+            )
+            if matches:
+                row["owner_heartbeat_at"] = heartbeat_at
             return _FakeCursor(rowcount=int(matches))
         if normalized.startswith("update hermes_gw.responses set accessed_at"):
             accessed_at, response_id = params
@@ -454,6 +607,55 @@ def test_pg_response_store_exposes_positive_backend_attestation(monkeypatch):
         store.close()
 
 
+def test_pg_current_schema_second_boot_avoids_ddl_lock_and_backfill(monkeypatch):
+    _install_fake_psycopg_modules(monkeypatch)
+    store = PgResponseStore("postgresql://fake")
+    try:
+        conn = _FakePool.last_instance.conn
+        mutations = conn.schema_mutation_count
+        locks = conn.schema_lock_count
+
+        store._init_schema()
+
+        assert conn.schema_mutation_count == mutations
+        assert conn.schema_lock_count == locks
+    finally:
+        store.close()
+
+
+def test_pg_current_schema_missing_heartbeat_column_reenters_migration(monkeypatch):
+    _install_fake_psycopg_modules(monkeypatch)
+    store = PgResponseStore("postgresql://fake")
+    try:
+        conn = _FakePool.last_instance.conn
+        locks = conn.schema_lock_count
+        conn.owner_heartbeat_column_exists = False
+
+        store._init_schema()
+
+        assert conn.schema_lock_count == locks + 1
+    finally:
+        store.close()
+
+
+def test_pg_future_schema_contract_fails_closed_without_mutation(monkeypatch):
+    _install_fake_psycopg_modules(monkeypatch)
+    store = PgResponseStore("postgresql://fake")
+    try:
+        conn = _FakePool.last_instance.conn
+        conn.schema_contract_version = 99
+        conn.raise_on_schema_fast_path = True
+        mutations = conn.schema_mutation_count
+
+        with pytest.raises(RuntimeError, match="newer than this runtime"):
+            store._init_schema()
+
+        assert conn.schema_contract_version == 99
+        assert conn.schema_mutation_count == mutations
+    finally:
+        store.close()
+
+
 def test_pg_response_store_reinitializes_missing_schema_once(monkeypatch):
     _install_fake_psycopg_modules(monkeypatch)
     store = PgResponseStore("postgresql://fake", max_size=3)
@@ -518,6 +720,51 @@ def test_pg_owned_terminal_transition_cannot_be_overwritten_or_resurrected(
         store.close()
 
 
+def test_pg_stale_owner_recovery_is_heartbeat_fenced(monkeypatch):
+    _install_fake_psycopg_modules(monkeypatch)
+    store = PgResponseStore("postgresql://fake")
+    try:
+        for response_id in ("orphan", "live"):
+            assert store.claim(
+                response_id,
+                {"response": {"id": response_id, "status": "in_progress"}},
+                owner_id=f"owner-{response_id}",
+                owner_epoch=f"epoch-{response_id}",
+            )
+        conn = _FakePool.last_instance.conn
+        conn.responses["orphan"]["owner_heartbeat_at"] = 1.0
+
+        assert store.heartbeat(
+            "live", owner_id="owner-live", owner_epoch="epoch-live"
+        )
+        assert store.recover_stale_owned("orphan", stale_before=2.0)
+        assert not store.recover_stale_owned("live", stale_before=2.0)
+        assert store.get("orphan")["response"]["status"] == "incomplete"
+        assert store.get_control("orphan")["terminal"] is True
+        assert store.get_control("live")["terminal"] is False
+    finally:
+        store.close()
+
+
+def test_pg_ownerless_legacy_put_expires(monkeypatch):
+    _install_fake_psycopg_modules(monkeypatch)
+    store = PgResponseStore("postgresql://fake")
+    try:
+        store.put(
+            "legacy",
+            {"response": {"id": "legacy", "status": "in_progress"}},
+        )
+        conn = _FakePool.last_instance.conn
+        conn.responses["legacy"]["owner_heartbeat_at"] = None
+        conn.responses["legacy"]["accessed_at"] = 1.0
+
+        assert store.recover_stale_owned("legacy", stale_before=2.0)
+        assert store.get("legacy")["response"]["status"] == "incomplete"
+        assert store.delete_terminal("legacy") == "deleted"
+    finally:
+        store.close()
+
+
 def test_pg_existing_table_migration_backfills_state_and_removes_dangling_mappings(
     monkeypatch,
 ):
@@ -559,6 +806,9 @@ def test_pg_existing_table_migration_backfills_state_and_removes_dangling_mappin
                 "dangling": "missing-response",
             }
         )
+
+        # Simulate a database created by the pre-marker schema version.
+        conn.schema_contract_version = None
 
         store._init_schema()
 

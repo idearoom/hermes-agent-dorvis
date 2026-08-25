@@ -3076,6 +3076,33 @@ def _heartbeat_fire_claim_locked(job_id: str, *, expected_owner: str) -> bool:
     return False
 
 
+def release_fire_claim(job_id: str, *, expected_owner: str) -> bool:
+    """Release an unstarted fire without recording a run outcome.
+
+    Admission can fail before ``run_one_job`` begins (for example while an ECS
+    task is draining). That is not a failed execution and must not consume a
+    finite repeat or overwrite ``last_status``. The owner fence prevents a
+    stale caller from clearing a claim that another process recovered.
+    """
+    if not expected_owner:
+        return False
+    with _fire_job_lock(job_id) as acquired:
+        if not acquired:
+            return False
+        with _jobs_lock():
+            jobs = load_jobs()
+            for job in jobs:
+                if job.get("id") != job_id:
+                    continue
+                claim = job.get("fire_claim")
+                if not isinstance(claim, dict) or claim.get("by") != expected_owner:
+                    return False
+                job["fire_claim"] = None
+                save_jobs(jobs)
+                return True
+    return False
+
+
 def get_due_jobs() -> List[Dict[str, Any]]:
     """Get all jobs that are due to run now.
 

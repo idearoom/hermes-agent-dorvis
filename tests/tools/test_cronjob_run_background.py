@@ -237,6 +237,29 @@ class TestInFlightDedupe:
         assert seen_during_run["registered"] is True
         assert "job-bg-09" not in sched.get_running_job_ids()   # released after
 
+    def test_task_protection_refusal_releases_claim_without_false_run(self):
+        """Admission refusal is not an attempted cron execution."""
+        from gateway.drain_mode import TaskProtectionUnavailableError
+        from tools.cronjob_tools import _run_claimed_job
+
+        claimed = {
+            **_job("job-bg-protection-refused"),
+            "fire_claim": {"by": "manual-owner"},
+        }
+        with patch(
+            "cron.scheduler.try_register_running_job",
+            side_effect=TaskProtectionUnavailableError("draining"),
+        ), patch("tools.cronjob_tools.release_fire_claim") as release_claim, patch(
+            "tools.cronjob_tools.mark_job_run"
+        ) as mark_run:
+            result = _run_claimed_job(claimed)
+
+        assert result == {"claimed": True, "success": False, "error": "draining"}
+        release_claim.assert_called_once_with(
+            "job-bg-protection-refused", expected_owner="manual-owner"
+        )
+        mark_run.assert_not_called()
+
     def test_background_dispatch_reports_running_job_immediately(self):
         """The dispatch path pre-checks the running set so a mid-run job
         reports in the tool response, not as a delayed completion event."""

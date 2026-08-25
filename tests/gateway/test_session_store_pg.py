@@ -106,6 +106,10 @@ def test_full_crud_round_trip(pg_db):
 
     conv = pg_db.get_messages_as_conversation(sid)
     assert any(m["role"] == "assistant" for m in conv)
+    assert [m["role"] for m in pg_db.get_messages(sid, offset=1)] == [
+        "assistant",
+        "user",
+    ]
 
     pg_db.update_token_counts(sid, input_tokens=100, output_tokens=50)
     assert pg_db.get_session(sid)["input_tokens"] == 100
@@ -113,6 +117,17 @@ def test_full_crud_round_trip(pg_db):
     assert pg_db.delete_session(sid) is True
     assert pg_db.get_session(sid) is None
     assert pg_db.get_messages(sid) == []
+
+
+def test_second_current_schema_boot_is_catalog_neutral(pg_db):
+    with psycopg.connect(_DSN, autocommit=True) as conn:
+        before = _catalog_signature(conn)
+
+    second = PgSessionDB(dsn=_DSN)
+    second.close()
+
+    with psycopg.connect(_DSN, autocommit=True) as conn:
+        assert _catalog_signature(conn) == before
 
 
 def test_replace_messages_and_counters(pg_db):
@@ -461,6 +476,20 @@ def test_migration_mode_refuses_absent_schema_without_initializing_it():
         assert conn.execute(
             "SELECT to_regnamespace(%s)", (_SCHEMA,)
         ).fetchone()[0] is None
+
+
+def test_v22_optional_trigram_index_is_accepted_by_live_migration():
+    _drop_schema()
+    with psycopg.connect(_DSN, autocommit=True) as conn:
+        _create_frozen_v22_store(conn)
+        for statement in hermes_state_pg.PG_TRGM_SQL:
+            conn.execute(statement)
+
+    dry_run = _run_v26_migration()
+    assert dry_run.returncode == 0, dry_run.stderr
+
+    applied = _run_v26_migration("--apply")
+    assert applied.returncode == 0, applied.stderr
 
 
 def test_v22_requires_explicit_migration_and_preserves_rows():

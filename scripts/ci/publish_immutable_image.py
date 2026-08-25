@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """Publish one smoke-tested Docker image under a conflict-safe immutable tag.
 
-Docker's local image ID is the digest of the image config JSON.  A registry
-digest is instead the digest of a manifest (or index) that points at that
-config and the image layers.  Treating those two values as interchangeable can
-make a publisher claim it tested content that it rebuilt or replaced later.
+BuildKit reports the digest of the image config JSON as its image ID. Docker's
+local ``inspect .Id`` is not portable across image stores: the containerd
+store can report a manifest/index digest there instead. A registry digest is
+also the digest of a manifest (or index) that points at the config and layers.
+Treating those identities as interchangeable can make a publisher claim it
+tested content that it rebuilt or replaced later.
 
 This publisher never builds.  It accepts the already-built, already-smoked
 local image, checks the OCI labels and platform, and then:
@@ -44,7 +46,8 @@ _DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
 _REVISION = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
 _REVISION_LABEL = "org.opencontainers.image.revision"
 _SOURCE_LABEL = "org.opencontainers.image.source"
-_POST_PUSH_ATTEMPTS = 4
+_POST_PUSH_ATTEMPTS = 7
+_POST_PUSH_MAX_DELAY_SECONDS = 15.0
 
 
 class PublishError(RuntimeError):
@@ -167,7 +170,11 @@ def _verify_manifest_bytes(
     return _json_object(raw, description)
 
 
-def inspect_local_image(reference: str, cli: Any) -> LocalImage:
+def inspect_local_image(
+    reference: str,
+    cli: Any,
+    expected_config_digest: str | None = None,
+) -> LocalImage:
     args = ["docker", "image", "inspect", reference]
     result = cli.run(args, capture=True, check=False)
     if result.returncode:
@@ -184,7 +191,15 @@ def inspect_local_image(reference: str, cli: Any) -> LocalImage:
         raise PublishError("docker image inspect did not resolve exactly one image")
 
     data = payload[0]
-    config_digest = _require_digest(data.get("Id"), "local image")
+    # docker/build-push-action exposes BuildKit's config-based image ID. Use
+    # that identity when supplied because Docker's containerd image store uses
+    # the manifest/index digest for inspect .Id. The inspect call still proves
+    # the loaded reference's labels and platform before the exact tag is
+    # smoked and pushed.
+    config_digest = _require_digest(
+        expected_config_digest if expected_config_digest is not None else data.get("Id"),
+        "smoke-tested image config",
+    )
     config = data.get("Config")
     raw_labels = config.get("Labels") if isinstance(config, dict) else None
     labels = raw_labels if isinstance(raw_labels, dict) else {}
@@ -377,10 +392,11 @@ def publish_immutable_image(
     expected_source: str,
     cli: Any,
     *,
+    expected_config_digest: str | None = None,
     sleep: Callable[[float], None] = time.sleep,
 ) -> PublishResult:
     """Publish the local image once, or prove an existing tag is identical."""
-    local = inspect_local_image(local_reference, cli)
+    local = inspect_local_image(local_reference, cli, expected_config_digest)
     _validate_identity(local, immutable_reference, expected_revision, expected_source)
 
     tag_args = ["docker", "image", "tag", local_reference, immutable_reference]
@@ -409,7 +425,7 @@ def publish_immutable_image(
         if remote is not None:
             break
         if attempt + 1 < _POST_PUSH_ATTEMPTS:
-            sleep(float(2**attempt))
+            sleep(min(float(2**attempt), _POST_PUSH_MAX_DELAY_SECONDS))
     if remote is None:
         detail = f": {last_error}" if last_error is not None else ""
         raise PublishError(
@@ -474,6 +490,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--immutable-image", required=True)
     parser.add_argument("--expected-revision", required=True)
     parser.add_argument("--expected-source", required=True)
+    parser.add_argument("--expected-config-digest", required=True)
     parser.add_argument("--artifact-file", type=Path, default=Path("ghcr-image.json"))
     args = parser.parse_args(argv)
 
@@ -484,6 +501,7 @@ def main(argv: list[str] | None = None) -> int:
             args.expected_revision,
             args.expected_source,
             DockerCLI(),
+            expected_config_digest=args.expected_config_digest,
         )
         write_evidence(
             result,

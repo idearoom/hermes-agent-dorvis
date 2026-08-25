@@ -54,6 +54,13 @@ def test_qmark_placeholders_become_pyformat():
     )
 
 
+def test_offset_only_limit_sentinel_becomes_postgres_unbounded_limit():
+    assert _translate_sql(
+        "SELECT * FROM messages LIMIT ? OFFSET ?",
+        with_params=True,
+    ) == "SELECT * FROM messages LIMIT NULLIF(%s, -1) OFFSET %s"
+
+
 def test_question_mark_inside_literal_is_preserved():
     sql = "SELECT '?' AS q, id FROM sessions WHERE id = ?"
     out = _translate_sql(sql, with_params=True)
@@ -519,6 +526,7 @@ class _CatalogConn:
         wrong_constraint=None,
         include_optional_index=False,
         extra_index=None,
+        pg18_not_null_constraints=False,
     ):
         self.executed = []
         self.version = version
@@ -532,6 +540,7 @@ class _CatalogConn:
         self.wrong_constraint = wrong_constraint
         self.include_optional_index = include_optional_index
         self.extra_index = extra_index
+        self.pg18_not_null_constraints = pg18_not_null_constraints
 
     def execute(self, sql, params=None):
         self.executed.append((sql, params))
@@ -645,6 +654,28 @@ class _CatalogConn:
                 )
             if self.extra_constraint is not None:
                 rows.append(self.extra_constraint)
+            if (
+                self.pg18_not_null_constraints
+                and "constraint_catalog.contype in ('p', 'f', 'u', 'c', 'x')"
+                not in " ".join(sql.lower().split())
+            ):
+                rows.append(
+                    (
+                        "sessions",
+                        "sessions_id_not_null",
+                        "n",
+                        False,
+                        False,
+                        True,
+                        ("id",),
+                        None,
+                        None,
+                        (),
+                        " ",
+                        " ",
+                        " ",
+                    )
+                )
             return _RowsResult(rows)
         if "SELECT id, system_prompt" in sql:
             return _RowsResult(self.prompt_rows)
@@ -754,6 +785,12 @@ def test_catalog_verification_rejects_unexpected_constraint():
         PgSessionDB._verify_catalog(conn)
 
 
+def test_catalog_verification_ignores_postgres18_not_null_catalog_rows():
+    PgSessionDB._verify_catalog(
+        _CatalogConn(catalog_version=26, pg18_not_null_constraints=True)
+    )
+
+
 def test_catalog_verification_rejects_wrong_foreign_key_delete_action():
     conn = _CatalogConn(
         catalog_version=26,
@@ -813,6 +850,31 @@ def test_ordinary_boot_refuses_v22_without_running_migration_ddl():
         for sql, _ in conn.executed
     )
     assert db._storage_attestation is None
+
+
+def test_ordinary_v26_boot_is_observation_only():
+    conn = _CatalogConn(
+        version=EXPECTED_SCHEMA_VERSION,
+        surface=EXPECTED_SCHEMA_SURFACE_SHA256,
+        catalog_version=EXPECTED_SCHEMA_VERSION,
+        include_optional_index=True,
+    )
+    db = PgSessionDB.__new__(PgSessionDB)
+    db._pool = _Pool(conn)
+    db._allow_schema_migration = False
+    db._storage_attestation = None
+
+    db._init_pg_schema()
+
+    assert not any(
+        sql.lstrip().startswith(("CREATE", "ALTER", "INSERT", "UPDATE", "DELETE"))
+        for sql, _ in conn.executed
+    )
+    assert db._storage_attestation == {
+        "backend": "postgres",
+        "schema_version": EXPECTED_SCHEMA_VERSION,
+        "surface_marker": EXPECTED_SCHEMA_SURFACE_SHA256,
+    }
 
 
 def test_explicit_v22_preflight_accepts_only_the_exact_catalog():
