@@ -282,7 +282,8 @@ RUN mkdir -p "${UV_TOOL_BIN_DIR}" && \
     uv tool install --python /usr/bin/python3 --resolution lowest-direct \
         "browser-harness>=${BROWSER_HARNESS_VERSION},<0.3" && \
     ln -sf /opt/hermes/bin/browser-harness /opt/hermes/bin/browser-use && \
-    /opt/hermes/bin/browser-use --version | grep -Fx "${BROWSER_HARNESS_VERSION}"
+    browser_harness_version="$(/opt/hermes/bin/browser-use --version)" && \
+    test "${browser_harness_version}" = "${BROWSER_HARNESS_VERSION}"
 
 # ---------- Frontend build (cached independently from Python source) ----------
 # Copy only the frontend source trees first so that Python-only changes don't
