@@ -130,19 +130,24 @@ async def test_idle_queue_sends_payload_as_next_turn(command_text):
 
 
 @pytest.mark.asyncio
-async def test_idle_queue_without_payload_returns_usage():
+async def test_internal_event_is_silently_deferred_when_drain_blocks_admission(
+    monkeypatch,
+):
+    """A system event must not emit a user-facing retry message during drain."""
     runner, _adapter = _make_runner()
-    called = False
+    runner._external_drain_active = True
+    runner._handle_message_with_agent = AsyncMock(return_value="must not run")
 
-    async def fake_handle_message_with_agent(event, source, key, generation):
-        nonlocal called
-        called = True
-        return {"final_response": "", "messages": []}
+    async def _refuse_protection():
+        return False
 
-    runner._handle_message_with_agent = fake_handle_message_with_agent
+    monkeypatch.setattr(
+        "gateway.drain_mode.ensure_task_protection_for_admission",
+        _refuse_protection,
+    )
 
-    result = await runner._handle_message(_make_event("/queue"))
+    result = await runner._handle_message(_make_event("[BACKGROUND COMPLETE]"))
 
-    assert result == "Usage: /queue <prompt>"
-    assert called is False
-    assert runner._running_agents == {}
+    assert result is None
+    runner._handle_message_with_agent.assert_not_awaited()
+

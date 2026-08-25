@@ -31,12 +31,18 @@ on:
   push:
     # No path filter on purpose. The failure mode this guards is an upstream
     # rebase, which touches effectively everything and is precisely when a
-    # path-filtered job would be skipped. The suite is ~70 tests / ~10s, so
+    # path-filtered job would be skipped. The suite is ~90 tests / ~15s, so
     # running it unconditionally costs less than reasoning about which paths
     # can move a schema contract.
     branches: [dorvis/runtime, main]
   pull_request:
     branches: [dorvis/runtime, main]
+  # Manual re-arm (AE-200): a dorvis/runtime push event once produced no
+  # workflow run at all (GitHub dropped the trigger), which starves the
+  # idearoom-agents hermes-fork-pin-gate — it requires a successful run of
+  # this workflow at the exact pinned sha. Dispatching on the branch creates
+  # a run at its HEAD sha, which is what the gate queries for.
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -77,11 +83,16 @@ jobs:
       # The suite drops and recreates the `hermes_state` schema per test, so it
       # needs a throwaway database -- which is what the service container is.
       HERMES_STATE_TEST_DSN: postgresql://postgres:postgres@127.0.0.1:5432/hermes_state_ci
+      # The Responses API store uses its own explicit opt-in name so a workflow
+      # cannot accidentally point it at a developer database. This service is
+      # the same per-run throwaway database and each suite owns its schema.
+      HERMES_D6_TEST_DSN: postgresql://postgres:postgres@127.0.0.1:5432/hermes_state_ci
       JUNIT_XML: pg-state-junit.xml
       # These modules are the contract surface: the integration suite needs the
       # live DSN, the unit suite pins the schema-drift guard itself, and the
-      # delegation suite covers the second writer AE-183 moved onto this store.
-      PG_TEST_FILES: tests/gateway/test_session_store_pg.py tests/gateway/test_session_store_pg_unit.py tests/gateway/test_async_delegation_pg.py
+      # delegation suite covers the second writer AE-183 moved onto this store;
+      # the Responses suite exercises its separate lifecycle schema live.
+      PG_TEST_FILES: tests/gateway/test_session_store_pg.py tests/gateway/test_session_store_pg_unit.py tests/gateway/test_async_delegation_pg.py tests/gateway/test_response_store_pg.py
 
     steps:
       - name: Checkout code
@@ -142,11 +153,11 @@ jobs:
         # rebase author needs.
         if: always()
         env:
-          # Floor, not an exact count: 68 tests collect today, so a normal
+          # Floor, not an exact count: ~90 tests collect today, so a normal
           # test addition sails through while a wholesale disappearance (the
           # integration module alone is 27 of them) trips it. Raise this when
           # the suite grows a lot; never lower it to make a red run green.
-          MIN_TESTS: "60"
+          MIN_TESTS: "80"
         run: |
           set -euo pipefail
           python3 - <<'PY'

@@ -80,8 +80,17 @@ def normalize_tool_schema(schema: Any) -> Optional[Dict[str, Any]]:
     return schema
 
 
-def memory_provider_tools_enabled(enabled_toolsets: Optional[List[str]]) -> bool:
+def memory_provider_tools_enabled(
+    enabled_toolsets: Optional[List[str]],
+    disabled_toolsets: Optional[List[str]] = None,
+    *,
+    memory_tool_present: bool = False,
+) -> bool:
     """Return whether external memory-provider tools should be exposed."""
+    if disabled_toolsets and "memory" in disabled_toolsets:
+        return False
+    if memory_tool_present:
+        return True
     if enabled_toolsets is None:
         return True
     if not enabled_toolsets:
@@ -110,9 +119,10 @@ def inject_memory_provider_tools(agent: Any) -> int:
         for tool in tools
         if isinstance(tool, dict)
     }
-    if (
-        "memory" not in existing_tool_names
-        and not memory_provider_tools_enabled(getattr(agent, "enabled_toolsets", None))
+    if not memory_provider_tools_enabled(
+        getattr(agent, "enabled_toolsets", None),
+        getattr(agent, "disabled_toolsets", None),
+        memory_tool_present="memory" in existing_tool_names,
     ):
         return 0
 
@@ -371,6 +381,10 @@ class MemoryManager:
             raise ValueError("external_prefetch_timeout must be positive")
         self._external_prefetch_threads: Dict[str, threading.Thread] = {}
         self._external_prefetch_lock = threading.Lock()
+        # Per-memory structure behind the most recent prefetch_all(), keyed by
+        # nothing but recency: it is rebuilt every prefetch_all() call and read
+        # once by the turn prologue (AE-194). Observational only.
+        self._last_prefetch_memories: List[Dict[str, Any]] = []
         # Background executor for end-of-turn sync/prefetch. Lazily created on
         # first use so the common builtin-only path spawns no extra threads.
         # A single worker serializes a provider's writes (turn N must land
@@ -518,6 +532,7 @@ class MemoryManager:
         Returns merged context text labeled by provider. Empty providers
         are skipped. Failures in one provider don't block others.
         """
+        self._last_prefetch_memories = []
         clean_query = self._strip_skill_scaffolding(query)
         if not clean_query:
             return ""
@@ -527,12 +542,38 @@ class MemoryManager:
                 result = self._prefetch_provider(provider, clean_query, session_id=session_id)
                 if result and result.strip():
                     parts.append(result)
+                    self._last_prefetch_memories.extend(
+                        self._collect_prefetch_memories(provider)
+                    )
             except Exception as e:
                 logger.debug(
                     "Memory provider '%s' prefetch failed (non-fatal): %s",
                     provider.name, e,
                 )
         return "\n\n".join(parts)
+
+    @staticmethod
+    def _collect_prefetch_memories(provider: MemoryProvider) -> List[Dict[str, Any]]:
+        """Drain one provider's per-memory recall structure (AE-194).
+
+        Traceability only: a provider that cannot name its memories, or that
+        raises here, contributes nothing and never affects the injected text.
+        """
+        try:
+            records = provider.consume_prefetch_memories()
+        except Exception as exc:
+            logger.debug(
+                "Memory provider '%s' returned no recall structure: %s",
+                getattr(provider, "name", "?"), exc,
+            )
+            return []
+        if not isinstance(records, list):
+            return []
+        return [record for record in records if isinstance(record, dict)]
+
+    def last_prefetch_memories(self) -> List[Dict[str, Any]]:
+        """Per-memory structure behind the most recent ``prefetch_all``."""
+        return list(self._last_prefetch_memories)
 
     def _prefetch_provider(
         self, provider: MemoryProvider, query: str, *, session_id: str = ""
@@ -549,8 +590,13 @@ class MemoryManager:
             except Exception as exc:  # pragma: no cover - re-raised by caller
                 error_box["value"] = exc
 
+        # Propagate the caller's contextvars (profile HERMES_HOME override)
+        # to the prefetch thread — see _submit_background.
+        import contextvars
+        from functools import partial
+
         thread = threading.Thread(
-            target=_run,
+            target=partial(contextvars.copy_context().run, _run),
             daemon=True,
             name=f"memory-prefetch-{provider.name}",
         )
@@ -583,6 +629,38 @@ class MemoryManager:
         if error_box:
             raise error_box["value"]
         return result_box.get("value", "")
+
+    def describe_recall(self) -> str:
+        """Build a deterministic, model-independent recall indicator line.
+
+        Call right after :meth:`prefetch_all` on the turn thread. Collects each
+        provider's :meth:`MemoryProvider.recall_status` and renders a single
+        status string (e.g. ``"🧠 Provider — recalled 3 memories"``) so the
+        user SEES memory was used regardless of whether the model mentions it.
+        Returns ``""`` when no provider injected memory this turn — callers can
+        emit the result unconditionally.
+        """
+        segments: List[str] = []
+        for provider in self._providers:
+            try:
+                status = provider.recall_status()
+            except Exception as e:
+                logger.debug(
+                    "Memory provider '%s' recall_status failed (non-fatal): %s",
+                    provider.name, e,
+                )
+                continue
+            if status is None:
+                continue
+            if status.count == 1:
+                detail = "recalled 1 memory"
+            elif status.count > 1:
+                detail = f"recalled {status.count} memories"
+            else:
+                # count <= 0 → content injected but no discrete count (reflect).
+                detail = "recalled relevant memory"
+            segments.append(f"{status.glyph} {status.provider_label} — {detail}")
+        return "  ".join(segments)
 
     def queue_prefetch_all(self, query: str, *, session_id: str = "") -> None:
         """Queue background prefetch on all providers for the next turn.
@@ -725,7 +803,20 @@ class MemoryManager:
     # -- Background dispatch -------------------------------------------------
 
     def _submit_background(self, fn, *, kind: str = "write") -> None:
-        """Queue ``fn`` on the serialized worker and track its durability class."""
+        """Queue ``fn`` on the serialized worker and track its durability class.
+
+        The submitted callable is wrapped with the CALLER's contextvars:
+        profile isolation in multi-profile processes (gateway multiplexer,
+        dashboard, cron) is a ContextVar-scoped HERMES_HOME override, and
+        executor worker threads start with empty contexts — without the
+        wrap, a provider resolving ambient state (config paths, secrets)
+        from the worker would silently land on the default profile.
+        """
+        import contextvars
+        from functools import partial
+
+        ctx = contextvars.copy_context()
+        fn = partial(ctx.run, fn)
         executor = self._get_sync_executor()
         if executor is None:
             if self._shutting_down:

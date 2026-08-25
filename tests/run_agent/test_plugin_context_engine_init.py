@@ -45,7 +45,7 @@ def test_plugin_engine_gets_context_length_on_init():
     cfg = {"context": {"engine": "stub"}, "agent": {}}
 
     with (
-        patch("hermes_cli.config.load_config", return_value=cfg),
+        patch("hermes_cli.config.load_config", return_value=cfg), patch("hermes_cli.config.load_config_readonly", return_value=cfg),
         patch("plugins.context_engine.load_context_engine", return_value=engine),
         patch("agent.model_metadata.get_model_context_length", return_value=204_800),
         patch("run_agent.get_tool_definitions", return_value=[]),
@@ -82,7 +82,7 @@ def test_active_context_engine_tools_survive_explicit_platform_toolsets():
     assert "context_engine" in enabled_toolsets
 
     with (
-        patch("hermes_cli.config.load_config", return_value=cfg),
+        patch("hermes_cli.config.load_config", return_value=cfg), patch("hermes_cli.config.load_config_readonly", return_value=cfg),
         patch("plugins.context_engine.load_context_engine", return_value=engine),
         patch("agent.model_metadata.get_model_context_length", return_value=204_800),
         patch("run_agent.get_tool_definitions", return_value=[]),
@@ -115,7 +115,7 @@ def test_plugin_engine_update_model_args():
     cfg = {"context": {"engine": "stub"}, "agent": {}}
 
     with (
-        patch("hermes_cli.config.load_config", return_value=cfg),
+        patch("hermes_cli.config.load_config", return_value=cfg), patch("hermes_cli.config.load_config_readonly", return_value=cfg),
         patch("plugins.context_engine.load_context_engine", return_value=engine),
         patch("agent.model_metadata.get_model_context_length", return_value=131_072),
         patch("run_agent.get_tool_definitions", return_value=[]),
@@ -168,7 +168,7 @@ def test_codex_gpt55_autoraise_suppressed_for_plugin_engine():
     }
 
     with (
-        patch("hermes_cli.config.load_config", return_value=cfg),
+        patch("hermes_cli.config.load_config", return_value=cfg), patch("hermes_cli.config.load_config_readonly", return_value=cfg),
         patch("plugins.context_engine.load_context_engine", return_value=engine),
         patch("agent.model_metadata.get_model_context_length", return_value=272_000),
         patch("run_agent.get_tool_definitions", return_value=[]),
@@ -194,7 +194,7 @@ def test_codex_gpt55_autoraise_still_applies_to_builtin_compressor():
     }
 
     with (
-        patch("hermes_cli.config.load_config", return_value=cfg),
+        patch("hermes_cli.config.load_config", return_value=cfg), patch("hermes_cli.config.load_config_readonly", return_value=cfg),
         patch("agent.context_compressor.get_model_context_length", return_value=272_000),
         patch("run_agent.get_tool_definitions", return_value=[]),
         patch("run_agent.check_toolset_requirements", return_value={}),
@@ -210,20 +210,20 @@ def test_codex_gpt55_autoraise_still_applies_to_builtin_compressor():
     assert agent._compression_warning and "85%" in agent._compression_warning
 
 
-def test_small_context_threshold_floor_can_be_disabled_for_builtin_compressor():
-    """The configured threshold remains exact when both raises are disabled."""
+def test_small_context_threshold_floor_is_unconditional_for_builtin_compressor():
+    """Small-context models retain upstream's safety floor without an opt-out."""
     cfg = {
         "compression": {
             "enabled": True,
             "threshold": 0.50,
             "codex_gpt55_autoraise": False,
-            "small_context_threshold_floor": False,
         },
         "agent": {},
     }
 
     with (
         patch("hermes_cli.config.load_config", return_value=cfg),
+        patch("hermes_cli.config.load_config_readonly", return_value=cfg),
         patch("agent.context_compressor.get_model_context_length", return_value=272_000),
         patch("run_agent.get_tool_definitions", return_value=[]),
         patch("run_agent.check_toolset_requirements", return_value={}),
@@ -234,8 +234,8 @@ def test_small_context_threshold_floor_can_be_disabled_for_builtin_compressor():
         agent = AIAgent(**_codex_agent_kwargs())
 
     assert agent._compression_threshold_autoraised is None
-    assert agent.context_compressor.threshold_percent == 0.50
-    assert agent.context_compressor.threshold_tokens == 136_000
+    assert agent.context_compressor.threshold_percent == 0.75
+    assert agent.context_compressor.threshold_tokens == 204_000
 
 
 def test_codex_gpt55_autoraise_applies_when_plugin_engine_missing():
@@ -249,6 +249,7 @@ def test_codex_gpt55_autoraise_applies_when_plugin_engine_missing():
 
     with (
         patch("hermes_cli.config.load_config", return_value=cfg),
+        patch("hermes_cli.config.load_config_readonly", return_value=cfg),
         patch(
             "plugins.context_engine.load_context_engine",
             side_effect=ValueError("not found"),

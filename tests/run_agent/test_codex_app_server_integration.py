@@ -18,6 +18,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 import run_agent
+from agent.runtime_usage import snapshot_agent_usage
 from agent.transports.codex_app_server_session import CodexAppServerSession, TurnResult
 
 
@@ -94,9 +95,10 @@ class TestRunConversationCodexPath:
                 turn_id="turn-usage-1",
                 thread_id="thread-usage-1",
                 token_usage_last={
-                    "totalTokens": 130,
-                    "inputTokens": 80,
+                    "totalTokens": 125,
+                    "inputTokens": 100,
                     "cachedInputTokens": 20,
+                    "cacheWriteInputTokens": 10,
                     "outputTokens": 25,
                     "reasoningOutputTokens": 5,
                 },
@@ -114,27 +116,111 @@ class TestRunConversationCodexPath:
         assert result["api_calls"] == 1
         assert result["prompt_tokens"] == 100
         assert result["completion_tokens"] == 25
-        assert result["total_tokens"] == 130
-        assert result["input_tokens"] == 80
+        assert result["total_tokens"] == 125
+        assert result["input_tokens"] == 70
         assert result["output_tokens"] == 25
         assert result["cache_read_tokens"] == 20
-        assert result["cache_write_tokens"] == 0
+        assert result["cache_write_tokens"] == 10
         assert result["reasoning_tokens"] == 5
         assert result["last_prompt_tokens"] == 100
 
         assert agent.session_api_calls == 1
         assert agent.session_prompt_tokens == 100
         assert agent.session_completion_tokens == 25
-        assert agent.session_total_tokens == 130
-        assert agent.session_input_tokens == 80
+        assert agent.session_total_tokens == 125
+        assert agent.session_input_tokens == 70
         assert agent.session_output_tokens == 25
         assert agent.session_cache_read_tokens == 20
-        assert agent.session_cache_write_tokens == 0
+        assert agent.session_cache_write_tokens == 10
         assert agent.session_reasoning_tokens == 5
         assert agent.context_compressor.last_prompt_tokens == 100
         assert agent.context_compressor.last_completion_tokens == 25
-        assert agent.context_compressor.last_total_tokens == 130
+        assert agent.context_compressor.last_total_tokens == 125
         assert agent.context_compressor.context_length == 200000
+
+        usage = snapshot_agent_usage(agent)
+        assert usage["breakdown"]["parent"] == {
+            "input_tokens": 100,
+            "output_tokens": 25,
+            "total_tokens": 125,
+        }
+        assert usage["completeness"] == "complete"
+
+    def test_codex_app_server_inconsistent_total_uses_exact_components(
+        self, monkeypatch
+    ):
+        def fake_run_turn(self, user_input: str, **kwargs):
+            return TurnResult(
+                final_text="done",
+                projected_messages=[{"role": "assistant", "content": "done"}],
+                turn_id="turn-mismatch-1",
+                thread_id="thread-mismatch-1",
+                token_usage_last={
+                    "totalTokens": 130,
+                    "inputTokens": 100,
+                    "cachedInputTokens": 20,
+                    "outputTokens": 25,
+                    "reasoningOutputTokens": 5,
+                },
+            )
+
+        monkeypatch.setattr(CodexAppServerSession, "run_turn", fake_run_turn)
+        monkeypatch.setattr(
+            CodexAppServerSession, "ensure_started", lambda self: "thread-mismatch-1"
+        )
+        agent = _make_codex_agent()
+        with patch.object(agent, "_spawn_background_review", return_value=None):
+            result = agent.run_conversation("hello")
+
+        assert result["prompt_tokens"] == 100
+        assert result["completion_tokens"] == 25
+        assert result["total_tokens"] == 125
+
+        usage = snapshot_agent_usage(agent)
+        assert usage["breakdown"]["parent"]["total_tokens"] == 125
+        assert usage["completeness"] == "partial"
+        assert usage["warnings"] == ["primary:total_does_not_match_input_output"]
+
+    def test_codex_app_server_invalid_cache_subset_fails_conservatively(
+        self, monkeypatch
+    ):
+        def fake_run_turn(self, user_input: str, **kwargs):
+            return TurnResult(
+                final_text="done",
+                projected_messages=[{"role": "assistant", "content": "done"}],
+                turn_id="turn-cache-mismatch-1",
+                thread_id="thread-cache-mismatch-1",
+                token_usage_last={
+                    "totalTokens": 15,
+                    "inputTokens": 10,
+                    "cachedInputTokens": 11,
+                    "cacheWriteInputTokens": 2,
+                    "outputTokens": 5,
+                    "reasoningOutputTokens": 1,
+                },
+            )
+
+        monkeypatch.setattr(CodexAppServerSession, "run_turn", fake_run_turn)
+        monkeypatch.setattr(
+            CodexAppServerSession,
+            "ensure_started",
+            lambda self: "thread-cache-mismatch-1",
+        )
+        agent = _make_codex_agent()
+        with patch.object(agent, "_spawn_background_review", return_value=None):
+            result = agent.run_conversation("hello")
+
+        assert result["prompt_tokens"] == 10
+        assert result["input_tokens"] == 10
+        assert result["cache_read_tokens"] == 0
+        assert result["cache_write_tokens"] == 0
+        assert result["completion_tokens"] == 5
+        assert result["reasoning_tokens"] == 1
+        assert result["total_tokens"] == 15
+
+        usage = snapshot_agent_usage(agent)
+        assert usage["completeness"] == "partial"
+        assert usage["warnings"] == ["primary:cache_tokens_exceed_input_tokens"]
 
     def test_native_codex_compaction_updates_bookkeeping(self, monkeypatch):
         def fake_run_turn(self, user_input: str, **kwargs):
@@ -412,7 +498,7 @@ class TestRunConversationCodexPath:
         profile remains the filesystem boundary."""
         captured = self._capture_routing_agent(monkeypatch)
         with patch(
-            "hermes_cli.config.load_config",
+            "hermes_cli.config.load_config_readonly",
             return_value={"approvals": {"mode": "off"}},
         ):
             agent = _make_codex_agent()
@@ -431,7 +517,7 @@ class TestRunConversationCodexPath:
         subsystem's compatibility behavior for codex app-server routing too."""
         captured = self._capture_routing_agent(monkeypatch)
         with patch(
-            "hermes_cli.config.load_config",
+            "hermes_cli.config.load_config_readonly",
             return_value={"approvals": {"mode": False}},
         ):
             agent = _make_codex_agent()
@@ -498,7 +584,7 @@ class TestRunConversationCodexPath:
         ):
             agent = _make_codex_agent()
             with patch(
-                "tools.approval.is_current_session_yolo_enabled",
+                "tools.approval.is_approval_bypass_active_for_session",
                 return_value=True,
             ), patch.object(
                 agent, "_spawn_background_review", return_value=None
@@ -786,4 +872,3 @@ class TestCodexToolProgressBridge:
 
         assert "on_event" in captured_init and captured_init["on_event"] is not None
         assert ("tool.started", "exec_command", "pytest") in events
-

@@ -675,6 +675,47 @@ def test_auxiliary_stream_observer_terminalizes_after_last_chunk():
     assert "cost_usd" not in events[1][1]["usage"]
 
 
+def test_auxiliary_stream_completed_response_is_returned_and_terminalized():
+    agent = _agent(
+        session_id="session-completed-stream",
+        _current_task_id="task-completed-stream",
+        _current_turn_id="turn-completed-stream",
+        _request_metadata={"source": "dorvis-web"},
+    )
+    completed = _response(prompt=4, completion=2, total=6)
+    completed.choices = [SimpleNamespace(finish_reason="stop")]
+    events = []
+
+    with (
+        attribute_auxiliary_usage(agent),
+        patch(
+            "hermes_cli.plugins.invoke_hook",
+            side_effect=lambda name, **kwargs: events.append((name, kwargs)),
+        ),
+    ):
+        result = track_auxiliary_stream_dispatch(
+            lambda: completed,
+            task="compression",
+            provider="openrouter",
+            model="completed-model",
+            request={"stream": True},
+            completed_response_predicate=lambda value: hasattr(value, "choices"),
+        )
+
+    assert result is completed
+    assert [name for name, _ in events] == [
+        "pre_auxiliary_api_request",
+        "post_auxiliary_api_request",
+    ]
+    assert events[1][1]["usage"]["total_tokens"] == 6
+    usage = snapshot_agent_usage(agent)
+    assert usage["breakdown"]["auxiliary"] == {
+        "input_tokens": 4,
+        "output_tokens": 2,
+        "total_tokens": 6,
+    }
+
+
 def test_auxiliary_attempt_observer_sees_hidden_failure_and_response():
     events = []
 

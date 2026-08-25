@@ -14,6 +14,10 @@ Behavior-changing request or execution wrappers are outside this observer
 contract. Observer hooks should report what happened; they should not replace
 provider requests, tool arguments, or execution callbacks.
 
+Hermes also has a first-party NeMo Relay shared-metrics path. It uses these
+lifecycle boundaries directly and does not require enabling an observability
+plugin. See [Relay shared metrics](relay-shared-metrics.md).
+
 ## Contract
 
 Plugins register observer callbacks from `register(ctx)`:
@@ -51,7 +55,7 @@ behavior-affecting hooks:
 | Hook | Return behavior |
 | --- | --- |
 | `pre_llm_call` | May return a string or `{"context": "..."}` to inject ephemeral context into the current user message. |
-| `pre_tool_call` | May return `{"action": "block", "message": "..."}` to block a tool before execution. |
+| `pre_tool_call` | May return `{"action": "block", "message": "..."}` to block a tool before execution, or `{"action": "modify", "args": {...}}` to transform the tool's input arguments. |
 | `transform_tool_result` | May return a replacement tool result string after `post_tool_call`. |
 | `transform_llm_output` | May return a replacement final assistant text string. |
 
@@ -218,6 +222,33 @@ human, auxiliary-model, sandbox, configuration, and yolo decision sources.
 Sensitive command/code fields are forcibly sanitized before the event; a
 sanitization failure skips telemetry without changing the decision.
 
+### Memory Recall Injection
+
+`memory_context_injected` fires once per turn with the model-visible recall
+block. Alongside the existing `provider`, `source`, `query`, `injected_block`,
+`status`, char/token counts, and `reused_for_all_iterations` fields it carries
+`memories`: one dict per injected memory, in injection order, with `id`,
+`text` (bounded at 2000 chars — the untruncated text is in `injected_block`),
+optional `text_truncated: true` when that bound actually cut the text, `score`
+(`None` when the backend exposes no relevance score) and `type`. It is `[]`
+whenever nothing was injected, including the `empty` and `error` statuses.
+
+The hook fires once per turn for every platform, including follow-up turns
+whose history needed role-alternation repair before the request — repair
+compacts the message list, and the loop re-anchors this turn's user message
+afterwards so the current-turn branch (injection *and* this observation) still
+matches.
+
+When memories were injected, the same rows are also returned to API callers on
+the terminal result as `response_metadata.dorvis_memory_recall`
+(`{provider, status, count, memories, query_char_count, injected_char_count}`).
+The whole entry is bounded at 48 KiB of the 64 KiB terminal-metadata budget; an
+oversized recall sheds whole records from the tail and sets
+`memories_truncated: true` (plus the original `truncated` alias) while `count`
+keeps reporting what the turn actually injected. The key is omitted entirely
+when nothing was injected. This is the sanctioned structured channel: the
+`<memory-context>` block itself stays scrubbed out of streamed assistant text.
+
 ### Memory Mutation Lifecycle
 
 `memory_write` reports only a write that crossed a real mutation boundary:
@@ -241,10 +272,26 @@ Subagent hooks describe delegated child-agent work:
 and `child_goal`.
 
 `subagent_stop` fields include parent/child session IDs, role/status fields,
-`child_summary`, and `duration_ms`.
+`child_summary`, `duration_ms`, and a metadata-only `tool_call_history`. Each
+history entry contains the tool name, argument names, bounded side-effect
+targets, input/output byte counts, and outcome. URL query strings and fragments
+are removed; raw arguments, prompts, commands, contents, headers, and results
+are intentionally excluded.
 
 Observers can use these hooks to model nested trajectories while keeping child
 agent execution linked to the parent turn that spawned it.
+
+### Compression Attempt Log Events
+
+Each context-compression attempt emits one content-free
+`compression_attempt` JSON log event. `commit_status` is `committed` when the
+live transcript is durably compacted and `aborted` otherwise. `split_status`
+distinguishes `not_applicable`, `pending`, `in_place_committed`,
+`rotated_committed`, `in_place_adopted`, `rotated_adopted`,
+`failed_not_indexed`, and `aborted`. The `*_adopted` outcomes mean this agent
+lost the compression lock but converged on the winner's durable transcript;
+they do not represent a second summarizer run. Successful events omit
+`failure_class`.
 
 ## Payload Safety
 
@@ -334,7 +381,8 @@ nested agent work or security lifecycle events.
 The bundled Langfuse plugin demonstrates direct hook-based observability for
 turns, provider requests, and tool calls.
 
-The bundled NeMo Relay plugin maps the same generic observer contract to NeMo
-Relay scopes, LLM spans, tool spans, marks, ATOF streams, and ATIF exports.
-NeMo Relay-specific configuration and examples live in
-[`plugins/observability/nemo_relay/README.md`](../../plugins/observability/nemo_relay/README.md).
+The native NeMo Relay SDK integration maps Hermes session, turn, LLM, and tool
+lifecycles to Relay. Explicit Relay plugin configuration can add
+[ATOF, ATIF, or OTEL](https://docs.nvidia.com/nemo/relay/configure-plugins/observability/about)
+exporters and execution middleware; see
+[Relay shared metrics](relay-shared-metrics.md).

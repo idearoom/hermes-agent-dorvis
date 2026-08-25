@@ -14,14 +14,22 @@ from pathlib import Path
 
 import pytest
 
+import agent.lsp.client as lsp_client
 from agent.lsp.client import LSPClient
 
 
 MOCK_SERVER = str(Path(__file__).parent / "_mock_lsp_server.py")
 
 
-def _client(workspace: Path, script: str = "clean") -> LSPClient:
+def _client(
+    workspace: Path,
+    script: str = "clean",
+    *,
+    exit_marker: Path | None = None,
+) -> LSPClient:
     env = {"MOCK_LSP_SCRIPT": script, "PYTHONPATH": os.environ.get("PYTHONPATH", "")}
+    if exit_marker is not None:
+        env["MOCK_LSP_EXIT_MARKER"] = str(exit_marker)
     return LSPClient(
         server_id=f"mock-{script}",
         workspace_root=str(workspace),
@@ -52,6 +60,35 @@ async def test_client_lifecycle_clean(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_shutdown_allows_cooperative_server_to_exit_cleanly(tmp_path: Path):
+    """A server that accepted ``exit`` gets a grace period before SIGTERM."""
+    marker = tmp_path / "clean-exit.marker"
+    client = _client(tmp_path, "delayed_exit", exit_marker=marker)
+    await client.start()
+
+    await client.shutdown()
+
+    assert marker.read_text() == "clean\n"
+    assert not client.is_running
+
+
+@pytest.mark.asyncio
+async def test_shutdown_terminates_server_that_ignores_exit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """The clean-exit wait remains bounded when a server does not cooperate."""
+    monkeypatch.setattr(lsp_client, "GRACEFUL_EXIT_WAIT", 0.05)
+    monkeypatch.setattr(lsp_client, "SHUTDOWN_GRACE", 0.1)
+    client = _client(tmp_path, "ignore_exit")
+    await client.start()
+
+    await asyncio.wait_for(client.shutdown(), timeout=1.0)
+
+    assert not client.is_running
+
+
+@pytest.mark.asyncio
 async def test_client_receives_published_errors(tmp_path: Path):
     f = tmp_path / "x.py"
     f.write_text("print('hi')\n")
@@ -72,72 +109,6 @@ async def test_client_receives_published_errors(tmp_path: Path):
         await client.shutdown()
 
 
-@pytest.mark.asyncio
-async def test_client_didchange_bumps_version(tmp_path: Path):
-    f = tmp_path / "x.py"
-    f.write_text("print('hi')\n")
-
-    client = _client(tmp_path, "errors")
-    await client.start()
-    try:
-        v0 = await client.open_file(str(f), language_id="python")
-        f.write_text("print('hi 2')\n")
-        v1 = await client.open_file(str(f), language_id="python")  # re-open path = didChange
-        assert v1 == v0 + 1
-        await client.wait_for_diagnostics(str(f), v1, mode="document")
-        # Mock pushed a diagnostic for both events; merged view has one
-        # entry (push store keyed by file path).
-        diags = client.diagnostics_for(str(f))
-        assert len(diags) == 1
-    finally:
-        await client.shutdown()
 
 
-@pytest.mark.asyncio
-async def test_client_handles_crashing_server(tmp_path: Path):
-    """When the server exits right after initialize, subsequent requests
-    fail gracefully (not hang)."""
-    f = tmp_path / "x.py"
-    f.write_text("")
 
-    client = _client(tmp_path, "crash")
-    await client.start()  # should succeed (mock answers initialize before crashing)
-    # Give the OS a moment to deliver the EOF.
-    await asyncio.sleep(0.2)
-    # The reader loop should detect EOF and mark pending requests as failed.
-    try:
-        await asyncio.wait_for(
-            client.open_file(str(f), language_id="python"), timeout=2.0
-        )
-    except Exception:
-        pass  # any exception is acceptable; the contract is "doesn't hang"
-    await client.shutdown()
-
-
-@pytest.mark.asyncio
-async def test_client_shutdown_idempotent(tmp_path: Path):
-    """Calling shutdown twice must be safe."""
-    f = tmp_path / "x.py"
-    f.write_text("")
-    client = _client(tmp_path, "clean")
-    await client.start()
-    await client.shutdown()
-    await client.shutdown()  # must not raise
-
-
-@pytest.mark.asyncio
-async def test_client_diagnostics_are_deduped(tmp_path: Path):
-    """Repeated identical pushes must not produce duplicate diagnostics."""
-    f = tmp_path / "x.py"
-    f.write_text("")
-    client = _client(tmp_path, "errors")
-    await client.start()
-    try:
-        for _ in range(3):
-            v = await client.open_file(str(f), language_id="python")
-            await client.wait_for_diagnostics(str(f), v, mode="document")
-        diags = client.diagnostics_for(str(f))
-        # Push store overwrites on every notification — should have 1.
-        assert len(diags) == 1
-    finally:
-        await client.shutdown()

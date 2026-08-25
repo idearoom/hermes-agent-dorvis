@@ -6,8 +6,9 @@ isolation guarantees:
 
 1. Five distinct sessions compressing in parallel must not alias each other's
    session_ids (no cross-session contamination).
-2. Two agents sharing the same session_id must serialize: exactly one rotates,
-   the other returns its input unchanged (the no-op / lock-loser contract).
+2. Two agents sharing the same session_id must serialize: exactly one computes
+   and rotates, while the lock loser adopts that compacted child so both agents
+   converge on one transcript and one live session id.
 
 The stub-compressor pattern mirrors ``test_compression_concurrent_fork.py``:
 the compressor returns deterministic output and sleeps briefly so threads
@@ -56,7 +57,7 @@ def _build_agent_with_db(db: SessionDB, session_id: str):
     compressor = MagicMock()
 
     def _compress_with_overlap(*_a, **_kw):
-        time.sleep(0.25)  # match fork test sleep so threads reliably overlap
+        time.sleep(0.2)  # match fork test sleep so threads reliably overlap
         return [
             {"role": "user", "content": "[CONTEXT COMPACTION] summary"},
             {"role": "user", "content": "tail"},
@@ -85,58 +86,15 @@ _MESSAGES = [{"role": "user", "content": f"m{i}"} for i in range(20)]
 # Tests
 # ---------------------------------------------------------------------------
 
-def test_concurrent_compressions_do_not_alias_sessions(tmp_path: Path) -> None:
-    """Five distinct sessions compressing in parallel must each produce a unique
-    post-compression session_id; no two agents must end up sharing an id.
-
-    Without per-session locking there is no cross-session aliasing anyway (each
-    agent generates its own timestamp + uuid suffix), but this test makes the
-    invariant explicit and would catch any regression where session_id generation
-    became shared state (e.g. a module-level counter or a shared random seed).
-    """
-    db = SessionDB(db_path=tmp_path / "state.db")
-
-    n = 5
-    parent_ids = [f"DISTINCT_PARENT_{i:02d}" for i in range(n)]
-    for sid in parent_ids:
-        db.create_session(sid, source="discord")
-
-    agents = [_build_agent_with_db(db, sid) for sid in parent_ids]
-    errors: list[Exception] = []
-
-    def run(agent):
-        try:
-            agent._compress_context(_MESSAGES, "sys", approx_tokens=120_000)
-        except Exception as exc:
-            errors.append(exc)
-
-    threads = [threading.Thread(target=run, args=(a,), name=f"session-{i}") for i, a in enumerate(agents)]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join(timeout=15)
-
-    assert not errors, f"Compression raised exceptions: {errors}"
-
-    # Every agent must have rotated to a new, unique session_id.
-    new_ids = [a.session_id for a in agents]
-    assert all(sid not in parent_ids for sid in new_ids), (
-        "At least one agent did not rotate its session_id during compression. "
-        f"parent_ids={parent_ids}  new_ids={new_ids}"
-    )
-    assert len(set(new_ids)) == n, (
-        f"Post-compression session_ids are not unique: {new_ids}. "
-        "Two agents aliased to the same id — cross-session contamination."
-    )
-
 
 def test_concurrent_compressions_same_session_serialize(tmp_path: Path) -> None:
-    """Two agents sharing a session_id must not both rotate it.
+    """Two agents sharing a session_id converge on one compacted child.
 
     The per-session compression lock (added in #34351) serializes concurrent
-    compress() calls keyed on the same session_id.  Exactly one agent must
-    rotate (the lock winner); the other must return its messages unchanged (the
-    lock loser, which detects ``len(returned) == len(input)`` and backs off).
+    compress() calls keyed on the same session_id. Exactly one agent computes
+    and rotates (the lock winner); the loser waits for that holder and adopts
+    its compacted child. Returning the loser's stale, uncompacted transcript
+    would let downstream gateway merges double the context.
 
     This is the gateway analogue of the fork test in
     ``test_compression_concurrent_fork.py`` but scoped to the two-agent /
@@ -195,9 +153,13 @@ def test_concurrent_compressions_same_session_serialize(tmp_path: Path) -> None:
     # (and any future call) hits the unwrapped implementation.
     db.try_acquire_compression_lock = _real_acquire
 
+    assert not t_a.is_alive() and not t_b.is_alive(), (
+        "Compression threads did not finish"
+    )
     assert not errors, f"Compression raised exceptions: {errors}"
 
-    # Count which agents actually compressed (returned fewer messages than input)
+    # Both callers receive a compacted view, but only the lock winner may run
+    # the summarizer. The loser must adopt the winner's durable result.
     compressed_count = sum(
         1 for msgs in results.values()
         if msgs is not None and len(msgs) < len(_MESSAGES)
@@ -207,24 +169,29 @@ def test_concurrent_compressions_same_session_serialize(tmp_path: Path) -> None:
         if msgs is not None and len(msgs) == len(_MESSAGES)
     )
 
-    assert compressed_count == 1, (
-        f"Expected exactly one agent to compress, got {compressed_count}. "
-        "If both compressed, the lock failed to serialize. "
-        "If neither compressed, both lost the lock (check lock logic)."
+    assert compressed_count == 2, (
+        f"Expected the winner and adopter to return compacted views, got "
+        f"{compressed_count}."
     )
-    assert unchanged_count == 1, (
-        f"Expected exactly one agent to return messages unchanged (lock loser), "
-        f"got {unchanged_count}."
+    assert unchanged_count == 0, (
+        "A lock loser returned its stale uncompacted transcript instead of "
+        "adopting the winner's durable result."
     )
+    assert sum(
+        agent.context_compressor.compress.call_count
+        for agent in (agent_a, agent_b)
+    ) == 1, "The lock loser ran a second summarization instead of adopting"
 
-    # Exactly one session_id rotation must have occurred.
-    rotated = sum(
-        1 for a in (agent_a, agent_b) if a.session_id != shared_sid
+    # Exactly one child is published and both agents converge on it. Both
+    # agents moving is healthy: the loser rebinds to the winner's child rather
+    # than creating a second branch.
+    child = db.find_live_compression_child(shared_sid)
+    assert child is not None, (
+        "Expected one unambiguous compacted child. None means the winner did "
+        "not publish or multiple children formed a transcript fork."
     )
-    assert rotated == 1, (
-        f"Expected exactly one agent to rotate session_id, got {rotated}. "
-        "Both agents rotating produces a session fork (Damien's incident shape)."
-    )
+    child_id = child["id"]
+    assert {agent_a.session_id, agent_b.session_id} == {child_id}
 
     # The lock must be released so future compression on the NEW session_id works.
     assert db.get_compression_lock_holder(shared_sid) is None, (

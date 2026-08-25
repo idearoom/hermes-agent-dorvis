@@ -56,6 +56,8 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Set
 from urllib.parse import quote, unquote
 
+from hermes_cli._subprocess_compat import windows_hide_flags
+
 from agent.lsp.protocol import (
     ERROR_CONTENT_MODIFIED,
     ERROR_METHOD_NOT_FOUND,
@@ -78,6 +80,7 @@ DIAGNOSTICS_DOCUMENT_WAIT = 5.0
 DIAGNOSTICS_FULL_WAIT = 10.0
 DIAGNOSTICS_REQUEST_TIMEOUT = 3.0
 PUSH_DEBOUNCE = 0.15
+GRACEFUL_EXIT_WAIT = 0.5  # seconds for a server that accepted the LSP exit notification
 SHUTDOWN_GRACE = 1.0  # seconds between SIGTERM and SIGKILL
 
 # Retry policy for transient ContentModified errors.
@@ -294,6 +297,12 @@ class LSPClient:
         cmd = self._command
         if sys.platform == "win32":
             cmd = self._win_wrap_cmd(cmd)
+        # Suppress the cmd.exe console window that would otherwise flash
+        # every time we launch a ``.cmd``-wrapped language server
+        # (e.g. pyright-langserver.CMD) from a console-less host such as
+        # a VS Code/Zed extension running the ACP adapter.
+        # windows_hide_flags() is CREATE_NO_WINDOW on Windows, 0 on POSIX.
+        creationflags = windows_hide_flags()
 
         try:
             # start_new_session=True detaches the LSP server into its own
@@ -312,6 +321,7 @@ class LSPClient:
                 env=env,
                 cwd=self._cwd,
                 start_new_session=True,
+                creationflags=creationflags,
             )
         except FileNotFoundError as e:
             raise LSPProtocolError(
@@ -450,6 +460,7 @@ class LSPClient:
         if self._stopping:
             return
         self._stopping = True
+        graceful_exit_sent = False
         try:
             if self.is_running:
                 try:
@@ -458,13 +469,14 @@ class LSPClient:
                     pass
                 try:
                     await self._send_notification("exit", None)
+                    graceful_exit_sent = True
                 except Exception:
                     pass
         finally:
             self._state = "stopped"
-            await self._cleanup_process()
+            await self._cleanup_process(allow_graceful_exit=graceful_exit_sent)
 
-    async def _cleanup_process(self) -> None:
+    async def _cleanup_process(self, *, allow_graceful_exit: bool = False) -> None:
         if self._reader_task is not None and not self._reader_task.done():
             self._reader_task.cancel()
             try:
@@ -482,16 +494,23 @@ class LSPClient:
         if proc is None:
             return
         if proc.returncode is None:
+            wait_task = asyncio.create_task(proc.wait())
+            if allow_graceful_exit:
+                done, _ = await asyncio.wait(
+                    {wait_task},
+                    timeout=GRACEFUL_EXIT_WAIT,
+                )
+                if done:
+                    return
             try:
                 proc.terminate()
-                try:
-                    await asyncio.wait_for(proc.wait(), timeout=SHUTDOWN_GRACE)
-                except asyncio.TimeoutError:
+                done, _ = await asyncio.wait({wait_task}, timeout=SHUTDOWN_GRACE)
+                if not done:
                     try:
                         proc.kill()
-                        await proc.wait()
                     except ProcessLookupError:
                         pass
+                    await wait_task
             except ProcessLookupError:
                 pass
 

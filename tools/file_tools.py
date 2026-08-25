@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """File Tools Module - LLM agent file manipulation tools."""
 
+import base64
 import errno
 import json
 import logging
@@ -11,7 +12,11 @@ import threading
 from pathlib import Path, PurePosixPath
 
 from agent.file_safety import get_read_block_error
-from tools.binary_extensions import has_binary_extension
+from tools.binary_extensions import (
+    has_binary_extension,
+    has_opaque_document_extension,
+    is_pdf_path,
+)
 from tools.file_operations import (
     ShellFileOperations,
     normalize_read_pagination,
@@ -128,6 +133,203 @@ def _truncate_to_char_budget(content: str, max_chars: int) -> tuple[str, int, bo
     return "\n".join(kept), len(kept), True
 
 
+_EXTRACTED_LINE_CONTINUATION_PREFIX = "↳ "
+_SPLITLINE_BOUNDARIES = frozenset(
+    "\n\r\v\f\x1c\x1d\x1e\x85\u2028\u2029"
+)
+
+
+def _logical_line_bounds(text: str):
+    """Yield ``str.splitlines()``-equivalent slices without a line list."""
+    start = 0
+    cursor = 0
+    text_length = len(text)
+    while cursor < text_length:
+        character = text[cursor]
+        if character not in _SPLITLINE_BOUNDARIES:
+            cursor += 1
+            continue
+        yield start, cursor
+        if (
+            character == "\r"
+            and cursor + 1 < text_length
+            and text[cursor + 1] == "\n"
+        ):
+            cursor += 1
+        cursor += 1
+        start = cursor
+    # Like splitlines(), a terminal boundary does not add another empty line.
+    if start < text_length:
+        yield start, text_length
+
+
+def _document_page_lines(
+    text: str,
+    offset: int,
+    limit: int,
+    *,
+    max_line_length: int,
+) -> tuple[list[str], int, int, int, str]:
+    """Return a lossless display page for bounded extracted document text.
+
+    ``ShellFileOperations._add_line_numbers`` clamps every logical line at
+    ``tool_output.max_line_length``.  That behavior is useful for arbitrary
+    text files, whose remainder is still available from the underlying file,
+    but it is destructive for an in-memory DOCX/XLSX/IPYNB extraction:
+    ``offset`` pages logical lines and can never recover a clamped tail.
+
+    Split wide logical lines into display continuation lines *before*
+    pagination.  Offset/limit then address the lossless display-line stream,
+    and every line handed to ``_add_line_numbers`` is already within its cap.
+    Only the requested page is retained, so even a deliberately tiny configured
+    line limit cannot turn a two-million-character extraction into a second
+    multi-million-object allocation.
+    """
+    selected: list[str] = []
+    display_line = 0
+    logical_total_lines = 0
+    wrapped_logical_lines = 0
+    end_line = offset + limit - 1
+    continuation_prefix = _EXTRACTED_LINE_CONTINUATION_PREFIX
+    if max_line_length <= len(continuation_prefix):
+        # Preserve bytes under unusually small user-configured limits.  The
+        # metadata still identifies wrapping even when no prefix can fit.
+        continuation_prefix = ""
+    continuation_width = max(1, max_line_length - len(continuation_prefix))
+
+    for logical_start, logical_end in _logical_line_bounds(text):
+        logical_total_lines += 1
+        logical_length = logical_end - logical_start
+        if logical_length <= max_line_length:
+            segment_count = 1
+        else:
+            wrapped_logical_lines += 1
+            remaining = logical_length - max_line_length
+            segment_count = 1 + (
+                remaining + continuation_width - 1
+            ) // continuation_width
+
+        first_display_line = display_line + 1
+        last_display_line = display_line + segment_count
+        selected_start = max(offset, first_display_line)
+        selected_end = min(end_line, last_display_line)
+        for selected_line in range(selected_start, selected_end + 1):
+            segment_index = selected_line - first_display_line
+            if segment_index == 0:
+                segment_start = logical_start
+                segment_end = min(
+                    logical_start + max_line_length,
+                    logical_end,
+                )
+                selected.append(text[segment_start:segment_end])
+                continue
+            segment_start = (
+                logical_start
+                + max_line_length
+                + (segment_index - 1) * continuation_width
+            )
+            segment_end = min(segment_start + continuation_width, logical_end)
+            selected.append(
+                continuation_prefix + text[segment_start:segment_end]
+            )
+        display_line = last_display_line
+
+    return (
+        selected,
+        display_line,
+        logical_total_lines,
+        wrapped_logical_lines,
+        continuation_prefix,
+    )
+
+
+def _document_page_result(
+    text: str,
+    file_ops,
+    offset: int,
+    limit: int,
+    file_size: int,
+    *,
+    extracted_document: bool,
+    fallback_note: str | None = None,
+) -> dict:
+    """Paginate a bounded document snapshot without reading its path again."""
+    from tools.tool_output_limits import get_max_line_length
+
+    # Redact the bounded extraction snapshot before introducing continuation
+    # boundaries.  Redacting only the rendered page can split a credential
+    # such as ``sk-...`` across two display lines and make the prefix matcher
+    # miss it.  Native readers impose hard extraction/raw-fallback bounds, so
+    # this remains a bounded pass while protecting every paginated segment.
+    text = redact_sensitive_text(text, file_read=True)
+    max_chars = _get_max_read_chars()
+    # Include enough room for the largest possible gutter.  A display stream
+    # cannot have more lines than text characters plus one, even at a one-char
+    # line cap, so this bound is independent of the wrapping pass.
+    gutter_chars = len(str(max(1, len(text) + 1))) + 1
+    max_line_length = max(
+        1,
+        min(get_max_line_length(), max(1, max_chars - gutter_chars)),
+    )
+    (
+        page_lines,
+        total_lines,
+        logical_total_lines,
+        wrapped_logical_lines,
+        continuation_prefix,
+    ) = _document_page_lines(
+        text,
+        offset,
+        limit,
+        max_line_length=max_line_length,
+    )
+    end_line = offset + limit - 1
+    page_text = "\n".join(page_lines)
+    result_dict = {
+        "content": file_ops._add_line_numbers(page_text, offset) if page_text else "",
+        "total_lines": total_lines,
+        "logical_total_lines": logical_total_lines,
+        "wrapped_logical_lines": wrapped_logical_lines,
+        "file_size": file_size,
+        "truncated": total_lines > end_line,
+    }
+    if wrapped_logical_lines:
+        prefix_description = repr(continuation_prefix) if continuation_prefix else "none"
+        result_dict["line_wrapping"] = (
+            "Wide extracted logical lines were split into lossless display "
+            f"continuation lines (continuation prefix: {prefix_description}); "
+            "offset/limit address these display lines."
+        )
+    if extracted_document:
+        result_dict["extracted_document"] = True
+    if fallback_note is not None:
+        result_dict["raw_notebook_fallback"] = True
+        result_dict["note"] = fallback_note
+    if result_dict["truncated"]:
+        result_dict["hint"] = (
+            f"Use offset={end_line + 1} to continue reading "
+            f"(showing {offset}-{min(end_line, total_lines)} of {total_lines} lines)"
+        )
+
+    if len(result_dict["content"]) > max_chars:
+        trimmed, lines_kept, _ = _truncate_to_char_budget(
+            result_dict["content"], max_chars
+        )
+        next_offset = offset + lines_kept
+        shown_end = offset + lines_kept - 1
+        result_dict["content"] = trimmed
+        result_dict["truncated"] = True
+        result_dict["truncated_by"] = "characters"
+        result_dict["next_offset"] = next_offset
+        result_dict["hint"] = (
+            f"Output truncated at the {max_chars:,}-char read budget "
+            f"after {lines_kept} line(s) (showing lines {offset}-"
+            f"{shown_end} of {total_lines}). Use offset={next_offset} "
+            "to continue."
+        )
+    return result_dict
+
+
 # If the total file size exceeds this AND the caller didn't specify a narrow
 # range (limit <= 200), we include a hint encouraging targeted reads.
 _LARGE_FILE_HINT_BYTES = 512_000  # 512 KB
@@ -164,7 +366,7 @@ def _resolve_path(filepath: str, task_id: str = "default") -> Path | PurePosixPa
 # (gateway/run.py); the file/terminal-tool layer must do likewise so CLI
 # sessions get the same protection. See references/worktree-cwd-discipline.md.
 _TERMINAL_CWD_SENTINELS = frozenset({"", ".", "./", "auto", "cwd"})
-_CONTAINER_PATH_BACKENDS_FALLBACK = frozenset({"docker", "singularity", "modal", "daytona"})
+_CONTAINER_PATH_BACKENDS_FALLBACK = frozenset({"docker", "singularity", "modal", "daytona", "vercel_sandbox"})
 
 
 def _terminal_env_type_for_task(task_id: str = "default") -> str:
@@ -439,6 +641,79 @@ def _path_resolution_warning(filepath: str, resolved: Path, task_id: str = "defa
         return None
 
 
+def _file_ops_uses_host_paths(file_ops) -> bool:
+    """Return True when *file_ops* targets the same host filesystem as Hermes.
+
+    Only then may we rewrite V4A header paths to resolved host-absolute
+    paths: a container/remote backend has its own filesystem namespace where
+    a host-absolute path would be meaningless.
+    """
+    env = getattr(file_ops, "env", None)
+    if env is None:
+        return True
+    try:
+        from tools.environments.local import LocalEnvironment
+    except ImportError:
+        return True
+    return isinstance(env, LocalEnvironment)
+
+
+def _rewrite_v4a_patch_paths_for_host(
+    patch: str,
+    path_to_resolved: dict,
+    file_ops,
+) -> str:
+    """Rewrite V4A file headers to the exact host paths the tool layer resolved.
+
+    ``patch_tool`` resolves every header path against the task's workspace for
+    locking, staleness, and reporting, but historically handed the *original*
+    patch text to ``file_ops.patch_v4a`` — so the shell layer re-resolved the
+    (often relative) header against its own cwd, which can differ from the
+    tool layer's workspace (the git-worktree cwd bug). That made a relative
+    header land in a different directory than everything else the tool
+    reported. This rewrites ``*** Update/Add/Delete/Move File:`` headers to the
+    resolved absolute paths so both layers agree on the target.
+
+    Header patterns mirror ``patch_parser`` (``\\s*`` after ``***`` accepts the
+    no-space ``***Update File:`` form) and cover ``Move File: src -> dst``.
+    Only applied when *file_ops* targets the host filesystem.
+    """
+    if not _file_ops_uses_host_paths(file_ops):
+        return patch
+
+    import re as _re
+
+    def _resolved_or_original(raw: str) -> str:
+        raw = raw.strip()
+        return path_to_resolved.get(raw) or raw
+
+    def _replace_single(match):
+        prefix = match.group(1)
+        resolved = _resolved_or_original(match.group(2))
+        return f"{prefix}{resolved}"
+
+    patch = _re.sub(
+        r'^(\*\*\*\s*(?:Update|Add|Delete)\s+File:\s*)(.+)$',
+        _replace_single,
+        patch,
+        flags=_re.MULTILINE,
+    )
+
+    def _replace_move(match):
+        prefix = match.group(1)
+        src = _resolved_or_original(match.group(2))
+        dst = _resolved_or_original(match.group(3))
+        return f"{prefix}{src} -> {dst}"
+
+    patch = _re.sub(
+        r'^(\*\*\*\s*Move\s+File:\s*)(.+?)\s*->\s*(.+)$',
+        _replace_move,
+        patch,
+        flags=_re.MULTILINE,
+    )
+    return patch
+
+
 def _is_blocked_device_path(path: str) -> bool:
     """Return True for concrete device/fd paths that can hang reads."""
     normalized = os.path.normpath(_expand_tilde(path))
@@ -568,7 +843,13 @@ def _filter_read_blocked_search_results(result, task_id: str = "default") -> int
 # terminal tool's approval system.  These match prefixes after os.path.realpath.
 _SENSITIVE_PATH_PREFIXES = (
     "/etc/", "/boot/", "/usr/lib/systemd/",
-    "/private/etc/", "/private/var/",
+    "/private/etc/",
+    # macOS: /private/var mirrors /var. Block the sensitive subtrees, NOT the
+    # whole thing — a blanket "/private/var/" refused every legitimate temp-file
+    # write, because $TMPDIR, /tmp, and /var/folders all realpath() into
+    # /private/var/folders/... on macOS (and _resolve_path_for_task resolves
+    # symlinks), and /private/var/tmp is a normal temp dir.
+    "/private/var/db/", "/private/var/root/",
 )
 _SENSITIVE_EXACT_PATHS = {"/var/run/docker.sock", "/run/docker.sock"}
 
@@ -621,6 +902,318 @@ def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None
             "Edit ~/.hermes/config.yaml directly or use 'hermes config' instead."
         )
     return None
+
+
+# ---------------------------------------------------------------------------
+# Protected agent-instruction files (always-ask approval gate)
+# ---------------------------------------------------------------------------
+# Files that steer FUTURE agent behavior are a prompt-injection persistence
+# vector: an injected instruction that edits AGENTS.md / CLAUDE.md / SOUL.md /
+# .cursorrules (or a project-local .hermes config tree) outlives the current
+# turn and poisons every later session that loads it. Writes to these files
+# therefore ALWAYS require human approval — even under --yolo / auto-approve —
+# and fail closed when no human channel exists.
+#
+# Ported from: RooCodeInc/Roo-Code RooProtectedController (Apache-2.0).
+# Companion: the terminal-tool vector is covered separately (#58631); this
+# gate covers the write_file/patch vector. Symlink lesson from #41351:
+# always realpath before matching.
+#
+# Scope decision (documented): basenames match in ANY directory, because
+# project-context instruction files are loaded from cwd trees — an
+# AGENTS.md anywhere the agent might later run from is a live target.
+# Basenames match case-insensitively so case-variant spellings on
+# case-insensitive filesystems (macOS/Windows) cannot slip past; on
+# case-sensitive filesystems most loaders probe common case variants too,
+# so the stricter behavior is kept uniform.
+_PROTECTED_INSTRUCTION_BASENAMES = frozenset({
+    "agents.md", "claude.md", "soul.md", ".cursorrules",
+})
+
+_real_hermes_home_cached: str | None = None
+_real_hermes_home_loaded = False
+
+
+def _get_real_hermes_home() -> str | None:
+    """Return the realpath of the authoritative Hermes home (cached)."""
+    global _real_hermes_home_cached, _real_hermes_home_loaded
+    if _real_hermes_home_loaded:
+        return _real_hermes_home_cached
+    _real_hermes_home_loaded = True
+    try:
+        from hermes_constants import get_hermes_home
+        _real_hermes_home_cached = os.path.realpath(str(get_hermes_home()))
+    except Exception:
+        try:
+            _real_hermes_home_cached = os.path.realpath(_expand_tilde("~/.hermes"))
+        except Exception:
+            _real_hermes_home_cached = None
+    return _real_hermes_home_cached
+
+
+def _protected_instruction_config() -> tuple[bool, list[str]]:
+    """Read the protected-instruction-files gate config.
+
+    Returns ``(enabled, extra_patterns)``. Defaults to enabled with no extra
+    patterns; config read failures keep the gate ON (fail-safe for a
+    security boundary).
+
+    Config keys (config.yaml)::
+
+        security:
+          protected_instruction_files: true       # default
+          protected_instruction_extra_patterns: []  # fnmatch on basename
+    """
+    try:
+        from hermes_cli.config import load_config, cfg_get
+        cfg = load_config()
+        enabled = cfg_get(cfg, "security", "protected_instruction_files",
+                          default=True)
+        extra = cfg_get(cfg, "security", "protected_instruction_extra_patterns",
+                        default=[])
+    except Exception:
+        return True, []
+    if not isinstance(enabled, bool):
+        enabled = True
+    if not isinstance(extra, list):
+        extra = []
+    return enabled, [str(p) for p in extra if p]
+
+
+def _protected_instruction_reason(filepath: str, task_id: str = "default",
+                                  *, enabled: bool | None = None,
+                                  extra_patterns: list[str] | None = None) -> str | None:
+    """Return a short label when ``filepath`` targets a protected
+    agent-instruction file, else ``None``.
+
+    Matching runs on BOTH the normalized input path and its realpath so
+    neither a symlink pointing AT a protected file (#41351) nor a protected
+    name that is itself a symlink escapes the gate. ``..`` traversal is
+    neutralized by normpath/realpath before the basename compare.
+    """
+    if enabled is None or extra_patterns is None:
+        enabled, extra_patterns = _protected_instruction_config()
+    if not enabled:
+        return None
+
+    normalized = os.path.normpath(_expand_tilde(filepath))
+    try:
+        resolved = os.path.realpath(str(_resolve_path_for_task(filepath, task_id)))
+    except (OSError, ValueError, RuntimeError):
+        resolved = os.path.realpath(normalized)
+
+    # The authoritative ~/.hermes home is governed by its own guards
+    # (config.yaml hard-block, cross-profile guard, write_approval); this
+    # gate targets PROJECT-LOCAL instruction files only. Checked before the
+    # ``.hermes`` component rule below, which would otherwise match the
+    # home directory itself.
+    real_home = _get_real_hermes_home()
+    if real_home and (resolved == real_home
+                      or resolved.startswith(real_home + os.sep)):
+        return None
+
+    import fnmatch
+    for candidate in (normalized, resolved):
+        base = os.path.basename(candidate)
+        base_lower = base.lower()
+        if base_lower in _PROTECTED_INSTRUCTION_BASENAMES:
+            return base
+        for pattern in extra_patterns:
+            if fnmatch.fnmatch(base_lower, pattern.lower()):
+                return base
+        # Project-local .hermes config dirs (e.g. <repo>/.hermes/config.yaml)
+        # are loaded as project context and steer behavior the same way.
+        # Scope: the file's IMMEDIATE parent must be ``.hermes`` — matching
+        # any ancestor named .hermes would gate every write inside a
+        # checkout that happens to live under ~/.hermes (e.g. the
+        # hermes-agent repo itself at ~/.hermes/hermes-agent).
+        parts = candidate.replace("\\", "/").rstrip("/").split("/")
+        if len(parts) >= 2 and parts[-2] == ".hermes":
+            return candidate
+    return None
+
+
+def _request_protected_instruction_approval(
+        reasons: list[str], task_id: str = "default") -> str | None:
+    """Ask the human to approve a write to protected instruction file(s).
+
+    Returns ``None`` when approved, or a BLOCKED error string. This gate
+    intentionally does NOT route through ``_run_approval_gate``: that gate
+    honors --yolo and session/permanent allowlists, and the entire point
+    here is one-operation approval EVERY time, with no persistent scope
+    and no yolo bypass. Fail-closed when no human channel exists.
+    """
+    targets = ", ".join(dict.fromkeys(reasons))
+    description = (
+        f"Write to protected agent-instruction file(s): {targets}. "
+        "These files steer future agent behavior; approval is always "
+        "required (not bypassed by auto-approve)."
+    )
+    display = f"<write to {targets}>"
+    blocked = (
+        f"BLOCKED: write to protected agent-instruction file(s) ({targets}) "
+        "{why} The user has NOT consented to this write. Do NOT retry it or "
+        "attempt the same edit via another path (terminal, execute_code, "
+        "etc.)."
+    )
+
+    try:
+        import tools.approval as _approval
+    except Exception:
+        return blocked.format(why="requires approval but the approval "
+                                  "subsystem is unavailable.")
+
+    # Gateway surface: block on the button round-trip when a notify callback
+    # is registered for this session (Telegram/Discord/Slack). One-operation
+    # only — no session/permanent buttons are offered.
+    session_key = _approval.get_current_session_key()
+    notify_cb = None
+    try:
+        with _approval._lock:
+            notify_cb = _approval._gateway_notify_cbs.get(session_key)
+    except Exception:
+        notify_cb = None
+
+    if notify_cb is not None:
+        approval_data = {
+            "command": display,
+            "pattern_key": "protected_instruction_file",
+            "pattern_keys": ["protected_instruction_file"],
+            "description": description,
+            "allow_permanent": False,
+            "allow_session": False,
+        }
+        decision = _approval._await_gateway_decision(
+            session_key, notify_cb, approval_data, surface="gateway",
+        )
+        if decision.get("notify_failed"):
+            return blocked.format(
+                why="requires approval but the approval request could not "
+                    "be delivered.")
+        choice = decision.get("choice")
+        if decision.get("resolved") and choice in {"once", "session", "always"}:
+            # One-operation grant regardless of the tapped scope — nothing
+            # is persisted for this gate.
+            return None
+        if not decision.get("resolved"):
+            return blocked.format(
+                why="approval prompt timed out without a user response. "
+                    "Silence is not consent.")
+        return blocked.format(why="was denied by the user.")
+
+    # CLI surface: per-thread approval callback (prompt_toolkit panel).
+    callback = None
+    try:
+        from tools.terminal_tool import _get_approval_callback
+        callback = _get_approval_callback()
+    except Exception:
+        callback = None
+
+    if callback is not None:
+        choice = _approval.prompt_dangerous_approval(
+            display, description,
+            allow_permanent=False,
+            approval_callback=callback,
+        )
+        if choice in {"once", "session", "always"}:
+            # One-operation grant; never persisted (see docstring).
+            return None
+        if choice == "timeout":
+            return blocked.format(
+                why="approval prompt timed out without a user response. "
+                    "Silence is not consent.")
+        return blocked.format(why="was denied by the user.")
+
+    # No human channel at all (script, cron, background thread): fail
+    # closed. Auto-approving here would recreate the persistence vector.
+    return blocked.format(
+        why="requires approval but no interactive user or gateway is "
+            "present to approve it.")
+
+
+def _check_protected_instruction_write(paths: list[str],
+                                       task_id: str = "default") -> str | None:
+    """Gate a write/patch touching protected instruction files.
+
+    Returns ``None`` when no target is protected or the human approved;
+    otherwise a BLOCKED error string. For multi-file V4A patches, ONE
+    protected file gates the ENTIRE patch: a single prompt lists every
+    protected target, and a deny applies nothing (including innocent
+    files) — partial application of an approved-in-part patch would be
+    more surprising than an atomic all-or-nothing outcome.
+    """
+    enabled, extra = _protected_instruction_config()
+    if not enabled:
+        return None
+    reasons: list[str] = []
+    for p in paths:
+        reason = _protected_instruction_reason(
+            p, task_id, enabled=enabled, extra_patterns=extra)
+        if reason:
+            reasons.append(reason)
+    if not reasons:
+        return None
+    return _request_protected_instruction_approval(reasons, task_id)
+
+
+def _check_approval_required_write(paths: list[str],
+                                   task_id: str = "default") -> str | None:
+    """Gate a write/patch touching an approval-required path (``~/.ssh/config``).
+
+    These paths are NOT credentials and NOT hard-denied, but a write must
+    be confirmed by a human because they can steer process execution
+    (an SSH ``ProxyCommand`` / ``Match exec``). Unlike the protected-
+    instruction gate this is a routine, user-initiated edit, so the prompt
+    offers once/session/always scopes and honors --yolo (the historical
+    dangerous-command semantics) rather than always re-asking.
+
+    Returns ``None`` when no target is approval-gated or the human
+    approved; otherwise a BLOCKED error string. Fail-closed when no
+    interactive/gateway channel exists (a background/ACP caller cannot
+    consent on the user's behalf).
+    """
+    try:
+        from agent.file_safety import is_write_approval_required
+    except Exception:
+        return None
+
+    targets = [p for p in paths if is_write_approval_required(p)]
+    if not targets:
+        return None
+
+    display_targets = ", ".join(dict.fromkeys(targets))
+    description = (
+        f"Write to SSH client config file(s): {display_targets}. "
+        "The SSH config can carry ProxyCommand / Match exec directives that "
+        "run commands, so writes require your approval."
+    )
+    blocked = (
+        f"BLOCKED: write to SSH config file(s) ({display_targets}) "
+        "{why} Do NOT retry it via another path (terminal, execute_code) "
+        "without the user's explicit consent."
+    )
+
+    try:
+        import tools.approval as _approval
+    except Exception:
+        return blocked.format(why="requires approval but the approval "
+                                  "subsystem is unavailable.")
+
+    result = _approval._run_approval_gate(
+        pattern_key="ssh_config_write",
+        description=description,
+        display_target=f"<write to {display_targets}>",
+        cron_deny_message=blocked.format(
+            why="requires approval but this cron session denies it."),
+        autoapprove_log_prefix="ssh_config_write",
+        fail_closed_when_no_human=True,
+        no_human_block_message=blocked.format(
+            why="requires approval but no interactive user or gateway is "
+                "present to approve it."),
+    )
+    if result.get("approved"):
+        return None
+    return result.get("message") or blocked.format(why="was denied.")
 
 
 def _get_container_mirror_prefix_for_task(task_id: str = "default") -> str | None:
@@ -793,6 +1386,8 @@ def _reset_patch_failures(task_id: str, resolved_paths: list) -> None:
 _READ_HISTORY_CAP = 500       # set; used only by get_read_files_summary
 _DEDUP_CAP = 1000             # dict; skip-identical-reread guard
 _READ_TIMESTAMPS_CAP = 1000   # dict; external-edit detection for write/patch
+_NOT_FOUND_CAP = 500          # dict; per-task negative-result cache for missing paths
+_NOT_FOUND_TTL_SECONDS = 60.0 # short TTL — a path that didn't exist may be created soon
 _READ_DEDUP_STATUS_MESSAGE = (
     "File unchanged since last read. The content from "
     "the earlier read_file result in this conversation is "
@@ -849,6 +1444,209 @@ def _cap_read_tracker_data(task_data: dict) -> None:
                 ts.pop(next(iter(ts)))
             except (StopIteration, KeyError):
                 break
+
+    nf = task_data.get("not_found")
+    if nf is not None and len(nf) > _NOT_FOUND_CAP:
+        excess = len(nf) - _NOT_FOUND_CAP
+        for _ in range(excess):
+            try:
+                nf.pop(next(iter(nf)))
+            except (StopIteration, KeyError):
+                break
+
+
+def _ensure_read_tracker_data(task_id: str) -> dict:
+    """Return current-shape tracker state while ``_read_tracker_lock`` is held."""
+    task_data = _read_tracker.setdefault(task_id, {
+        "last_key": None,
+        "consecutive": 0,
+        "read_history": set(),
+        "dedup": {},
+        "dedup_hits": {},
+        "read_timestamps": {},
+    })
+    # Long-lived conversations can cross an in-process upgrade from tracker
+    # states created before these fields existed.
+    task_data.setdefault("read_history", set())
+    task_data.setdefault("dedup", {})
+    task_data.setdefault("dedup_hits", {})
+    task_data.setdefault("read_timestamps", {})
+    return task_data
+
+
+def _unchanged_read_response(
+    *,
+    path: str,
+    resolved_str: str,
+    offset: int,
+    limit: int,
+    task_id: str,
+) -> str | None:
+    """Apply the shared unchanged-file dedup/loop contract before a read."""
+    dedup_key = (resolved_str, offset, limit)
+    with _read_tracker_lock:
+        task_data = _ensure_read_tracker_data(task_id)
+        cached_mtime = task_data["dedup"].get(dedup_key)
+
+    if cached_mtime is None:
+        return None
+    try:
+        current_mtime = os.path.getmtime(resolved_str)
+    except OSError:
+        return None
+    if current_mtime != cached_mtime:
+        return None
+
+    # Count repeated stub returns so weak tool-followers cannot burn their
+    # iteration budget retrying a result that explicitly says it is current.
+    with _read_tracker_lock:
+        task_data = _ensure_read_tracker_data(task_id)
+        hits = task_data["dedup_hits"].get(dedup_key, 0) + 1
+        task_data["dedup_hits"][dedup_key] = hits
+        _cap_read_tracker_data(task_data)
+
+    if hits >= 2:
+        return tool_error(
+            f"BLOCKED: You have called read_file on this exact region "
+            f"{hits + 1} times and the file has NOT changed. STOP calling "
+            "read_file for this path — the content from your earlier "
+            "read_file result in this conversation is still current. "
+            "Proceed with your task using the information you already have.",
+            path=path,
+            already_read=hits + 1,
+        )
+
+    return json.dumps({
+        "status": "unchanged",
+        "message": _READ_DEDUP_STATUS_MESSAGE,
+        "path": path,
+        "dedup": True,
+        "content_returned": False,
+    }, ensure_ascii=False)
+
+
+def _finish_tracked_read(
+    result_dict: dict,
+    *,
+    path: str,
+    resolved_str: str,
+    offset: int,
+    limit: int,
+    task_id: str,
+) -> str:
+    """Record one completed text or structured read and serialize its result."""
+    dedup_key = (resolved_str, offset, limit)
+    read_key = ("read", path, offset, limit)
+    with _read_tracker_lock:
+        task_data = _ensure_read_tracker_data(task_id)
+        # A real read resets any unchanged-stub loop for this region.  The file
+        # either changed or its prior stat failed and we deliberately reread it.
+        task_data["dedup_hits"].pop(dedup_key, None)
+        task_data["read_history"].add((path, offset, limit))
+        if task_data["last_key"] == read_key:
+            task_data["consecutive"] += 1
+        else:
+            task_data["last_key"] = read_key
+            task_data["consecutive"] = 1
+        count = task_data["consecutive"]
+
+        try:
+            mtime_now = os.path.getmtime(resolved_str)
+            task_data["dedup"][dedup_key] = mtime_now
+            task_data["read_timestamps"][resolved_str] = mtime_now
+        except OSError:
+            pass
+        _cap_read_tracker_data(task_data)
+
+    # Cross-agent coordination is intentionally separate from the per-task
+    # loop tracker.  A structured document page is partial under exactly the
+    # same offset/truncation conditions as an ordinary text-file page.
+    try:
+        partial = (offset > 1) or bool(result_dict.get("truncated"))
+        file_state.record_read(task_id, resolved_str, partial=partial)
+    except Exception:
+        logger.debug("file_state.record_read failed", exc_info=True)
+
+    if count >= 4:
+        return tool_error(
+            f"BLOCKED: You have read this exact file region {count} times in "
+            "a row. The content has NOT changed. You already have this "
+            "information. STOP re-reading and proceed with your task.",
+            path=path,
+            already_read=count,
+        )
+    if count >= 3:
+        result_dict["_warning"] = (
+            f"You have read this exact file region {count} times consecutively. "
+            "The content has not changed since your last read. Use the "
+            "information you already have. If you are stuck in a loop, stop "
+            "reading and proceed with writing or responding."
+        )
+    return json.dumps(result_dict, ensure_ascii=False)
+
+
+def _check_not_found_cache(op: str, resolved_str: str, task_id: str) -> str | None:
+    """Return cached not-found JSON for *(op, resolved_str)* if still fresh.
+
+    Skips the expensive subprocess + suggestion walk when the model retries
+    the same missing path. Observed in agent.log: a single typo'd path was
+    retried 13 times — each retry forked a shell to walk the parent directory
+    and score similar names.
+
+    *op* is "read" or "search" — kept separate because the two callers return
+    different error JSON shapes ("File not found:" vs "Path not found:").
+
+    Eviction: TTL or write_file/patch on the path (see invalidate_for_path).
+    """
+    import os as _os
+    import time
+    with _read_tracker_lock:
+        task_data = _read_tracker.get(task_id)
+        if not task_data:
+            return None
+        nf = task_data.get("not_found")
+        if not nf:
+            return None
+        entry = nf.get((op, resolved_str))
+        if entry is None:
+            return None
+        ts, cached_json = entry
+        if time.monotonic() - ts > _NOT_FOUND_TTL_SECONDS:
+            nf.pop((op, resolved_str), None)
+            return None
+    # Existence guard: the path may have been created since we cached the
+    # miss — by a terminal command, another agent, or any external process
+    # (write_file/patch invalidate explicitly, but they're not the only
+    # writers). The agent pattern "check file → create it → read it" is
+    # common; serving a stale miss for up to the TTL breaks it. One stat is
+    # ~free next to the subprocess walk we're skipping.
+    #
+    # The stat runs OUTSIDE _read_tracker_lock (matching the dedup mtime
+    # check below in read_file_tool): the lock is global across all tasks,
+    # and a hung stat on a dead network mount must not stall every other
+    # task's read/search bookkeeping.
+    if _os.path.exists(resolved_str):
+        with _read_tracker_lock:
+            task_data = _read_tracker.get(task_id)
+            nf = task_data.get("not_found") if task_data else None
+            if nf:
+                nf.pop((op, resolved_str), None)
+        return None
+    return cached_json
+
+
+def _record_not_found(op: str, resolved_str: str, task_id: str, error_json: str) -> None:
+    """Cache a not-found error so the next *op* call for *resolved_str* skips I/O."""
+    import time
+    with _read_tracker_lock:
+        task_data = _read_tracker.setdefault(task_id, {
+            "last_key": None, "consecutive": 0,
+            "read_history": set(), "dedup": {},
+            "dedup_hits": {}, "read_timestamps": {},
+        })
+        nf = task_data.setdefault("not_found", {})
+        nf[(op, resolved_str)] = (time.monotonic(), error_json)
+        _cap_read_tracker_data(task_data)
 
 
 def _is_internal_file_status_text(content: str) -> bool:
@@ -946,6 +1744,7 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
         _creation_locks,
         _creation_locks_lock,
         _resolve_container_task_id,
+        _resolve_task_host_cwd,
         _is_unusable_container_cwd,
         _CONTAINER_BACKENDS,
     )
@@ -969,11 +1768,21 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
                 # (fixes #26211: silent file-creation failures in long-running
                 # conversations). Usually a no-op: every completed command
                 # already recorded its cwd.
+                #
+                # Fill-only: ``cached.cwd`` is a snapshot of the SHARED env's
+                # cwd at cache-build time, so it is not attributable to this
+                # session (same class as the interrupted-command bug, #85658).
+                # Rescue a session that has no record, but never overwrite a
+                # record the session wrote for itself.
                 old_cwd = getattr(cached, "cwd", None)
                 if old_cwd:
                     try:
-                        from tools.terminal_tool import record_session_cwd
-                        record_session_cwd(raw_task_id, old_cwd)
+                        from tools.terminal_tool import (
+                            get_session_cwd,
+                            record_session_cwd,
+                        )
+                        if get_session_cwd(raw_task_id) is None:
+                            record_session_cwd(raw_task_id, old_cwd)
                     except Exception:
                         pass
                 with _file_ops_lock:
@@ -1042,12 +1851,13 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
             logger.info("Creating new %s environment for task %s...", env_type, task_id[:8])
 
             container_config = None
-            if env_type in {"docker", "singularity", "modal", "daytona"}:
+            if env_type in {"docker", "singularity", "modal", "daytona", "vercel_sandbox"}:
                 container_config = {
                     "container_cpu": config.get("container_cpu", 1),
                     "container_memory": config.get("container_memory", 5120),
                     "container_disk": config.get("container_disk", 51200),
                     "container_persistent": config.get("container_persistent", True),
+                    "vercel_runtime": config.get("vercel_runtime", ""),
                     "docker_volumes": config.get("docker_volumes", []),
                     "docker_mount_cwd_to_workspace": config.get("docker_mount_cwd_to_workspace", False),
                     "docker_forward_env": config.get("docker_forward_env", []),
@@ -1080,7 +1890,7 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
                 container_config=container_config,
                 local_config=local_config,
                 task_id=task_id,
-                host_cwd=config.get("host_cwd"),
+                host_cwd=_resolve_task_host_cwd(config, raw_task_id),
             )
 
             with _env_lock:
@@ -1106,7 +1916,39 @@ def clear_file_ops_cache(task_id: str = None):
             _file_ops_cache.clear()
 
 
-def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = "default") -> str:
+def _special_file_kind(path) -> str | None:
+    """Return a human name for non-regular file types that block reads.
+
+    Stat-based sibling of the name-based ``_is_blocked_device`` guard: a
+    FIFO at ``logs/live.pipe`` or a socket in a workspace hangs ``read_file``
+    just as hard as ``/dev/zero``, but carries no recognizable name. Only
+    called for host-visible filesystems (see ``_file_ops_uses_host_paths``);
+    remote backends cannot be statted from here.
+
+    Returns None for regular files, missing paths, and anything unstattable
+    (those flow to the normal read path and its own error handling).
+    """
+    import stat as _stat
+
+    try:
+        st = os.stat(os.fspath(path))  # follows symlinks, matching a real read
+    except OSError:
+        return None
+    mode = st.st_mode
+    if _stat.S_ISREG(mode) or _stat.S_ISDIR(mode):
+        return None
+    if _stat.S_ISFIFO(mode):
+        return "a FIFO (named pipe)"
+    if _stat.S_ISSOCK(mode):
+        return "a socket"
+    if _stat.S_ISCHR(mode):
+        return "a character device"
+    if _stat.S_ISBLK(mode):
+        return "a block device"
+    return "a special (non-regular) file"
+
+
+def read_file_tool(path: str, offset: int = 1, limit: int = 2000, task_id: str = "default") -> str:
     """Read a file with pagination and line numbers."""
     try:
         offset, limit = normalize_read_pagination(offset, limit)
@@ -1114,162 +1956,238 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = 
         # ── Device path guard ─────────────────────────────────────────
         # Block paths that would hang the process (infinite output,
         # blocking on input).  Pure path check — no I/O.
-        device_base = None if Path(path).expanduser().is_absolute() else _resolve_base_dir(task_id)
+        # ``Path.expanduser`` raises for a valid remote ``~user/...`` path when
+        # that account does not exist on the gateway host.  Keep this pure
+        # guard host-tolerant; the target backend expands the path later.
+        device_path = _expand_tilde(path)
+        device_base = None if Path(device_path).is_absolute() else _resolve_base_dir(task_id)
         if _is_blocked_device(path, base_dir=device_base):
-            return json.dumps({
-                "error": (
-                    f"Cannot read '{path}': this is a device file that would "
-                    "block or produce infinite output."
-                ),
-            })
+            return tool_error(
+                f"Cannot read '{path}': this is a device file that would "
+                "block or produce infinite output."
+            )
 
         _resolved = _resolve_path_for_task(path, task_id)
 
-        # ── Structured-document extraction ────────────────────────────
-        # Try before the binary-extension guard so .docx/.xlsx can render as text.
-        # Malformed documents fall through to the normal path/binary guard.
-        from tools.read_extract import ExtractionError, extract_document_text, is_extractable_document
-
-        if is_extractable_document(str(_resolved)):
-            try:
-                extracted_text = extract_document_text(str(_resolved))
-            except ExtractionError:
-                logger.debug("document extraction failed for %s", path, exc_info=True)
-            else:
-                file_ops = _get_file_ops(task_id)
-                lines = extracted_text.splitlines()
-                total_lines = len(lines)
-                end_line = offset + limit - 1
-                page_text = "\n".join(lines[offset - 1:end_line])
-                result_dict = {
-                    "content": file_ops._add_line_numbers(page_text, offset) if page_text else "",
-                    "total_lines": total_lines,
-                    "file_size": os.path.getsize(_resolved),
-                    "truncated": total_lines > end_line,
-                    "extracted_document": True,
-                }
-                if result_dict["truncated"]:
-                    result_dict["hint"] = (
-                        f"Use offset={end_line + 1} to continue reading "
-                        f"(showing {offset}-{min(end_line, total_lines)} of {total_lines} lines)"
-                    )
-                content_len = len(result_dict["content"])
-                max_chars = _get_max_read_chars()
-                if content_len > max_chars:
-                    # Graceful char-budget truncation (nearai/ironclaw#5029):
-                    # trim to the last complete line that fits and offer a
-                    # next_offset rather than rejecting the whole extraction.
-                    trimmed, lines_kept, _ = _truncate_to_char_budget(
-                        result_dict["content"], max_chars
-                    )
-                    next_offset = offset + lines_kept
-                    shown_end = offset + lines_kept - 1
-                    result_dict["content"] = trimmed
-                    result_dict["truncated"] = True
-                    result_dict["truncated_by"] = "bytes"
-                    result_dict["next_offset"] = next_offset
-                    result_dict["hint"] = (
-                        f"Output truncated at the {max_chars:,}-char read budget "
-                        f"after {lines_kept} line(s) (showing lines {offset}-"
-                        f"{shown_end} of {total_lines}). Use offset={next_offset} "
-                        "to continue."
-                    )
-                    if len(trimmed.split("\n", 1)[0]) >= max_chars:
-                        result_dict["hint"] += (
-                            " Note: the first line alone exceeded the budget and "
-                            "was clamped mid-line; its remainder is not "
-                            "retrievable via offset."
-                        )
-                if result_dict["content"]:
-                    result_dict["content"] = redact_sensitive_text(result_dict["content"], file_read=True)
-                return json.dumps(result_dict, ensure_ascii=False)
-
-        # ── Binary file guard ─────────────────────────────────────────
-        # Block binary files by extension (no I/O).
-        if has_binary_extension(str(_resolved)):
-            _ext = _resolved.suffix.lower()
-            return json.dumps({
-                "error": (
-                    f"Cannot read binary file '{path}' ({_ext}). "
-                    "Use vision_analyze for images, or terminal to inspect binary files."
-                ),
-            })
+        # ── Special-file type guard (stat-based) ──────────────────────
+        # The name blocklist above catches /dev/* and /proc/* aliases; this
+        # catches the class — any FIFO/socket/device wherever it lives. A
+        # read on a FIFO blocks until the exec timeout: a self-shipped DoS.
+        if _file_ops_uses_host_paths(_get_file_ops(task_id)):
+            kind = _special_file_kind(_resolved)
+            if kind is not None:
+                return json.dumps({
+                    "success": False,
+                    "note": (
+                        f"'{path}' is {kind}, not a regular file — reading "
+                        "it would block indefinitely, so no read was "
+                        "attempted. Use terminal utilities if you need to "
+                        "interact with it."
+                    ),
+                })
 
         # ── Hermes internal path guard ────────────────────────────────
-        # Prevent prompt injection via catalog or hub metadata files,
-        # and block credential stores under HERMES_HOME.  Pass the
-        # already-resolved path so a relative-path read against
-        # TERMINAL_CWD == HERMES_HOME (e.g. "auth.json") still hits the
-        # denylist — get_read_block_error's own resolve() runs against
-        # the Python process cwd, which can differ.
+        # Run before every content-reading path, including structured
+        # document byte transport. Otherwise a blocked credential/cache file
+        # with a supported extension could bypass the canonical denylist.
         block_error = get_read_block_error(str(_resolved))
         if block_error:
-            return json.dumps({"error": block_error})
+            return tool_error(block_error)
+
+        # ── Structured-document extraction ────────────────────────────
+        # Try before the binary-extension guard so .docx/.xlsx can render as text.
+        # Binary-document failures are surfaced. Notebook syntax/decode errors
+        # and parsed-but-nonrenderable notebook structures paginate the already-
+        # bounded byte snapshot rather than re-reading a path.
+        from tools.read_extract import (
+            ANYDOC_EXTENSIONS,
+            EXTRACTABLE_EXTENSIONS,
+            ExtractionBusyError,
+            ExtractionError,
+            NotebookFallbackError,
+            document_size_limit,
+            extract_document_bytes,
+            is_extractable_document,
+            native_extraction_slot,
+        )
+
+        resolved_str = str(_resolved)
+        if is_extractable_document(resolved_str):
+            unchanged = _unchanged_read_response(
+                path=path,
+                resolved_str=resolved_str,
+                offset=offset,
+                limit=limit,
+                task_id=task_id,
+            )
+            if unchanged is not None:
+                return unchanged
+            file_ops = _get_file_ops(task_id)
+            _doc_ext = _resolved.suffix.lower()
+            try:
+                # Acquire before backend/base64 transport so rejected overflow
+                # calls cannot consume the memory this guard is meant to cap.
+                with native_extraction_slot(path):
+                    binary = file_ops.read_file_bytes(
+                        path,
+                        max_bytes=document_size_limit(path),
+                    )
+                    if binary.error or binary.base64_content is None:
+                        raise ExtractionError(
+                            binary.error or "Document bytes unavailable"
+                        )
+                    document_bytes = base64.b64decode(
+                        binary.base64_content, validate=True
+                    )
+                    try:
+                        extracted_text = extract_document_bytes(
+                            document_bytes, path
+                        )
+                    except NotebookFallbackError as extraction_exc:
+                        # Syntax/decode failures have no parsed graph. Semantic
+                        # failures do, so clear the complete exception chain
+                        # before raw decoding; JSON graphs are acyclic and are
+                        # released when their traceback frame is detached.
+                        fallback_reason = str(extraction_exc)
+                        extraction_exc.__traceback__ = None
+                        extraction_exc.__cause__ = None
+                        extraction_exc.__context__ = None
+                        raw_notebook = document_bytes.decode(
+                            "utf-8-sig", errors="replace"
+                        )
+                        result_dict = _document_page_result(
+                            raw_notebook,
+                            file_ops,
+                            offset,
+                            limit,
+                            binary.file_size,
+                            extracted_document=False,
+                            fallback_note=(
+                                "Notebook structured extraction failed; showing the "
+                                "bounded raw snapshot instead: "
+                                f"{fallback_reason}"
+                            ),
+                        )
+                        return _finish_tracked_read(
+                            result_dict,
+                            path=path,
+                            resolved_str=resolved_str,
+                            offset=offset,
+                            limit=limit,
+                            task_id=task_id,
+                        )
+                    # Keep the native-reader allocation slot through
+                    # redaction, lossless pagination, and serialization. The
+                    # per-request working-set proof includes these phases;
+                    # releasing immediately after parsing would let an
+                    # unbounded tail of completed parsers overlap the next ten
+                    # transports while still retaining decoded/extracted data.
+                    result_dict = _document_page_result(
+                        extracted_text,
+                        file_ops,
+                        offset,
+                        limit,
+                        binary.file_size,
+                        extracted_document=True,
+                    )
+                    return _finish_tracked_read(
+                        result_dict,
+                        path=path,
+                        resolved_str=resolved_str,
+                        offset=offset,
+                        limit=limit,
+                        task_id=task_id,
+                    )
+            except (ExtractionError, ValueError, base64.binascii.Error) as exc:
+                logger.debug("document extraction failed for %s", path, exc_info=True)
+                if isinstance(exc, ExtractionBusyError):
+                    return tool_error(f"Cannot read '{path}': {exc}.")
+                if not isinstance(exc, ExtractionError):
+                    return tool_error(
+                        f"Cannot read '{path}' ({_doc_ext}): bounded document "
+                        f"transport returned invalid byte data — {exc}. Retry "
+                        "if the file or backend is changing."
+                    )
+                # For binary document formats, surface the specific failure
+                # (size cap, encrypted, malformed…) instead of falling through
+                # — the fallthrough path can only produce a generic
+                # binary-file error or garbage raw bytes, hiding the
+                # actionable reason (e.g. "Document too large to convert").
+                # Malformed notebooks use the bounded snapshot above. Any
+                # transport, size, or base64 failure is surfaced so no path
+                # can fall through to an uncapped second read.
+                _binary_doc = _doc_ext in ANYDOC_EXTENSIONS or (
+                    _doc_ext in EXTRACTABLE_EXTENSIONS and _doc_ext != ".ipynb"
+                )
+                if _doc_ext == ".ipynb":
+                    return tool_error(
+                        f"Cannot read '{path}' (.ipynb): bounded notebook "
+                        f"transport/extraction failed — {exc}. Retry if the "
+                        "file is changing, or inspect a smaller copy."
+                    )
+                if (
+                    _binary_doc
+                    and isinstance(exc, ExtractionError)
+                    and not str(exc).startswith("Unsupported document type")
+                ):
+                    return tool_error(
+                        f"Cannot read '{path}' ({_doc_ext}): document "
+                        f"extraction failed — {exc}. Use terminal utilities "
+                        "to inspect or convert the file."
+                    )
+        # ── Binary file guard ─────────────────────────────────────────
+        # Block binary files by extension (no I/O). Name what we know:
+        # the extension is a claim, so keep this branch's message to the
+        # extension itself — the content-sniffing path below names the
+        # actual magic-byte type for extension-less/lying files.
+        if has_binary_extension(str(_resolved)):
+            _ext = _resolved.suffix.lower()
+            return tool_error(
+                f"Cannot read binary file '{path}' ({_ext}). "
+                "Use vision_analyze for images, or terminal to inspect binary files."
+            )
+
+        # ── Negative-result cache ─────────────────────────────────────
+        # If we already discovered this path doesn't exist (within TTL),
+        # return the cached error without spawning the subprocess +
+        # similar-files walk. Cleared by write_file/patch on the same path.
+        resolved_str_for_neg = str(_resolved)
+        cached_not_found = _check_not_found_cache("read", resolved_str_for_neg, task_id)
+        if cached_not_found is not None:
+            return cached_not_found
 
         # ── Dedup check ───────────────────────────────────────────────
         # If we already read this exact (path, offset, limit) and the
         # file hasn't been modified since, return a lightweight stub
         # instead of re-sending the same content.  Saves context tokens.
-        resolved_str = str(_resolved)
-        dedup_key = (resolved_str, offset, limit)
-        with _read_tracker_lock:
-            task_data = _read_tracker.setdefault(task_id, {
-                "last_key": None, "consecutive": 0,
-                "read_history": set(), "dedup": {},
-                "dedup_hits": {}, "read_timestamps": {},
-            })
-            # Backward-compat for pre-existing tracker entries that predate
-            # dedup_hits/read_timestamps (long-lived task or crossed an
-            # upgrade boundary).
-            if "dedup_hits" not in task_data:
-                task_data["dedup_hits"] = {}
-            if "read_timestamps" not in task_data:
-                task_data["read_timestamps"] = {}
-            cached_mtime = task_data.get("dedup", {}).get(dedup_key)
-
-        if cached_mtime is not None:
-            try:
-                current_mtime = os.path.getmtime(resolved_str)
-                if current_mtime == cached_mtime:
-                    # Count repeated stub returns so weak tool-followers that
-                    # ignore the "refer to earlier result" hint don't burn
-                    # their iteration budget in an infinite read loop.  After
-                    # 2 stubs for the same key we escalate to a hard block
-                    # mirroring the count>=4 path on real reads.
-                    with _read_tracker_lock:
-                        hits = task_data["dedup_hits"].get(dedup_key, 0) + 1
-                        task_data["dedup_hits"][dedup_key] = hits
-                        _cap_read_tracker_data(task_data)
-
-                    if hits >= 2:
-                        return json.dumps({
-                            "error": (
-                                f"BLOCKED: You have called read_file on this "
-                                f"exact region {hits + 1} times and the file "
-                                "has NOT changed. STOP calling read_file for "
-                                "this path — the content from your earlier "
-                                "read_file result in this conversation is "
-                                "still current. Proceed with your task using "
-                                "the information you already have."
-                            ),
-                            "path": path,
-                            "already_read": hits + 1,
-                        }, ensure_ascii=False)
-
-                    return json.dumps({
-                        "status": "unchanged",
-                        "message": _READ_DEDUP_STATUS_MESSAGE,
-                        "path": path,
-                        "dedup": True,
-                        "content_returned": False,
-                    }, ensure_ascii=False)
-            except OSError:
-                pass  # stat failed — fall through to full read
+        unchanged = _unchanged_read_response(
+            path=path,
+            resolved_str=resolved_str,
+            offset=offset,
+            limit=limit,
+            task_id=task_id,
+        )
+        if unchanged is not None:
+            return unchanged
 
         # ── Perform the read ──────────────────────────────────────────
         file_ops = _get_file_ops(task_id)
         result = file_ops.read_file(path, offset, limit)
         result_dict = result.to_dict()
+
+        # ── Populate negative-result cache on not-found ───────────────
+        # _suggest_similar_files returns ReadResult(error="File not found: ..").
+        # Cache the JSON we'd return so a retry skips the parent-dir walk.
+        # Deliberately NO early return: on upstream, error results flow
+        # through the tracking block below (consecutive-loop detection,
+        # dedup bookkeeping via the resolved path) and the normal exit —
+        # short-circuiting here changes that behavior (and broke a real
+        # test interaction). Serving from the cache (above) is the
+        # optimization; recording must stay side-effect-identical.
+        _err = result_dict.get("error") or ""
+        if isinstance(_err, str) and _err.startswith("File not found:"):
+            _not_found_json = json.dumps(result_dict, ensure_ascii=False)
+            _record_not_found("read", resolved_str_for_neg, task_id, _not_found_json)
 
         # ── Character-count guard ─────────────────────────────────────
         # We're model-agnostic so we can't count tokens; characters are
@@ -1329,74 +2247,14 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = 
                 "to keep context usage efficient."
             ))
 
-        # ── Track for consecutive-loop detection ──────────────────────
-        read_key = ("read", path, offset, limit)
-        with _read_tracker_lock:
-            # Ensure "dedup" / "dedup_hits" keys exist (backward compat with
-            # old tracker state from pre-dedup-guard sessions).
-            if "dedup" not in task_data:
-                task_data["dedup"] = {}
-            if "dedup_hits" not in task_data:
-                task_data["dedup_hits"] = {}
-            # Real read succeeded — this key is no longer in a stub-loop, so
-            # reset its hit counter.  (File either changed or stat failed
-            # earlier and we fell through.)
-            task_data["dedup_hits"].pop(dedup_key, None)
-            task_data["read_history"].add((path, offset, limit))
-            if task_data["last_key"] == read_key:
-                task_data["consecutive"] += 1
-            else:
-                task_data["last_key"] = read_key
-                task_data["consecutive"] = 1
-            count = task_data["consecutive"]
-
-            # Store mtime at read time for two purposes:
-            # 1. Dedup: skip identical re-reads of unchanged files.
-            # 2. Staleness: warn on write/patch if the file changed since
-            #    the agent last read it (external edit, concurrent agent, etc.).
-            try:
-                _mtime_now = os.path.getmtime(resolved_str)
-                task_data["dedup"][dedup_key] = _mtime_now
-                task_data.setdefault("read_timestamps", {})[resolved_str] = _mtime_now
-            except OSError:
-                pass  # Can't stat — skip tracking for this entry
-
-            # Bound the per-task containers so a long CLI session doesn't
-            # accumulate megabytes of dict/set state.  See _cap_read_tracker_data.
-            _cap_read_tracker_data(task_data)
-
-        # Cross-agent file-state registry (separate from per-task read
-        # tracker above): records that THIS agent has read this path so
-        # write/patch can detect sibling-subagent writes that happened
-        # after our read.  Partial read when offset>1 or the read was
-        # truncated (large file with more content than limit covered).
-        # Outside the _read_tracker_lock so the registry's own locking
-        # isn't nested under ours.
-        try:
-            _partial = (offset > 1) or bool(result_dict.get("truncated"))
-            file_state.record_read(task_id, resolved_str, partial=_partial)
-        except Exception:
-            logger.debug("file_state.record_read failed", exc_info=True)
-
-        if count >= 4:
-            # Hard block: stop returning content to break the loop
-            return json.dumps({
-                "error": (
-                    f"BLOCKED: You have read this exact file region {count} times in a row. "
-                    "The content has NOT changed. You already have this information. "
-                    "STOP re-reading and proceed with your task."
-                ),
-                "path": path,
-                "already_read": count,
-            }, ensure_ascii=False)
-        elif count >= 3:
-            result_dict["_warning"] = (
-                f"You have read this exact file region {count} times consecutively. "
-                "The content has not changed since your last read. Use the information you already have. "
-                "If you are stuck in a loop, stop reading and proceed with writing or responding."
-            )
-
-        return json.dumps(result_dict, ensure_ascii=False)
+        return _finish_tracked_read(
+            result_dict,
+            path=path,
+            resolved_str=resolved_str,
+            offset=offset,
+            limit=limit,
+            task_id=task_id,
+        )
     except Exception as e:
         return tool_error(str(e))
 
@@ -1448,6 +2306,15 @@ def notify_other_tool_call(task_id: str = "default"):
             # progress, so clear per-key dedup hit counters too.
             if "dedup_hits" in task_data:
                 task_data["dedup_hits"].clear()
+            # Any other tool (terminal, delegate, ...) may have created a
+            # previously-missing path — a cached miss is no longer
+            # trustworthy. The serve-side existence guard in
+            # _check_not_found_cache already covers this, but clearing
+            # here keeps the cache honest and covers exotic cases the
+            # stat can't (e.g. permission flips).
+            nf = task_data.get("not_found")
+            if nf:
+                nf.clear()
 
 
 def _invalidate_dedup_for_path(filepath: str, task_id: str) -> None:
@@ -1464,7 +2331,7 @@ def _invalidate_dedup_for_path(filepath: str, task_id: str) -> None:
     internally.
     """
     try:
-        resolved = str(_resolve_path(filepath))
+        resolved = str(_resolve_path(filepath, task_id))
     except (OSError, ValueError):
         return
     with _read_tracker_lock:
@@ -1472,12 +2339,18 @@ def _invalidate_dedup_for_path(filepath: str, task_id: str) -> None:
         if task_data is None:
             return
         dedup = task_data.get("dedup")
-        if not dedup:
-            return
-        # Collect keys to remove (can't mutate dict during iteration).
-        stale_keys = [k for k in dedup if k[0] == resolved]
-        for k in stale_keys:
-            del dedup[k]
+        if dedup:
+            # Collect keys to remove (can't mutate dict during iteration).
+            stale_keys = [k for k in dedup if k[0] == resolved]
+            for k in stale_keys:
+                del dedup[k]
+        # Also evict from the negative-result cache: a write_file that
+        # creates the path means subsequent reads (or searches under it)
+        # must hit disk.
+        nf = task_data.get("not_found")
+        if nf:
+            nf.pop(("read", resolved), None)
+            nf.pop(("search", resolved), None)
 
 
 def _update_read_timestamp(filepath: str, task_id: str) -> None:
@@ -1569,6 +2442,51 @@ def _mark_verification_stale(
         logger.debug("verification stale marker failed", exc_info=True)
 
 
+def _check_binary_document_write(filepath: str, task_id: str = "default") -> str | None:
+    """Reject text-tool writes that would corrupt a binary document.
+
+    ``read_file`` auto-extracts .docx/.xlsx/.pptx (and PDF, via anydoc) to
+    readable text, so the model plausibly believes it holds the file's
+    contents and tries to write the edited text back with write_file/patch.
+    A plain-text write can never produce a valid OOXML/OLE/ODF container, so
+    that write silently destroys the document (port of nearai/ironclaw#7109).
+
+    Rules:
+    - Opaque container formats (.doc/.docx/.xls/.xlsx/.ppt/.pptx/.odt/.ods/
+      .odp): always rejected — text bytes are never a valid document, whether
+      creating or overwriting.
+    - .pdf: rejected only when OVERWRITING an existing regular file. Raw PDF
+      syntax is text-authorable, so new-file creation stays allowed.
+    """
+    if has_opaque_document_extension(filepath):
+        ext = filepath[filepath.rfind("."):].lower()
+        return (
+            f"Refusing to write plain text to binary document '{filepath}' ({ext}). "
+            "A text write cannot produce a valid document container and would "
+            "corrupt the file (read_file showed you EXTRACTED text, not the real "
+            "bytes). Use the docx/xlsx/powerpoint skills or a library like "
+            "python-docx/openpyxl/python-pptx via the terminal to create or edit "
+            "this document."
+        )
+    if is_pdf_path(filepath):
+        try:
+            resolved = Path(_resolve_path_for_task(filepath, task_id))
+        except Exception:
+            resolved = Path(_expand_tilde(filepath))
+        try:
+            if resolved.is_file():
+                return (
+                    f"Refusing to overwrite existing PDF '{filepath}' with plain text. "
+                    "read_file showed you EXTRACTED text, not the real bytes — writing "
+                    "text back would destroy the document. Use the pdf skill or a PDF "
+                    "library via the terminal to modify it. (Creating a NEW .pdf file "
+                    "is allowed.)"
+                )
+        except OSError:
+            pass
+    return None
+
+
 def write_file_tool(path: str, content: str, task_id: str = "default",
                     cross_profile: bool = False,
                     session_id: str | None = None) -> str:
@@ -1583,6 +2501,15 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
     sensitive_err = _check_sensitive_path(path, task_id)
     if sensitive_err:
         return tool_error(sensitive_err)
+    binary_doc_err = _check_binary_document_write(path, task_id)
+    if binary_doc_err:
+        return tool_error(binary_doc_err)
+    protected_err = _check_protected_instruction_write([path], task_id)
+    if protected_err:
+        return tool_error(protected_err)
+    approval_err = _check_approval_required_write([path], task_id)
+    if approval_err:
+        return tool_error(approval_err)
     if not cross_profile:
         cross_warning = _check_cross_profile_path(path, task_id)
         if cross_warning:
@@ -1664,8 +2591,12 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
     """
     # Check sensitive paths for both replace (explicit path) and V4A patch (extract paths)
     _paths_to_check = []
+    # Paths whose CONTENT will be text-written (Update/Add + explicit path).
+    # V4A Delete/Move don't write text, so they skip the binary-document guard.
+    _content_write_paths = []
     if path:
         _paths_to_check.append(path)
+        _content_write_paths.append(path)
     if mode == "patch" and patch:
         import re as _re
         from tools.path_security import has_traversal_component
@@ -1691,12 +2622,15 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
         # it accepts ``***Update File:`` with no space after the asterisks
         # (patch_parser.py uses ``\*\*\*\s*Update\s+File:``). Requiring a space
         # here let a no-space header parse + apply while skipping this check.
-        for _m in _re.finditer(r'^\*\*\*\s*(?:Update|Add|Delete)\s+File:\s*(.+)$', patch, _re.MULTILINE):
-            v4a_path = _m.group(1).strip()
+        for _m in _re.finditer(r'^\*\*\*\s*(Update|Add|Delete)\s+File:\s*(.+)$', patch, _re.MULTILINE):
+            _op = _m.group(1)
+            v4a_path = _m.group(2).strip()
             _err = _reject_v4a_traversal(v4a_path)
             if _err:
                 return _err
             _paths_to_check.append(v4a_path)
+            if _op in ("Update", "Add"):
+                _content_write_paths.append(v4a_path)
         # ``*** Move File: src -> dst`` is a valid V4A op (patch_parser.py:114)
         # but was never extracted, so a Move targeting /etc/crontab skipped the
         # sensitive-path pre-check. Check BOTH endpoints, and run them through
@@ -1715,6 +2649,18 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
             cross_warning = _check_cross_profile_path(_p, task_id)
             if cross_warning:
                 return tool_error(cross_warning)
+    for _p in _content_write_paths:
+        binary_doc_err = _check_binary_document_write(_p, task_id)
+        if binary_doc_err:
+            return tool_error(binary_doc_err)
+    # One approval prompt for the whole patch: a single protected file gates
+    # the ENTIRE patch (deny applies nothing — see the helper's docstring).
+    protected_err = _check_protected_instruction_write(_paths_to_check, task_id)
+    if protected_err:
+        return tool_error(protected_err)
+    approval_err = _check_approval_required_write(_paths_to_check, task_id)
+    if approval_err:
+        return tool_error(approval_err)
     try:
         # Resolve paths for locking.  Ordered + deduplicated so concurrent
         # callers lock in the same order — prevents deadlock on overlapping
@@ -1775,7 +2721,15 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
             elif mode == "patch":
                 if not patch:
                     return tool_error("patch content required")
-                result = file_ops.patch_v4a(patch)
+                # Rewrite V4A headers to the resolved absolute paths so the
+                # shell layer patches the exact files the tool layer resolved
+                # (locked/reported). Without this a relative header re-resolves
+                # against the shell's cwd, which can differ from the workspace
+                # (git-worktree cwd bug) — landing the edit elsewhere.
+                patch_for_ops = _rewrite_v4a_patch_paths_for_host(
+                    patch, _path_to_resolved, file_ops
+                )
+                result = file_ops.patch_v4a(patch_for_ops)
             else:
                 return tool_error(f"Unknown mode: {mode}")
 
@@ -1878,15 +2832,13 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
             count = task_data["consecutive"]
 
         if count >= 4:
-            return json.dumps({
-                "error": (
-                    f"BLOCKED: You have run this exact search {count} times in a row. "
-                    "The results have NOT changed. You already have this information. "
-                    "STOP re-searching and proceed with your task."
-                ),
-                "pattern": pattern,
-                "already_searched": count,
-            }, ensure_ascii=False)
+            return tool_error(
+                f"BLOCKED: You have run this exact search {count} times in a row. "
+                "The results have NOT changed. You already have this information. "
+                "STOP re-searching and proceed with your task.",
+                pattern=pattern,
+                already_searched=count,
+            )
 
         try:
             resolved_path = _resolve_path_for_task(path, task_id)
@@ -1894,7 +2846,20 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
             resolved_path = None
         block_error = get_read_block_error(str(resolved_path) if resolved_path else path)
         if block_error:
-            return json.dumps({"error": block_error}, ensure_ascii=False)
+            return tool_error(block_error)
+
+        # ── Negative-result cache ─────────────────────────────────────
+        # Search returns "Path not found: <path>" when the search root
+        # doesn't exist. The error path also lists the parent directory
+        # (file_operations.py:1402) — expensive to repeat. Cache so the
+        # next call to a known-missing root skips both shells.
+        try:
+            resolved_search_path = str(_resolve_path_for_task(path, task_id))
+        except (OSError, ValueError):
+            resolved_search_path = path
+        cached_search_nf = _check_not_found_cache("search", resolved_search_path, task_id)
+        if cached_search_nf is not None:
+            return cached_search_nf
 
         file_ops = _get_file_ops(task_id)
         result = file_ops.search(
@@ -1913,6 +2878,14 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
                 f"{omitted} result(s) omitted because they target credential, "
                 "token, cache, or secret-bearing environment files."
             )
+
+        # Populate negative cache when search root was missing. No early
+        # return — same rationale as the read path: error results keep
+        # flowing through the consecutive-search bookkeeping below.
+        _search_err = result_dict.get("error") or ""
+        if isinstance(_search_err, str) and _search_err.startswith("Path not found:"):
+            _search_nf_json = json.dumps(result_dict, ensure_ascii=False)
+            _record_not_found("search", resolved_search_path, task_id, _search_nf_json)
 
         if count >= 3:
             result_dict["_warning"] = (
@@ -1946,13 +2919,13 @@ def _check_file_reqs():
 
 READ_FILE_SCHEMA = {
     "name": "read_file",
-    "description": "Read a text file with line numbers and pagination. Use this instead of cat/head/tail in terminal. Output format: 'LINE_NUM|CONTENT'. Suggests similar filenames if not found. Use offset and limit for large files. Reads exceeding ~100K characters are truncated on a line boundary and return a next_offset; continue with offset to read the rest. Jupyter notebooks (.ipynb), Word documents (.docx), and Excel workbooks (.xlsx) are auto-extracted to readable text. NOTE: Cannot read images or other binary files — use vision_analyze for images.",
+    "description": "Read a text file with line numbers and pagination. Use this instead of cat/head/tail in terminal. Output format: 'LINE_NUM|CONTENT'. Suggests similar filenames if not found. Use offset and limit for large files. Reads exceeding ~100K characters are truncated on a line boundary and return a next_offset; continue with offset to read the rest. Jupyter notebooks (.ipynb), Word documents (.docx), and Excel workbooks (.xlsx) are auto-extracted to readable text; PDF, legacy Office (.doc/.ppt/.xls), OpenDocument, RTF, and EPUB convert too when the optional anydoc converter is available (auto-installed on first use where installs are permitted). PDF conversion reads the text layer only: scanned/image pages yield no text, and when many pages come back empty the output begins with an EXTRACTION COVERAGE WARNING listing the affected pages — follow its instructions (render pages with pdftoppm and inspect via vision_analyze, or OCR) instead of treating the extraction as complete. NOTE: Cannot read images or other binary files — use vision_analyze for images.",
     "parameters": {
         "type": "object",
         "properties": {
             "path": {"type": "string", "description": "Path to the file to read (absolute, relative, or ~/path)"},
             "offset": {"type": "integer", "description": "Line number to start reading from (1-indexed, default: 1)", "default": 1, "minimum": 1},
-            "limit": {"type": "integer", "description": "Maximum number of lines to read (default: 500, max: 2000)", "default": 500, "maximum": 2000}
+            "limit": {"type": "integer", "description": "Maximum number of lines to read (default: 2000, max: 2000). Reads are additionally capped at a ~100K-character budget with a next_offset continuation.", "default": 2000, "maximum": 2000}
         },
         "required": ["path"]
     }
@@ -1960,7 +2933,7 @@ READ_FILE_SCHEMA = {
 
 WRITE_FILE_SCHEMA = {
     "name": "write_file",
-    "description": "Write content to a file, completely replacing existing content. Use this instead of echo/cat heredoc in terminal. Creates parent directories automatically. OVERWRITES the entire file — use 'patch' for targeted edits. Auto-runs syntax checks on .py/.json/.yaml/.toml and other linted languages; only NEW errors introduced by this write are surfaced (pre-existing errors are filtered out).",
+    "description": "Write content to a file, completely replacing existing content. Use this instead of echo/cat heredoc in terminal. Creates parent directories automatically. OVERWRITES the entire file — use 'patch' for targeted edits. Auto-runs syntax checks on .py/.json/.yaml/.toml and other linted languages; only NEW errors introduced by this write are surfaced (pre-existing errors are filtered out). The result's verified:true means the on-disk content hash was confirmed — do NOT re-read the file to check the write landed.",
     "parameters": {
         "type": "object",
         "properties": {
@@ -2006,7 +2979,7 @@ PATCH_SCHEMA = {
             },
             "new_string": {
                 "type": "string",
-                "description": "REQUIRED when mode='replace'. Replacement text. Pass empty string '' to delete the matched text.",
+                "description": "REQUIRED when mode='replace'. Changed replacement text; it must differ from old_string. Pass empty string '' to delete the matched text.",
             },
             "replace_all": {
                 "type": "boolean",
