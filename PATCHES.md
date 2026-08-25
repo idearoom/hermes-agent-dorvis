@@ -13,11 +13,15 @@ Current upstream base for the carried branch: `fcbd1076a93841fa88855acce810e342a
 The upstream release is a large rollup, so every conflict was resolved at the
 runtime contract rather than by choosing one side wholesale. Notable results:
 
-- **Behavior-neutral first release** — upstream's new tool, skill, web-extract,
-  compaction, stall/repetition recovery, stream-hook, webhook, monitoring, and
-  messaging implementations remain available in source, but no Dorvis
-  model-visible tool set or production behavior is enabled by this rebase.
-  Product adoption is evaluated separately after parity is proved.
+- **Parity-first release with two reviewed improvements** — upstream's new
+  native DOCX/XLSX/notebook reader is carried through the existing `read_file`
+  surface with strict resource and archive/XML bounds, and the existing GPT /
+  Codex execution-discipline prompt receives upstream's expanded read-back,
+  count, and literal-preservation guidance. Newly shipped paid BFL/FLUX tools,
+  hard loop caps, deterministic empty-response stopping, and the remaining
+  optional tool/skill surfaces are explicitly disabled or left unselected.
+  Their product adoption is evaluated separately under AE-226 after parity is
+  proved.
 - **Postgres session store, v22 → v26 re-audit** — upstream advances the state
   schema through v26, including prompt normalization, usage/display fields,
   hygiene state, and turn leases. The adapter now mirrors the exact v26 SQL
@@ -178,6 +182,10 @@ notable resolutions:
 | Patch | Status | Purpose | Main files | Conflict surface | Owner |
 |---|---|---|---|---|---|
 | Request metadata and tool-dispatch observability | Promoted in fork history | Preserve request/session/turn metadata through hooks and tool execution so gateway, traces, and downstream plugins can correlate turns reliably. | `run_agent.py`, `model_tools.py`, `hermes_cli/hooks.py`, `hermes_cli/plugins.py`, `tools/delegate_tool.py` | Medium: agent loop and hook dispatch | IdeaRoom Agentic Systems |
+| Native structured-document reading hardening | Pending promotion | Expose upstream's native DOCX, XLSX, and IPYNB-to-text extraction through the existing bounded `read_file` contract while keeping blocked-path checks ahead of byte transport. Enforce fail-fast process concurrency, per-format byte and output budgets, bounded base64 transport, strict OOXML ZIP/XML/relationship/cell limits, and safe notebook rendering that omits active HTML/widgets and sanitizes retained traceback text. Malformed notebooks alone fall back to the same already-bounded raw snapshot; malformed binary documents fail closed. Preserve upstream's optional AnyDoc path for generic deployments, but add `HERMES_DISABLE_ANYDOC` as a pre-import/pre-install managed-runtime kill switch so Dorvis can quarantine that converter without disabling the three bounded native readers or the existing lazy-dependency allowlist. | `tools/read_extract.py`, `tools/file_operations.py`, `tools/file_tools.py`, `tests/tools/test_read_extract.py`, `tests/tools/test_file_operations.py` | Medium: file-read dispatch, untrusted archive/XML parsing, memory and output bounds | IdeaRoom Agentic Systems |
+| Hermetic Playwright container dependency | Pending promotion | Pin the root Playwright package and invoke its installed binary directly so the Chromium layer used by the runtime image cannot drift through `npx` package resolution between the tested and published build. | `package.json`, `package-lock.json`, `Dockerfile`, `tests-js/docker-playwright-pin.test.ts` | Low: container-only browser dependency installation | IdeaRoom Agentic Systems |
+| Immutable GHCR publisher and base roots | Pending promotion | Build and label the arm64 runtime image exactly once, smoke that local image, fail closed on conflicting or unverifiable `sha-<commit>` tags, and export the read-back registry manifest digest that the parent stack pins. Pin both Debian build/runtime roots to one official immutable index digest, preserve idempotent reruns only when the remote config digest matches, and publish no mutable convenience alias. | `.github/workflows/idearoom-ghcr-publish.yml`, `scripts/ci/publish_immutable_image.py`, `tests/ci/test_ghcr_image_publish.py`, `Dockerfile` | Medium: container supply chain, GHCR publication, parent-image identity handoff | IdeaRoom Agentic Systems |
+| Delegated code-execution boundary | Pending promotion | Preserve Dorvis's prior child-agent resource and side-effect boundary after upstream generalized delegated tool inheritance: leaf and orchestrator children cannot receive either `execute_code` or its composite `code_execution` toolset. | `tools/delegate_tool.py`, `tests/tools/test_delegate.py`, `website/docs/guides/delegation-patterns.md`, `website/docs/user-guide/features/delegation.md` | Low: delegated child tool filtering and model-facing delegation description | IdeaRoom Agentic Systems |
 | Runtime footer preservation | Promoted in fork history | Preserve runtime footer usage fields across gateway streaming and response handling. | `gateway/runtime_footer.py`, `gateway/run.py`, `gateway/platforms/api_server.py` | Medium: gateway stream/result formatting | IdeaRoom Agentic Systems |
 | Hindsight retained-chat tagging and document metadata | Promoted in fork history | Tag retained web chats with useful provenance and preserve document-level Hindsight metadata for recall/auditability, including chat/session/user/environment/profile fields when traffic comes through Hermes Web. | `agent/agent_init.py`, `agent/turn_context.py`, `plugins/memory/hindsight/__init__.py` | Low: Hindsight plugin provider surface and request metadata handoff | IdeaRoom Agentic Systems |
 | Stateful compression quality gate | Promoted in fork history | Improve context-compression safety by preserving ledger/state details and validating compression quality. | `agent/context_compressor.py`, `agent/conversation_compression.py`, `agent/conversation_loop.py`, `agent/turn_context.py`, `agent/turn_finalizer.py` | High: agent context and compression flow | IdeaRoom Agentic Systems |
