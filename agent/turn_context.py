@@ -28,7 +28,7 @@ import logging
 import threading
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Mapping, Optional
 
 from agent.conversation_compression import (
@@ -290,6 +290,54 @@ def reanchor_current_turn_user_idx(messages: List[Any], user_message: Any) -> in
     return fallback
 
 
+def reanchor_current_turn_user_idx_after_repair(
+    messages: List[Any],
+    turn_user_msg: Any,
+    user_message: Any,
+    current_idx: int,
+) -> tuple[int, bool]:
+    """Re-find this turn's user message after alternation repair compacted it.
+
+    ``repair_message_sequence`` merges/drops rows in place and rewrites
+    ``messages`` shorter, so a pre-repair index is meaningless afterwards. On
+    api_server (web) follow-up turns this fires on EVERY turn — the restored
+    history carries one duplicated user row per prior turn, each of which the
+    consecutive-user pass merges away — leaving the loop's index pointing past
+    the new end. The current-turn branch of the ``api_messages`` build then
+    never matched, so the ``memory_context_injected`` hook was never emitted
+    (no ``memory.retrieve``/``memory.inject`` observations, no
+    ``dorvis_memory_recall`` response metadata, no web recall block) even
+    though the memories still reached the model through the replayed
+    ``api_content`` sidecar. See AE-196.
+
+    Unlike compression, repair PRESERVES OBJECT IDENTITY for every surviving
+    message — the same property ``repair_message_sequence_with_cursor`` relies
+    on to recompute the flush cursor — so identity is the exact anchor here and
+    cannot be confused by a historical row carrying the same text.
+
+    Falls back to the content-based :func:`reanchor_current_turn_user_idx` when
+    identity is gone: the consecutive-user pass merged this turn's message into
+    the preceding user row (and dropped that row's now-stale ``api_content``),
+    so the merged row IS the live current-turn user message and the loop
+    re-composes the injection onto it — the memories still go on the wire, so
+    reporting them as injected stays truthful. Leaves ``current_idx`` untouched
+    when the list has no user row at all.
+
+    Returns ``(index, identity_preserved)``. Callers use the flag to decide
+    whether trackers other than the injection anchor may follow: after a merge,
+    the row is no longer the dict the prologue anchored, so a persist override
+    keyed to it would rewrite another user turn's text.
+    """
+    if isinstance(turn_user_msg, dict):
+        for i, msg in enumerate(messages):
+            if msg is turn_user_msg:
+                return i, True
+    fallback = reanchor_current_turn_user_idx(messages, user_message)
+    if fallback >= 0:
+        return fallback, False
+    return current_idx, False
+
+
 def compression_made_progress(
     orig_len: int, new_len: int, orig_tokens: int, new_tokens: int
 ) -> bool:
@@ -430,6 +478,10 @@ class TurnContext:
     memory_prefetch_error: str = ""
     # Turn-start preflight already proved an immediate retry ineffective.
     preflight_compression_blocked: bool = False
+    # Per-memory structure behind ``ext_prefetch_cache`` (AE-194). One dict per
+    # injected memory ({id, text snippet, score, type}); empty when the turn
+    # injected nothing. Observational — the model still only sees the text.
+    memory_records: List[Dict[str, Any]] = field(default_factory=list)
 
 
 def build_turn_context(
@@ -1350,6 +1402,7 @@ def build_turn_context(
     memory_prefetch_query = original_user_message if isinstance(original_user_message, str) else ""
     memory_provider_name = "memory"
     memory_prefetch_error = ""
+    memory_records: List[Dict[str, Any]] = []
     if agent._memory_manager:
         try:
             _providers = [
@@ -1380,6 +1433,17 @@ def build_turn_context(
                     agent._emit_status(_recall_indicator)
             except Exception:
                 pass
+
+        # Per-memory traceability for the memory_context_injected hook and the
+        # terminal response metadata (AE-194). Never fatal: a manager without
+        # the accessor, or one returning something odd, just means no records.
+        if ext_prefetch_cache:
+            try:
+                _records = agent._memory_manager.last_prefetch_memories()
+                if isinstance(_records, list):
+                    memory_records = [r for r in _records if isinstance(r, dict)]
+            except Exception:
+                logger.debug("memory prefetch records unavailable", exc_info=True)
 
     # ── api_content sidecar: persist what you send ──
     # The prefetch/plugin context above is injected into the API copy of this
@@ -1493,4 +1557,5 @@ def build_turn_context(
         memory_provider_name=memory_provider_name,
         memory_prefetch_error=memory_prefetch_error,
         preflight_compression_blocked=_preflight_compression_blocked,
+        memory_records=memory_records,
     )

@@ -187,6 +187,57 @@ class TestMemoryManager:
         assert p2.prefetch_queries == ["what do you know?"]
 
 
+    def test_prefetch_collects_per_memory_records(self):
+        """AE-194: providers that can name their memories are aggregated."""
+        class _RecordingProvider(FakeMemoryProvider):
+            def __init__(self, name, records):
+                super().__init__(name)
+                self._records = records
+                self.consume_calls = 0
+
+            def consume_prefetch_memories(self):
+                self.consume_calls += 1
+                records, self._records = self._records, []
+                return records
+
+        mgr = MemoryManager()
+        silent = FakeMemoryProvider("builtin")
+        silent._prefetch_result = "Memory from builtin"
+        recorder = _RecordingProvider(
+            "external",
+            [{"id": "fact-1", "text": "snippet", "score": None, "type": "world"}],
+        )
+        recorder._prefetch_result = "Memory from external"
+        mgr.add_provider(silent)
+        mgr.add_provider(recorder)
+
+        mgr.prefetch_all("query")
+        assert mgr.last_prefetch_memories() == [
+            {"id": "fact-1", "text": "snippet", "score": None, "type": "world"}
+        ]
+        # Rebuilt per call: the next turn recalls nothing, reports nothing.
+        mgr.prefetch_all("query 2")
+        assert mgr.last_prefetch_memories() == []
+        assert recorder.consume_calls == 2
+
+    def test_prefetch_records_ignore_provider_failures_and_bad_shapes(self):
+        class _BrokenProvider(FakeMemoryProvider):
+            def consume_prefetch_memories(self):
+                raise RuntimeError("boom")
+
+        class _BadShapeProvider(FakeMemoryProvider):
+            def consume_prefetch_memories(self):
+                return "not-a-list"
+
+        for provider_cls in (_BrokenProvider, _BadShapeProvider):
+            mgr = MemoryManager()
+            provider = provider_cls("external")
+            provider._prefetch_result = "Memory from external"
+            mgr.add_provider(provider)
+
+            assert mgr.prefetch_all("query") == "Memory from external"
+            assert mgr.last_prefetch_memories() == []
+
     def test_queue_prefetch_all(self):
         mgr = MemoryManager()
         p1 = FakeMemoryProvider("builtin")

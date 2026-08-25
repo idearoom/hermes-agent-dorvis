@@ -46,6 +46,7 @@ from agent.turn_context import (
     build_turn_context,
     compose_user_api_content,
     reanchor_current_turn_user_idx,
+    reanchor_current_turn_user_idx_after_repair,
 )
 from agent.turn_retry_state import TurnRetryState
 from agent.runtime_cwd import resolve_agent_cwd
@@ -1875,10 +1876,15 @@ def run_conversation(
     _memory_prefetch_query = _ctx.memory_prefetch_query
     _memory_provider_name = _ctx.memory_provider_name
     _memory_prefetch_error = _ctx.memory_prefetch_error
+    _memory_records = _ctx.memory_records
     _memory_context_observed = False
+    # Terminal-response payload for the injected memories of THIS turn
+    # (AE-194). Filled only when a block was actually injected; stays None
+    # otherwise so the response metadata omits the key entirely.
+    _memory_recall_metadata = None
 
     def _emit_memory_context_observation(status: str, injected_block: str = "") -> None:
-        nonlocal _memory_context_observed
+        nonlocal _memory_context_observed, _memory_recall_metadata
         if _memory_context_observed or not agent._memory_manager:
             return
         _memory_context_observed = True
@@ -1893,6 +1899,10 @@ def run_conversation(
                     ])
                 except Exception:
                     _estimated_tokens = 0
+            # Per-memory identity of what was injected (AE-194). Only
+            # meaningful when a block actually went in — an empty/error turn
+            # reports [] rather than last turn's memories.
+            _memories = list(_memory_records) if injected_block else []
             _payload = {
                 "session_id": agent.session_id or "",
                 "task_id": effective_task_id,
@@ -1906,10 +1916,23 @@ def run_conversation(
                 "injected_char_count": len(injected_block),
                 "estimated_injected_tokens": _estimated_tokens,
                 "reused_for_all_iterations": True,
+                "memories": _memories,
                 "request_metadata": getattr(agent, "_request_metadata", None) or {},
             }
             if _memory_prefetch_error:
                 _payload["error"] = _memory_prefetch_error
+            if _memories:
+                # Structured channel for API callers. The injected block stays
+                # scrubbed from streamed text; this metadata is where the web
+                # app reads which memories the answer saw.
+                _memory_recall_metadata = {
+                    "provider": _payload["provider"],
+                    "status": status,
+                    "count": len(_memories),
+                    "memories": _memories,
+                    "query_char_count": _payload["query_char_count"],
+                    "injected_char_count": _payload["injected_char_count"],
+                }
             _invoke_hook("memory_context_injected", **_payload)
         except Exception as exc:
             logger.debug("memory_context_injected hook failed: %s", exc)
@@ -2196,6 +2219,18 @@ def run_conversation(
         # flush cursor (_last_flushed_db_idx) when repair compacts the list,
         # so the turn-end flush doesn't skip the assistant/tool chain (#44837).
         from agent.agent_runtime_helpers import repair_message_sequence_with_cursor
+        # Identity anchor for THIS turn's user message, captured before repair
+        # can compact the list. Repair preserves object identity for surviving
+        # messages, so this is the exact way to re-find the row afterwards
+        # (see the reanchor below).
+        _pre_repair_turn_user_msg = None
+        if 0 <= current_turn_user_idx < len(messages):
+            _idx_candidate = messages[current_turn_user_idx]
+            if (
+                isinstance(_idx_candidate, dict)
+                and _idx_candidate.get("role") == "user"
+            ):
+                _pre_repair_turn_user_msg = _idx_candidate
         repaired_seq = repair_message_sequence_with_cursor(agent, messages)
         if repaired_seq > 0:
             request_logger.info(
@@ -2203,6 +2238,40 @@ def run_conversation(
                 repaired_seq,
                 agent.session_id or "-",
             )
+            # Repair shrank the list, so the prologue's current-turn index is
+            # stale — on api_server follow-up turns it lands past the new end.
+            # A stale index silently skips the whole current-turn branch below:
+            # the memory block still reaches the model (the historical-replay
+            # branch substitutes the stamped api_content sidecar), but the
+            # memory_context_injected hook never fires, so the turn produces no
+            # memory.retrieve/memory.inject observations, no
+            # dorvis_memory_recall response metadata, and no web recall block.
+            # Re-anchor by identity. AE-196.
+            _reanchored_idx, _identity_kept = (
+                reanchor_current_turn_user_idx_after_repair(
+                    messages,
+                    _pre_repair_turn_user_msg,
+                    user_message,
+                    current_turn_user_idx,
+                )
+            )
+            if _reanchored_idx != current_turn_user_idx:
+                request_logger.debug(
+                    "Re-anchored current-turn user index %s -> %s after repair "
+                    "(identity_preserved=%s, session=%s)",
+                    current_turn_user_idx,
+                    _reanchored_idx,
+                    _identity_kept,
+                    agent.session_id or "-",
+                )
+            current_turn_user_idx = _reanchored_idx
+            if _identity_kept:
+                # Same dict the prologue anchored, so the persist-override
+                # tracker can follow it safely. When repair MERGED this turn's
+                # message into an earlier user row instead, the override text no
+                # longer describes that row's content — leave the tracker where
+                # it was rather than let it overwrite another user turn.
+                agent._persist_user_message_idx = current_turn_user_idx
 
         api_messages = []
         for idx, msg in enumerate(messages):
@@ -8516,6 +8585,7 @@ def run_conversation(
         _turn_exit_reason=_turn_exit_reason,
         _pending_verification_response=_pending_verification_response,
         _pending_verification_response_previewed=_pending_verification_response_previewed,
+        memory_recall_metadata=_memory_recall_metadata,
     )
 
 

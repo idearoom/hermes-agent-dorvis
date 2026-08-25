@@ -5,6 +5,7 @@ Exposes an HTTP server with endpoints:
 - POST /v1/chat/completions        — OpenAI Chat Completions format (stateless; opt-in session continuity via X-Hermes-Session-Id header; opt-in long-term memory scoping via X-Hermes-Session-Key header)
 - POST /v1/responses               — OpenAI Responses API format (stateful via previous_response_id; X-Hermes-Session-Key supported)
 - GET  /v1/responses/{response_id} — Retrieve a stored response
+- POST /v1/responses/{response_id}/cancel — Terminate an in-flight response, preserving its envelope
 - DELETE /v1/responses/{response_id} — Delete a stored response
 - GET  /v1/models                  — lists hermes-agent and any configured model_routes aliases
 - GET  /v1/capabilities            — machine-readable API capabilities for external UIs
@@ -279,16 +280,27 @@ def _agent_token_count(agent: Any, name: str, default: Optional[int] = 0) -> Opt
         return default
 
 
-def _session_usage_snapshot(agent: Any) -> Dict[str, Any]:
+def _session_usage_snapshot(agent: Any, *, include_cost: bool = True) -> Dict[str, Any]:
     from agent.runtime_usage import snapshot_agent_usage
     attributed = snapshot_agent_usage(agent)
     input_tokens = _coerce_token_count(attributed.get("input_tokens"), 0) or 0
     output_tokens = _coerce_token_count(attributed.get("output_tokens"), 0) or 0
     total_tokens = _coerce_token_count(attributed.get("total_tokens"), 0) or 0
+    # Prompt-cache split. The aggregate ``input_tokens`` above is
+    # prompt-inclusive (uncached input + cache reads + cache writes), so a
+    # consumer that wants fresh input has to subtract the cached buckets. The
+    # cache counters are parent-scope only — the auxiliary and delegated
+    # buckets folded into the aggregate do not track cache — so subtracting
+    # these slightly overstates fresh input. That is the conservative
+    # direction and is preferable to publishing no split at all.
+    cache_read_tokens = _agent_token_count(agent, "session_cache_read_tokens", 0) or 0
+    cache_write_tokens = _agent_token_count(agent, "session_cache_write_tokens", 0) or 0
     usage: Dict[str, Any] = {
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
         "total_tokens": total_tokens,
+        "cache_read_tokens": cache_read_tokens,
+        "cache_write_tokens": cache_write_tokens,
         "scope": "run_aggregate",
         "completeness": attributed.get("completeness", "partial"),
         "warnings": attributed.get("warnings", []),
@@ -300,13 +312,21 @@ def _session_usage_snapshot(agent: Any) -> Dict[str, Any]:
     except Exception:
         comp = None
     if comp is not None:
+        # ``last_prompt_tokens`` is the engine's only measured context reading.
+        # It is 0 before the first provider response and the -1 sentinel while
+        # a just-completed compaction awaits real usage; both mean "not
+        # measured", not "empty context". Never substitute a run-cumulative
+        # counter for it — ``session_total_tokens`` is tokens processed across
+        # the whole run, not a context size, and clamping that to 100% falsely
+        # pins a consumer's context bar and fakes a "compaction imminent"
+        # signal. Publish the context trio only when a real reading exists,
+        # and omit ``context_max`` with it so consumers can render "not
+        # reported" instead of a misleading 0%.
         ctx_used = _coerce_token_count(getattr(comp, "last_prompt_tokens", None), None)
+        if not ctx_used:
+            ctx_used = None
         ctx_max = _coerce_token_count(getattr(comp, "context_length", None), None)
-        if ctx_max:
-            if ctx_used is None:
-                # Context is a property of the parent conversation, not the
-                # separate auxiliary/child sessions included in run totals.
-                ctx_used = _agent_token_count(agent, "session_total_tokens", 0) or 0
+        if ctx_max and ctx_used is not None:
             usage["context_used"] = ctx_used
             usage["context_max"] = ctx_max
             usage["context_percent"] = max(0, min(100, round(ctx_used / ctx_max * 100)))
@@ -318,7 +338,11 @@ def _session_usage_snapshot(agent: Any) -> Dict[str, Any]:
         model = getattr(agent, "model", "") or ""
     except Exception:
         model = ""
-    if isinstance(model, str) and model:
+    # Pricing resolution can reach a provider's /models endpoint on a cold
+    # cache, which is fine on the executor thread every normal call runs on and
+    # not fine on the event loop. Callers that snapshot from the loop pass
+    # ``include_cost=False`` and publish tokens without a cost estimate.
+    if include_cost and isinstance(model, str) and model:
         try:
             from agent.usage_pricing import CanonicalUsage, estimate_usage_cost
 
@@ -327,8 +351,8 @@ def _session_usage_snapshot(agent: Any) -> Dict[str, Any]:
                 CanonicalUsage(
                     input_tokens=_agent_token_count(agent, "session_input_tokens", input_tokens) or input_tokens,
                     output_tokens=_agent_token_count(agent, "session_output_tokens", output_tokens) or output_tokens,
-                    cache_read_tokens=_agent_token_count(agent, "session_cache_read_tokens", 0) or 0,
-                    cache_write_tokens=_agent_token_count(agent, "session_cache_write_tokens", 0) or 0,
+                    cache_read_tokens=cache_read_tokens,
+                    cache_write_tokens=cache_write_tokens,
                 ),
                 provider=getattr(agent, "provider", None),
                 base_url=getattr(agent, "base_url", None),
@@ -342,7 +366,52 @@ def _session_usage_snapshot(agent: Any) -> Dict[str, Any]:
     return usage
 
 
+# Marks usage read off an agent that never got to report its own snapshot.
+_INTERRUPTED_USAGE_WARNING = "run_interrupted_before_completion"
+
+
+def _interrupted_usage_snapshot(agent: Any) -> Optional[Dict[str, Any]]:
+    """Usage accrued by a run stopped before it returned a snapshot of its own.
+
+    Only turn-boundary counters exist here: the agent commits provider usage
+    when a response comes back, so tokens spent inside the request that was in
+    flight at the interrupt are reported by nobody and cannot be reconstructed.
+    The last committed cumulative is therefore the most that can honestly be
+    published — an undercount, never an invented number — so it is labelled
+    partial and carries a warning naming why.
+
+    Both callers snapshot from the event loop while the agent's own thread is
+    still running, so the cost estimate is left out: its pricing lookup can
+    block on a provider request, and no envelope field is worth stalling the
+    gateway for.
+
+    Returns ``None`` only when there is no agent to read.
+    """
+    if agent is None:
+        return None
+    try:
+        snapshot = _session_usage_snapshot(agent, include_cost=False)
+    except Exception:
+        logger.debug("Accrued usage snapshot failed for interrupted run", exc_info=True)
+        return None
+    if any(
+        _coerce_token_count(snapshot.get(key), 0)
+        for key in ("input_tokens", "output_tokens", "total_tokens")
+    ):
+        snapshot["completeness"] = "partial"
+    # A run interrupted before its first provider response came back keeps the
+    # snapshot's own ``unavailable``: an unlabelled zero is indistinguishable
+    # from a measured zero downstream, and reporting a free run for one whose
+    # spend is simply unknown is the same lie in the other direction.
+    warnings = set(snapshot.get("warnings") or ())
+    warnings.add(_INTERRUPTED_USAGE_WARNING)
+    snapshot["warnings"] = sorted(str(value) for value in warnings)
+    return snapshot
+
+
 _RESPONSES_USAGE_EXTRA_KEYS = (
+    "cache_read_tokens",
+    "cache_write_tokens",
     "scope",
     "completeness",
     "warnings",
@@ -1731,6 +1800,15 @@ class APIServerAdapter(BasePlatformAdapter):
         self._runner: Optional["web.AppRunner"] = None
         self._site: Optional["web.TCPSite"] = None
         self._response_store = make_response_store()
+        # Streaming /v1/responses turns still owned by this process, keyed by
+        # response_id, for POST /v1/responses/{id}/cancel. The value is the
+        # same mutable dict the SSE writer holds, so the cancel handler and
+        # the writer agree on whether a terminal `cancelled` snapshot was
+        # already persisted. Registration is per-process: a cancel that lands
+        # on a different gateway task (only possible during a blue/green
+        # deploy overlap, ADR 0177) can mark the shared stored envelope
+        # terminal but cannot reach the other task's executor thread.
+        self._inflight_responses: Dict[str, Dict[str, Any]] = {}
         # Active run streams: run_id -> asyncio.Queue of SSE event dicts
         self._run_streams: Dict[str, "asyncio.Queue[Optional[Dict]]"] = {}
         # Creation timestamps for orphaned-run TTL sweep
@@ -2412,6 +2490,7 @@ class APIServerAdapter(BasePlatformAdapter):
             ("POST", "/v1/chat/completions", self._handle_chat_completions),
             ("POST", "/v1/responses", self._handle_responses),
             ("GET", "/v1/responses/{response_id}", self._handle_get_response),
+            ("POST", "/v1/responses/{response_id}/cancel", self._handle_cancel_response),
             ("DELETE", "/v1/responses/{response_id}", self._handle_delete_response),
             # Generic platform HTTP event callback ingress. Authenticated by
             # the target adapter's own verifier (platform-signed bearer), NOT
@@ -3767,6 +3846,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "model_options": {"method": "GET", "path": "/api/model/options"},
                 "chat_completions": {"method": "POST", "path": "/v1/chat/completions"},
                 "responses": {"method": "POST", "path": "/v1/responses"},
+                "response_cancel": {"method": "POST", "path": "/v1/responses/{response_id}/cancel"},
                 "runs": {"method": "POST", "path": "/v1/runs"},
                 "run_status": {"method": "GET", "path": "/v1/runs/{run_id}"},
                 "run_events": {"method": "GET", "path": "/v1/runs/{run_id}/events"},
@@ -5316,6 +5396,9 @@ class APIServerAdapter(BasePlatformAdapter):
           response object with all output items + usage (same payload
           shape as the non-streaming path for parity)
         - ``response.failed`` — terminal event on agent error
+        - ``response.context_compression.{started,completed,aborted,adopted}``
+          — Hermes extension: compaction lifecycle mid-turn so clients can
+          show a live "compacting" indicator (see ``_emit_compression_event``)
 
         If the client disconnects mid-stream, ``agent.interrupt()`` is
         called so the agent stops issuing upstream LLM calls, then the
@@ -5413,6 +5496,64 @@ class APIServerAdapter(BasePlatformAdapter):
             if conversation:
                 self._response_store.set_conversation(conversation, response_id)
 
+        def _best_known_usage() -> Dict[str, Any]:
+            """Usage for an envelope written while the agent may still be running.
+
+            ``usage`` is only filled in once ``agent_task`` returns, so every
+            unwind that beats the agent to the end — a cancel, a disconnect, a
+            writer crash — would otherwise publish zeros for a run that really
+            spent tokens, and the spend of an abandoned headless run would be
+            invisible to cost accounting. The agent object still holds its
+            committed counters, so read those instead.
+            """
+            if any(
+                _coerce_token_count(usage.get(key), 0)
+                for key in ("input_tokens", "output_tokens", "total_tokens")
+            ):
+                return usage
+            live_agent = agent_ref[0] if agent_ref else None
+            return (
+                _interrupted_usage_snapshot(live_agent)
+                or _finished_task_usage()
+                or usage
+            )
+
+        def _finished_task_usage() -> Optional[Dict[str, Any]]:
+            """The agent's own snapshot when it beat the writer to the end.
+
+            ``_run_agent`` clears ``agent_ref`` on its executor thread before
+            the future resolves, so an unwind landing between the agent
+            returning and the writer reading its result sees no live agent
+            while a complete snapshot already sits in the finished task. That
+            snapshot is not partial — the run really did finish; only its
+            delivery was abandoned — so it is published as the agent reported
+            it.
+            """
+            if not agent_task.done() or agent_task.cancelled():
+                return None
+            try:
+                if agent_task.exception() is not None:
+                    return None
+                _finished_result, task_usage = agent_task.result()
+            except Exception:
+                return None
+            if not isinstance(task_usage, dict):
+                return None
+            return task_usage or None
+
+        def _mark_terminal() -> None:
+            """Record that this turn can no longer be cancelled.
+
+            ``_handle_cancel_response`` otherwise reads terminality off the
+            stored envelope, which ``store=false`` never writes — a cancel
+            landing on an already-finished stream would be answered
+            ``accepted`` for a run nothing needed to contain. The in-flight
+            entry is the only witness in that case.
+            """
+            nonlocal terminal_snapshot_persisted
+            terminal_snapshot_persisted = True
+            cancel_entry["terminal"] = True
+
         def _persist_incomplete_if_needed() -> None:
             """Persist an ``incomplete`` snapshot if no terminal one was written.
 
@@ -5421,7 +5562,10 @@ class APIServerAdapter(BasePlatformAdapter):
             GET /v1/responses/{id} and ``previous_response_id`` chaining keep
             working after abrupt stream termination.
             """
-            if not store or terminal_snapshot_persisted:
+            if terminal_snapshot_persisted:
+                return
+            _mark_terminal()
+            if not store:
                 return
             incomplete_text = "".join(final_text_parts) or final_response_text
             incomplete_items: List[Dict[str, Any]] = list(emitted_items)
@@ -5433,7 +5577,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 })
             incomplete_env = _envelope("incomplete")
             incomplete_env["output"] = incomplete_items
-            incomplete_env["usage"] = _responses_usage_payload(usage)
+            incomplete_env["usage"] = _responses_usage_payload(_best_known_usage())
             incomplete_history = list(conversation_history)
             incomplete_history.append({"role": "user", "content": user_message})
             if incomplete_text:
@@ -5442,6 +5586,53 @@ class APIServerAdapter(BasePlatformAdapter):
                 incomplete_env,
                 conversation_history_snapshot=incomplete_history,
             )
+
+        def _persist_cancelled_snapshot(reason: str) -> Dict[str, Any]:
+            """Write the terminal ``cancelled`` envelope and return it.
+
+            Called by ``_handle_cancel_response`` on the event loop rather
+            than from this coroutine, so it must not await: it snapshots
+            whatever partial output the stream produced before the cancel
+            and marks the record terminal in place. ``_mark_terminal`` is what
+            stops the writer's own unwind from overwriting ``cancelled`` with
+            ``incomplete``.
+            """
+            cancelled_text = "".join(final_text_parts) or final_response_text
+            cancelled_items: List[Dict[str, Any]] = list(emitted_items)
+            if cancelled_text:
+                cancelled_items.append({
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": cancelled_text}],
+                })
+            cancelled_env = _envelope("cancelled")
+            cancelled_env["output"] = cancelled_items
+            cancelled_env["usage"] = _responses_usage_payload(_best_known_usage())
+            cancelled_env["incomplete_details"] = {"reason": reason}
+            cancelled_history = list(conversation_history)
+            cancelled_history.append({"role": "user", "content": user_message})
+            if cancelled_text:
+                cancelled_history.append({"role": "assistant", "content": cancelled_text})
+            _persist_response_snapshot(
+                cancelled_env,
+                conversation_history_snapshot=cancelled_history,
+            )
+            _mark_terminal()
+            return cancelled_env
+
+        # Publish this turn to the cancel route for as long as the stream is
+        # this process's to stop. The agent runs on an executor thread that
+        # no asyncio cancellation can reach, so ``agent_ref`` (the same list
+        # ``_run_agent`` fills in) is the only handle that revokes further
+        # tool execution.
+        cancel_entry: Dict[str, Any] = {
+            "agent_ref": agent_ref,
+            "task": agent_task,
+            "persist_cancelled": _persist_cancelled_snapshot,
+            "cancelled": False,
+            "terminal": False,
+        }
+        self._inflight_responses[response_id] = cancel_entry
 
         try:
             # response.created — initial envelope, status=in_progress
@@ -5594,6 +5785,36 @@ class APIServerAdapter(BasePlatformAdapter):
                     "item": output_item,
                 })
 
+            async def _emit_compression_event(payload: Dict[str, Any]) -> None:
+                """Emit ``response.context_compression.<phase>`` (Hermes extension).
+
+                Custom event types on the Responses stream: spec-conformant
+                clients that switch on known event names skip them, and Hermes
+                Web renders a compaction indicator from them. The payload is
+                whitelisted to phase plus non-sensitive counters — free-text
+                fields from the hook (abort reasons carry raw provider error
+                text) must never reach the client stream.
+                """
+                phase = payload.get("phase")
+                if phase not in ("started", "completed", "aborted", "adopted"):
+                    return
+                src = payload.get("payload") or {}
+                event_type = f"response.context_compression.{phase}"
+                data: Dict[str, Any] = {"type": event_type}
+                for key in (
+                    "pre_message_count",
+                    "post_message_count",
+                    "pre_tokens",
+                    "post_tokens",
+                    "waited_seconds",
+                ):
+                    value = src.get(key)
+                    if isinstance(value, (int, float)) and not isinstance(value, bool):
+                        data[key] = value
+                if isinstance(src.get("quality_gate_passed"), bool):
+                    data["quality_gate_passed"] = src["quality_gate_passed"]
+                await _write_event(event_type, data)
+
             # Main drain loop — thread-safe queue fed by agent callbacks.
             async def _dispatch(it) -> None:
                 """Route a queue item to the correct SSE emitter.
@@ -5614,6 +5835,8 @@ class APIServerAdapter(BasePlatformAdapter):
                         await _emit_tool_started(payload)
                     elif tag == "__tool_completed__":
                         await _emit_tool_completed(payload)
+                    elif tag == "__compression__":
+                        await _emit_compression_event(payload)
                 elif isinstance(it, str):
                     # Batch text deltas — append to buffer, flush on timer
                     _batch_buf.append(it)
@@ -5791,7 +6014,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     failed_env,
                     conversation_history_snapshot=_failed_history,
                 )
-                terminal_snapshot_persisted = True
+                _mark_terminal()
                 await _write_event("response.failed", {
                     "type": "response.failed",
                     "response": failed_env,
@@ -5817,7 +6040,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     conversation_history_snapshot=full_history,
                     session_id_snapshot=_result_sid if isinstance(_result_sid, str) and _result_sid else None,
                 )
-                terminal_snapshot_persisted = True
+                _mark_terminal()
                 await _write_event("response.completed", {
                     "type": "response.completed",
                     "response": completed_env,
@@ -5871,6 +6094,20 @@ class APIServerAdapter(BasePlatformAdapter):
             # get a TransferEncodingError from incomplete chunked encoding.
             import traceback as _tb
             _persist_incomplete_if_needed()
+            # This unwind abandons the turn without the client having
+            # disconnected, so nothing else will stop the executor thread.
+            # The other two unwinds already interrupt here; leaving this one
+            # out strands a running agent behind an ``incomplete`` record,
+            # which POST /v1/responses/{id}/cancel reads as already terminal
+            # — it would answer 409 for a run still executing tools.
+            agent = agent_ref[0] if agent_ref else None
+            if agent is not None:
+                try:
+                    agent.interrupt("SSE writer failed mid-stream")
+                except Exception:
+                    pass
+            if not agent_task.done():
+                agent_task.cancel()
             agent_error = _redact_api_error_text(_tb.format_exc())
             try:
                 failed_env = _envelope("failed")
@@ -5879,7 +6116,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     "message": _redact_api_error_text(_exc, limit=500),
                     "type": _responses_error_type(_exc),
                 }
-                failed_env["usage"] = _responses_usage_payload(usage)
+                failed_env["usage"] = _responses_usage_payload(_best_known_usage())
                 await _write_event("response.failed", {
                     "type": "response.failed",
                     "response": failed_env,
@@ -5888,6 +6125,9 @@ class APIServerAdapter(BasePlatformAdapter):
             except Exception:
                 pass
             logger.error("Agent crashed mid-stream for %s: %s", response_id, str(agent_error)[:300])
+        finally:
+            if self._inflight_responses.get(response_id) is cancel_entry:
+                self._inflight_responses.pop(response_id, None)
 
         return response
 
@@ -6062,7 +6302,23 @@ class APIServerAdapter(BasePlatformAdapter):
                     "result": function_result,
                 }))
 
-            agent_ref = [None]
+            def _on_compression_event(hook_name, payload):
+                """Queue a compaction lifecycle event for live streaming.
+
+                Hook names arrive as ``context_compression_<phase>``; the SSE
+                writer whitelists the payload before anything reaches the
+                client (see ``_emit_compression_event``).
+                """
+                phase = str(hook_name).rsplit("_", 1)[-1]
+                _stream_q.put_threadsafe(("__compression__", {
+                    "phase": phase,
+                    "payload": payload if isinstance(payload, dict) else {},
+                }))
+
+            # Slot 1 is the cancel route's pending-interrupt slot (see
+            # _run_agent): a cancel that arrives while the agent is still
+            # being constructed parks its reason there instead of dropping it.
+            agent_ref = [None, None]
             agent_task = asyncio.ensure_future(self._run_agent(
                 user_message=user_message,
                 conversation_history=conversation_history,
@@ -6072,6 +6328,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 tool_progress_callback=_on_tool_progress,
                 tool_start_callback=_on_tool_start,
                 tool_complete_callback=_on_tool_complete,
+                compression_event_callback=_on_compression_event,
                 agent_ref=agent_ref,
                 request_metadata=request_metadata,
                 gateway_session_key=gateway_session_key,
@@ -6218,8 +6475,15 @@ class APIServerAdapter(BasePlatformAdapter):
         return web.json_response(response_data, headers=response_headers)
 
     # ------------------------------------------------------------------
-    # GET / DELETE response endpoints
+    # GET / CANCEL / DELETE response endpoints
     # ------------------------------------------------------------------
+
+    # A response whose record already reached one of these can no longer be
+    # cancelled — including ``incomplete``, which is the snapshot a detected
+    # SSE disconnect leaves behind after it has already interrupted the agent.
+    _TERMINAL_RESPONSE_STATUSES = frozenset(
+        {"completed", "failed", "cancelled", "canceled", "incomplete"}
+    )
 
     async def _handle_get_response(self, request: "web.Request") -> "web.Response":
         """GET /v1/responses/{response_id} — retrieve a stored response."""
@@ -6233,6 +6497,144 @@ class APIServerAdapter(BasePlatformAdapter):
             return web.json_response(_openai_error(f"Response not found: {response_id}"), status=404)
 
         return web.json_response(stored["response"])
+
+    async def _handle_cancel_response(self, request: "web.Request") -> "web.Response":
+        """POST /v1/responses/{response_id}/cancel — terminate an in-flight response.
+
+        The containment half of a headless client's recovery-then-terminate
+        policy: when a client abandons a streaming response it needs the
+        runtime to stop executing tools on its behalf, and it needs the
+        stored envelope to survive so recovery and forensics can still read
+        what the run did. DELETE satisfies neither — it destroys exactly the
+        record the client came back for.
+
+        Statuses, per the OpenAI Responses shape:
+
+        - ``200`` + the response object with terminal status ``cancelled``.
+        - ``409`` when the response already reached a terminal state; a
+          repeated cancel lands here, which is the idempotent answer.
+        - ``404`` (OpenAI error body) for an id this gateway never stored.
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        response_id = request.match_info["response_id"]
+        entry = self._inflight_responses.get(response_id)
+        stored = self._response_store.get(response_id)
+
+        if entry is None and stored is None:
+            return web.json_response(
+                _openai_error(
+                    f"Response not found: {response_id}",
+                    code="response_not_found",
+                ),
+                status=404,
+            )
+
+        stored_status = ""
+        if isinstance(stored, dict) and isinstance(stored.get("response"), dict):
+            stored_status = str(stored["response"].get("status") or "")
+        entry_terminal = entry is not None and (
+            entry.get("cancelled") or entry.get("terminal")
+        )
+        if entry_terminal or stored_status in self._TERMINAL_RESPONSE_STATUSES:
+            return web.json_response(
+                _openai_error(
+                    f"Response is already terminal and cannot be cancelled: {response_id}",
+                    code="response_already_terminal",
+                ),
+                status=409,
+            )
+
+        cancelled_env: Optional[Dict[str, Any]] = None
+        interrupted = False
+        if entry is not None:
+            entry["cancelled"] = True
+            persist_cancelled = entry.get("persist_cancelled")
+            if callable(persist_cancelled):
+                try:
+                    cancelled_env = persist_cancelled("cancelled")
+                except Exception:
+                    logger.error(
+                        "[api_server] failed to persist cancelled snapshot for %s",
+                        response_id,
+                        exc_info=True,
+                    )
+            interrupted = self._interrupt_inflight_response(entry, response_id)
+            task = entry.get("task")
+            if task is not None and not task.done():
+                task.cancel()
+
+        if cancelled_env is None:
+            cancelled_env = self._mark_stored_response_cancelled(response_id, stored)
+
+        logger.info(
+            "[api_server] cancelled response %s (agent interrupted=%s, in-flight here=%s)",
+            response_id,
+            interrupted,
+            entry is not None,
+        )
+        return web.json_response(cancelled_env)
+
+    def _interrupt_inflight_response(
+        self, entry: Dict[str, Any], response_id: str
+    ) -> bool:
+        """Revoke further tool execution for a registered in-flight response.
+
+        The agent runs on an executor thread, so cancelling its asyncio
+        wrapper only detaches the stream — ``agent.interrupt`` is the call
+        that breaks the tool-calling loop and aborts in-flight tool work.
+        The agent object appears partway through ``_run_agent``'s executor
+        body, so the reason is parked in the ref's pending-interrupt slot
+        *before* reading it: a cancel that arrives during agent construction
+        is then honored by the executor thread itself rather than lost.
+        """
+        agent_ref = entry.get("agent_ref")
+        if not isinstance(agent_ref, list) or not agent_ref:
+            return False
+        reason = "Cancelled via /v1/responses/{id}/cancel"
+        if len(agent_ref) > 1:
+            agent_ref[1] = reason
+        agent = agent_ref[0]
+        if agent is None:
+            return False
+        try:
+            agent.interrupt(reason)
+            return True
+        except Exception:
+            logger.debug(
+                "[api_server] interrupt failed while cancelling response %s",
+                response_id,
+                exc_info=True,
+            )
+            return False
+
+    def _mark_stored_response_cancelled(
+        self, response_id: str, stored: Optional[Dict[str, Any]]
+    ) -> Dict[str, Any]:
+        """Flip a stored envelope to ``cancelled`` without discarding it.
+
+        The fallback for responses this process holds no stream for — a
+        record left in_progress by a gateway that has since restarted, or by
+        a sibling task during a blue/green overlap. Marking the shared record
+        terminal is all this path can honestly do; it does not reach another
+        process's executor thread.
+        """
+        if isinstance(stored, dict) and isinstance(stored.get("response"), dict):
+            cancelled_env = dict(stored["response"])
+            cancelled_env["status"] = "cancelled"
+            cancelled_env["incomplete_details"] = {"reason": "cancelled"}
+            record = dict(stored)
+            record["response"] = cancelled_env
+            self._response_store.put(response_id, record)
+            return cancelled_env
+        return {
+            "id": response_id,
+            "object": "response",
+            "status": "cancelled",
+            "incomplete_details": {"reason": "cancelled"},
+        }
 
     async def _handle_delete_response(self, request: "web.Request") -> "web.Response":
         """DELETE /v1/responses/{response_id} — delete a stored response."""
@@ -6675,13 +7077,29 @@ class APIServerAdapter(BasePlatformAdapter):
     ) -> List[Dict[str, Any]]:
         """Build the stored Responses transcript without duplicating history.
 
-        When context compression occurs during a turn the agent returns a
-        compressed full transcript in ``result["messages"]`` (starting with a
-        summary) and sets ``result["_compressed"] = True``.  Because the
-        compressed transcript does not share the input ``conversation_history``
-        prefix, the normal turn-start detection fails and old code would
-        concatenate the uncompressed history on front, bloating the stored
-        context and re-triggering compression on every subsequent request.
+        The agent's ``result["messages"]`` is a full transcript that embeds
+        the input history, so appending it after ``prior`` doubles every
+        stored message — repeated ``previous_response_id`` chaining then
+        grows the snapshot as h(n+1) = 2*h(n) + 2 (the staging 2026-08-11
+        doubling; AE-204 family). Concatenation is therefore reserved for
+        result shapes that provably do NOT embed the history:
+
+        - transcript-shaped results (prefix match, current-user anchor, or
+          a compaction summary) are adopted verbatim;
+        - a suffix that starts at this turn's user row gets ``prior``
+          prepended once;
+        - a result that still carries user rows AND whose head row proves
+          it embeds the prior history (see
+          ``_response_messages_embed_prior``) is a perturbed transcript
+          (alternation repair merges user rows and rewrites content
+          mid-turn) and is adopted — never re-concatenated;
+        - everything else (user-row-free assistant/tool suffixes, and
+          suffix shapes carrying mid-turn user-role nudges) is appended
+          after ``prior + current_user`` — prior history is never dropped.
+
+        A result explicitly marked ``_compressed`` is also authoritative even
+        when a provider-specific summary shape does not match the textual
+        compaction-prefix detector.
         """
         prior = list(conversation_history)
         current_user = {"role": "user", "content": user_message}
@@ -6696,14 +7114,37 @@ class APIServerAdapter(BasePlatformAdapter):
             if turn_start or APIServerAdapter._messages_include_compaction_summary(agent_messages):
                 return list(agent_messages)
 
-            # turn_start == 0: agent_messages does not start with prior.
-            # This can happen because compression rewrote the transcript
-            # (summary prefix replaces original history), OR because
-            # agent_messages only carries the current turn without prior.
-            # The ``_compressed`` flag (set by _run_agent after compaction)
-            # distinguishes — skip the concatenation and use the compressed
-            # transcript directly.
             if result.get("_compressed"):
+                return list(agent_messages)
+
+            # turn_start == 0: either the current turn genuinely starts at
+            # index 0, or no prefix/anchor matched at all.
+            current_idx = APIServerAdapter._response_current_user_row_index(
+                agent_messages, user_message
+            )
+            if current_idx == 0:
+                # Suffix beginning at this turn's user row (also the clean
+                # first turn, where prior is empty). Prepend prior only —
+                # appending current_user too is what duplicated the user row.
+                return prior + list(agent_messages)
+            if (
+                any(
+                    isinstance(msg, dict) and msg.get("role") == "user"
+                    for msg in agent_messages
+                )
+                and APIServerAdapter._response_messages_embed_prior(
+                    prior, agent_messages
+                )
+            ):
+                # User rows present, no recognizable prefix or anchor, but
+                # the head row proves the result embeds the prior history:
+                # a perturbed transcript (e.g. repair merged this turn's
+                # user row into a prior one). Adopt it; re-embedding prior
+                # is never correct. Without the head proof (a suffix shape
+                # carrying mid-turn user-role nudges — only reachable from
+                # mocked/older hosts, never the live runtime, which always
+                # returns the full transcript), fall through to the legacy
+                # concatenation so prior history is never dropped.
                 return list(agent_messages)
 
             full_history = prior
@@ -6729,14 +7170,21 @@ class APIServerAdapter(BasePlatformAdapter):
         history exponentially.
 
         Underscore-prefixed fields are Hermes runtime bookkeeping, not message
-        semantics. Ignore them recursively for prefix detection while retaining
-        the original messages unchanged in the stored authoritative transcript.
+        semantics. So is the ``api_content`` persistence sidecar that memory
+        prefetch / plugin injection stamps on the current turn's user row
+        (see ``agent/turn_context.py``): on platforms with live memory recall
+        (staging Hindsight) every turn's user row carries it, and keeping it
+        in the projection made the expected-prefix match fail on every turn —
+        the fallthrough then re-embedded the whole prior history each turn
+        (the staging 2026-08-11 h(n+1)=2h(n)+2 doubling). Ignore both
+        recursively for prefix detection while retaining the original
+        messages unchanged in the stored authoritative transcript.
         """
         if isinstance(value, dict):
             return {
                 key: APIServerAdapter._response_prefix_projection(item)
                 for key, item in value.items()
-                if not str(key).startswith("_")
+                if not str(key).startswith("_") and key != "api_content"
             }
         if isinstance(value, list):
             return [
@@ -6773,7 +7221,97 @@ class APIServerAdapter(BasePlatformAdapter):
             and projected_messages[:len(projected_prior)] == projected_prior
         ):
             return len(prior)
+        # Prefix comparison failed — mid-turn perturbations (alternation
+        # repair merging user rows, content rewrites) can invalidate the
+        # prior rows without making the transcript any less authoritative.
+        # Anchor on this turn's user row instead: the current turn's user
+        # message is always the LAST user row of a real transcript (steers
+        # and memory blocks never append user rows after it). A positive
+        # index proves the transcript embeds (a possibly perturbed form of)
+        # the history, and marks where the current turn starts.
+        current_idx = APIServerAdapter._response_current_user_row_index(
+            agent_messages, user_message
+        )
+        if current_idx is not None and current_idx > 0:
+            return current_idx
         return 0
+
+    @staticmethod
+    def _response_current_user_row_index(
+        agent_messages: List[Dict[str, Any]],
+        user_message: Any,
+    ) -> Optional[int]:
+        """Index of the current turn's user row in ``result["messages"]``.
+
+        Scans user-role rows from the end and returns the LAST one whose
+        projected content equals this turn's user message; projection strips
+        persistence sidecars (``api_content``, ``_db_persisted``) so they
+        cannot hide the match. Scanning past the last user row matters:
+        ``conversation_loop.py`` legitimately appends user-role rows AFTER
+        the current turn's user row mid-turn (empty-response recovery,
+        codex-incomplete/verification/kanban nudges, continue markers), so
+        the transcript's final user row may be a nudge rather than the turn
+        anchor. Taking the last matching row keeps repeated user inputs
+        ("continue") anchored to the current turn. Returns ``None`` when no
+        user row carries this turn's content — e.g. when repair merged it
+        into an earlier user row, or the result is a user-row-free suffix.
+        """
+        target = APIServerAdapter._response_prefix_projection(user_message)
+        for i in range(len(agent_messages) - 1, -1, -1):
+            msg = agent_messages[i]
+            if isinstance(msg, dict) and msg.get("role") == "user":
+                projected = APIServerAdapter._response_prefix_projection(
+                    msg.get("content")
+                )
+                if projected == target:
+                    return i
+        return None
+
+    @staticmethod
+    def _response_messages_embed_prior(
+        prior: List[Dict[str, Any]],
+        agent_messages: List[Dict[str, Any]],
+    ) -> bool:
+        """Structural proof that ``agent_messages`` embeds the prior history.
+
+        Used only on the last-resort adoption branch, where no prefix match
+        and no current-user anchor exist. A real agent transcript always
+        starts with (a possibly repaired form of) the prior history's first
+        row: ``run_conversation`` builds ``messages = list(history) + ...``
+        and every mid-turn user-role injection in ``conversation_loop.py``
+        (recovery/verification/kanban nudges, continue markers) APPENDS to
+        that full list — the runtime never produces a suffix-shaped result.
+        Suffix shapes only come from mocked or older host integrations, and
+        adopting one of those verbatim would silently DROP the prior turns.
+
+        The head row survives every repair pass with its original content
+        first: pass 0 (assistant merge) and pass 2 (user merge) concatenate
+        the earlier row's content before the later one's, so an embedded
+        head either equals ``prior[0]`` under projection or is a string that
+        starts with ``prior[0]``'s string content. A plain length comparison
+        is NOT sufficient — a nudge-bearing suffix can be longer than the
+        prior history.
+        """
+        if not prior or not agent_messages:
+            return False
+        prior_head = prior[0]
+        agent_head = agent_messages[0]
+        if not isinstance(prior_head, dict) or not isinstance(agent_head, dict):
+            return False
+        if agent_head.get("role") != prior_head.get("role"):
+            return False
+        projected_prior_head = APIServerAdapter._response_prefix_projection(prior_head)
+        projected_agent_head = APIServerAdapter._response_prefix_projection(agent_head)
+        if projected_agent_head == projected_prior_head:
+            return True
+        prior_content = prior_head.get("content")
+        agent_content = agent_head.get("content")
+        return (
+            isinstance(prior_content, str)
+            and bool(prior_content)
+            and isinstance(agent_content, str)
+            and agent_content.startswith(prior_content)
+        )
 
     @classmethod
     def _turn_transcript_messages(
@@ -7084,6 +7622,7 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_progress_callback=None,
         tool_start_callback=None,
         tool_complete_callback=None,
+        compression_event_callback=None,
         agent_ref: Optional[list] = None,
         request_metadata: Optional[Dict[str, Any]] = None,
         active_run_id: Optional[str] = None,
@@ -7126,6 +7665,12 @@ class APIServerAdapter(BasePlatformAdapter):
         If *active_run_id* is supplied, the same live agent is registered in
         ``_active_run_agents`` while the turn is running so API clients can
         call run-scoped control endpoints such as ``/v1/runs/{run_id}/steer``.
+
+        A caller that may need to stop the run before the agent exists (the
+        Responses cancel route) passes a two-element list instead: it parks
+        an interrupt reason in ``agent_ref[1]``, and this executor body
+        honors it the moment construction finishes, closing the window where
+        an interrupt would have had no agent to land on.
         """
         loop = asyncio.get_running_loop()
         # Capture before hopping to the executor — ContextVars do not follow
@@ -7165,8 +7710,24 @@ class APIServerAdapter(BasePlatformAdapter):
                         session_model=session_model,
                         confirmed_runtime_lock=confirmed_runtime_lock,
                     )
+                    if compression_event_callback is not None:
+                        # Attribute, not a constructor kwarg: the compression
+                        # wrapper reads it via getattr, so agent builds that
+                        # predate the callback stay compatible.
+                        agent._compression_event_callback = compression_event_callback
                     if agent_ref is not None:
                         agent_ref[0] = agent
+                        pending_interrupt = (
+                            agent_ref[1] if len(agent_ref) > 1 else None
+                        )
+                        if pending_interrupt:
+                            try:
+                                agent.interrupt(str(pending_interrupt))
+                            except Exception:
+                                logger.debug(
+                                    "Pending interrupt failed on agent startup",
+                                    exc_info=True,
+                                )
                     # Track executor-backed agents for drain-cap interruption.
                     agent_key = id(agent)
                     self._inflight_run_agents[agent_key] = agent

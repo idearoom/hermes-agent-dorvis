@@ -333,6 +333,63 @@ class TestConfig:
         assert p._retain_source == "cogoport"
         assert p._build_metadata(message_count=2, turn_index=1)["source"] == "cogoport"
 
+    def test_config_env_fallback_warns_once_per_process(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """The silent env fallback is the AE-182 failure mode — make it loud."""
+        import pathlib
+
+        missing_home = tmp_path / "nonexistent"
+        monkeypatch.setattr(
+            "plugins.memory.hindsight.get_hermes_home", lambda: missing_home
+        )
+        monkeypatch.setattr(pathlib.Path, "home", classmethod(lambda cls: tmp_path))
+        monkeypatch.setattr(
+            "plugins.memory.hindsight._CONFIG_FALLBACK_WARNED", False
+        )
+
+        with caplog.at_level("WARNING", logger="plugins.memory.hindsight"):
+            _load_config()
+            _load_config()
+
+        warnings = [
+            r for r in caplog.records
+            if r.levelname == "WARNING" and "environment defaults" in r.getMessage()
+        ]
+        assert len(warnings) == 1
+        message = warnings[0].getMessage()
+        assert str(missing_home / "hindsight" / "config.json") in message
+
+    def test_config_parse_failure_warns_with_exception_name(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        import pathlib
+
+        config_path = tmp_path / "hindsight" / "config.json"
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text("{not json", encoding="utf-8")
+        monkeypatch.setattr(
+            "plugins.memory.hindsight.get_hermes_home", lambda: tmp_path
+        )
+        monkeypatch.setattr(
+            pathlib.Path, "home", classmethod(lambda cls: tmp_path / "home")
+        )
+        monkeypatch.setattr(
+            "plugins.memory.hindsight._CONFIG_FALLBACK_WARNED", False
+        )
+
+        with caplog.at_level("WARNING", logger="plugins.memory.hindsight"):
+            cfg = _load_config()
+
+        assert cfg["banks"]["hermes"]["bankId"] == "hermes"  # env defaults
+        parse_warnings = [
+            r.getMessage() for r in caplog.records
+            if "could not be parsed" in r.getMessage()
+        ]
+        assert len(parse_warnings) == 1
+        assert "JSONDecodeError" in parse_warnings[0]
+        assert str(config_path) in parse_warnings[0]
+
     def test_embedded_profile_env_includes_idle_timeout_from_config(self):
         env = _build_embedded_profile_env({
             "llm_provider": "openai",
@@ -546,6 +603,99 @@ class TestPrefetch:
         result = provider.prefetch("a totally different current query")
         assert "buffered from previous turn" in result
         provider._client.arecall.assert_not_called()
+
+    def test_prefetch_exposes_structured_memories(self, provider):
+        """Per-memory identity survives the recall → prefetch handoff (AE-194)."""
+        provider._client.arecall = AsyncMock(
+            return_value=SimpleNamespace(
+                results=[
+                    SimpleNamespace(
+                        id="fact-1",
+                        text="Dalton prefers staging evidence first",
+                        type="world",
+                        document_id="doc-1",
+                    ),
+                    SimpleNamespace(id="fact-2", text="Second memory", type=None),
+                ]
+            )
+        )
+        provider.queue_prefetch("what do you remember?")
+        provider._prefetch_thread.join(timeout=5.0)
+
+        injected = provider.prefetch("what do you remember?")
+        assert "Dalton prefers staging evidence first" in injected
+
+        memories = provider.consume_prefetch_memories()
+        assert [m["id"] for m in memories] == ["fact-1", "fact-2"]
+        assert memories[0]["text"] == "Dalton prefers staging evidence first"
+        assert memories[0]["type"] == "world"
+        # hindsight-client 0.6.1 exposes no per-result score.
+        assert memories[0]["score"] is None
+        assert memories[0]["document_id"] == "doc-1"
+        assert memories[1]["type"] is None
+        # Consumed exactly once — a later turn must not re-report these.
+        assert provider.consume_prefetch_memories() == []
+
+    def test_prefetch_memory_snippet_is_capped(self, provider):
+        long_text = "x" * 4000
+        provider._client.arecall = AsyncMock(
+            return_value=SimpleNamespace(
+                results=[SimpleNamespace(id="fact-1", text=long_text, type="world")]
+            )
+        )
+        provider.queue_prefetch("q")
+        provider._prefetch_thread.join(timeout=5.0)
+
+        injected = provider.prefetch("q")
+        # The injected block keeps the full text; only the structured copy is cut.
+        assert long_text in injected
+        record = provider.consume_prefetch_memories()[0]
+        snippet = record["text"]
+        assert len(snippet) < len(long_text)
+        assert snippet.startswith("x" * 2000)
+        # AE-196: a clipped record says so, so the UI can offer the full text
+        # from the deletion/inspection runbook instead of implying completeness.
+        assert record["text_truncated"] is True
+
+    def test_prefetch_memory_text_under_the_cap_is_not_flagged(self, provider):
+        """The flag is present only when text was really cut — its absence is
+        the "this is the whole memory" signal (AE-196)."""
+        text = "y" * 1999
+        provider._client.arecall = AsyncMock(
+            return_value=SimpleNamespace(
+                results=[SimpleNamespace(id="fact-1", text=text, type="world")]
+            )
+        )
+        provider.queue_prefetch("q")
+        provider._prefetch_thread.join(timeout=5.0)
+        provider.prefetch("q")
+
+        record = provider.consume_prefetch_memories()[0]
+        assert record["text"] == text
+        assert "text_truncated" not in record
+
+    def test_consume_prefetch_memories_empty_when_nothing_injected(self, provider):
+        assert provider.prefetch("test") == ""
+        assert provider.consume_prefetch_memories() == []
+
+    def test_reflect_prefetch_reports_no_per_memory_rows(self, provider_with_config):
+        p = provider_with_config(prefetch_method="reflect")
+        p._client.areflect = AsyncMock(
+            return_value=SimpleNamespace(text="Synthesized answer")
+        )
+        p.queue_prefetch("q")
+        if p._prefetch_thread:
+            p._prefetch_thread.join(timeout=5.0)
+
+        assert "Synthesized answer" in p.prefetch("q")
+        assert p.consume_prefetch_memories() == []
+
+    def test_structured_memories_cleared_on_session_switch(self, provider):
+        provider._prefetch_result = "- some memory"
+        provider._prefetch_memories = [{"id": "fact-1", "text": "m", "score": None, "type": None}]
+        provider.on_session_switch("new-session", reset=True)
+        assert provider._prefetch_memories == []
+        assert provider.consume_prefetch_memories() == []
 
     def test_queue_prefetch_skipped_in_tools_mode(self, provider_with_config):
         p = provider_with_config(memory_mode="tools")

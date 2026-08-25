@@ -552,7 +552,10 @@ class TestWireInvariant:
 # guard, sanitize-divergence capture, max-iterations replay, replay cleanup
 # ---------------------------------------------------------------------------
 
-from agent.turn_context import reanchor_current_turn_user_idx
+from agent.turn_context import (
+    reanchor_current_turn_user_idx,
+    reanchor_current_turn_user_idx_after_repair,
+)
 
 
 class TestReanchorCurrentTurnUserIdx:
@@ -567,6 +570,71 @@ class TestReanchorCurrentTurnUserIdx:
     def test_non_dict_entries_ignored(self):
         messages = ["junk", {"role": "user", "content": "hello"}, None]
         assert reanchor_current_turn_user_idx(messages, "hello") == 1
+
+
+class TestReanchorAfterAlternationRepair:
+    """AE-196: repair compacts ``messages`` between the prologue and the
+    api_messages build, so the current-turn index must be re-derived.
+
+    Repair preserves object identity for survivors (the property the flush
+    cursor recompute already relies on), so identity is the exact anchor."""
+
+    def test_identity_wins_over_same_text_history_row(self):
+        """A historical row can carry byte-identical text (a repeated question
+        or, on api_server, the duplicated row repair merges) — only identity
+        distinguishes the live turn."""
+        turn_user = {"role": "user", "content": "hello", "api_content": "hello\n\nMEM"}
+        messages = [
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "a"},
+            turn_user,
+        ]
+        assert reanchor_current_turn_user_idx_after_repair(
+            messages, turn_user, "hello", 7
+        ) == (2, True)
+
+    def test_stale_index_from_compaction_is_repaired(self):
+        """The api_server follow-up shape: the duplicated prior user row was
+        merged away, so the prologue's index now points past the end."""
+        turn_user = {"role": "user", "content": "follow-up", "api_content": "x"}
+        messages = [
+            {"role": "user", "content": "prior\n\nprior"},
+            {"role": "assistant", "content": "a"},
+            turn_user,
+        ]
+        idx, identity = reanchor_current_turn_user_idx_after_repair(
+            messages, turn_user, "follow-up", 3
+        )
+        assert (idx, identity) == (2, True)
+        assert messages[idx] is turn_user
+
+    def test_merged_away_current_turn_falls_back_to_the_merged_row(self):
+        """Consecutive-user repair merges this turn's message INTO the earlier
+        user row and drops that row's stale sidecar, so the merged row is the
+        live current-turn message and must take the anchor — the loop then
+        re-composes the injection onto it."""
+        merged = {"role": "user", "content": "prior\n\nfollow-up"}
+        messages = [merged, {"role": "assistant", "content": "a"}]
+        gone = {"role": "user", "content": "follow-up"}
+        assert reanchor_current_turn_user_idx_after_repair(
+            messages, gone, "follow-up", 2
+        ) == (0, False)
+
+    def test_keeps_current_index_when_no_user_row_survives(self):
+        messages = [{"role": "assistant", "content": "a"}]
+        assert reanchor_current_turn_user_idx_after_repair(
+            messages, {"role": "user", "content": "hi"}, "hi", 4
+        ) == (4, False)
+
+    def test_no_anchor_dict_uses_content_match(self):
+        messages = [
+            {"role": "user", "content": "old"},
+            {"role": "assistant", "content": "a"},
+            {"role": "user", "content": "hello"},
+        ]
+        assert reanchor_current_turn_user_idx_after_repair(
+            messages, None, "hello", 9
+        ) == (2, False)
 
 
 class TestPrologueMoaAndInPlaceBackfill:

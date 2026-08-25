@@ -31,6 +31,7 @@ from __future__ import annotations
 import copy
 import inspect
 import json
+import logging
 import os
 import sqlite3
 import threading
@@ -40,6 +41,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from agent.context_compressor import SUMMARY_PREFIX
 from hermes_state import SessionDB
 
 
@@ -100,6 +102,10 @@ def _build_agent_with_db(
     # lock contention) — pin in_place=False so they keep exercising it
     # regardless of the global default (which flipped to True in #38763).
     agent.compression_in_place = False
+    # AE-204: the losing path now waits for the holder before giving up. Keep
+    # the default wait out of the suite's runtime; tests that exercise the
+    # wait itself set their own budget.
+    agent._compression_lock_wait_seconds = 0.25
     return agent
 
 
@@ -573,6 +579,30 @@ def test_concurrent_compression_does_not_fork_session(tmp_path: Path) -> None:
     assert db.get_compression_lock_holder(parent_sid) is None, (
         "Compression lock leaked: still held after both paths completed."
     )
+
+
+def test_skipped_compression_returns_messages_unchanged(tmp_path: Path) -> None:
+    """A holder that never finishes must not stall or mutate the loser."""
+    db = SessionDB(db_path=tmp_path / "state.db")
+    parent_sid = "LOSER_TEST"
+    db.create_session(parent_sid, source="discord")
+
+    held = db.try_acquire_compression_lock(parent_sid, "external_holder")
+    assert held is True
+
+    agent = _build_agent_with_db(db, parent_sid)
+    messages = [
+        {"role": "user", "content": "m1"},
+        {"role": "user", "content": "m2"},
+    ]
+
+    compressed, _sp = agent._compress_context(
+        messages, "sys", approx_tokens=120_000
+    )
+
+    assert compressed is messages or compressed == messages
+    assert agent.session_id == parent_sid
+    agent.context_compressor.compress.assert_not_called()
 
 
 def test_durable_message_committed_before_lease_is_adopted(
@@ -1830,3 +1860,731 @@ def test_exact_cooldown_restore_api_propagates_sqlite_write_failure(
                 "error": "must propagate",
             },
         )
+# ── AE-204: the losing path must converge on the winner's compacted state ───
+#
+# Before AE-204 the loser returned its (uncompacted) message list verbatim.
+# The session was not forked, but two divergent views of one conversation
+# stayed alive: the winner's compacted transcript in the session store and the
+# loser's full pre-compaction copy in memory. Downstream transcript merges
+# (Responses-store history rebuild, gateway history_offset re-baselining, the
+# identity-diffed session flush) then concatenated the conversation with
+# itself — production chat ca5c63dd: 158 msgs → 39 compacted, loser returns
+# 158 unchanged, next compaction sees 326 msgs / 1.94x tokens.
+
+# A REAL compaction summary. Adoption demands positive proof that the holder
+# actually compacted, and the proof is the compressor's own summary prefix —
+# so the fixture has to carry the genuine article, not a look-alike.
+COMPACTION_SUMMARY = f"{SUMMARY_PREFIX}\n## State Ledger"
+
+
+def _compacted_payload() -> list:
+    """Fresh copies — compress_context mutates/annotates what it returns."""
+    return [
+        {"role": "user", "content": COMPACTION_SUMMARY},
+        {"role": "assistant", "content": "carrying on from the summary"},
+    ]
+
+
+def _build_in_place_agent(db: SessionDB, session_id: str):
+    agent = _build_agent_with_db(db, session_id)
+    agent.compression_in_place = True
+    return agent
+
+
+def _signal_on_contention(db: SessionDB, session_id: str) -> threading.Event:
+    """Return an Event set the moment an acquire of ``session_id``'s lock fails.
+
+    Wall-clock timers race agent construction (plugin discovery alone can take
+    seconds), so any test that needs "the loser has provably lost" must key off
+    the *failed acquire* itself rather than a sleep.
+    """
+    contended = threading.Event()
+    original = db.try_acquire_compression_lock
+
+    def _instrumented(sid: str, new_holder: str, ttl_seconds: float = 300.0) -> bool:
+        acquired = original(sid, new_holder, ttl_seconds=ttl_seconds)
+        if not acquired and sid == session_id:
+            contended.set()
+        return acquired
+
+    setattr(db, "try_acquire_compression_lock", _instrumented)
+    return contended
+
+
+def _release_lock_when_contended(
+    db: SessionDB, session_id: str, holder: str
+) -> threading.Thread:
+    """Release ``holder``'s lock the moment a compression path is blocked by it.
+
+    Same determinism argument as :func:`_signal_on_contention`: releasing on a
+    timer would let the losing path acquire the lock outright and compress for
+    real.
+    """
+    contended = _signal_on_contention(db, session_id)
+
+    def _release() -> None:
+        if contended.wait(timeout=20):
+            db.release_compression_lock(session_id, holder)
+
+    thread = threading.Thread(target=_release, name="lock-releaser", daemon=True)
+    thread.start()
+    return thread
+
+
+def _seed_history(db: SessionDB, session_id: str, count: int) -> list:
+    history = [
+        {
+            "role": "user" if index % 2 == 0 else "assistant",
+            "content": f"turn {index} " + ("x" * 200),
+        }
+        for index in range(count)
+    ]
+    db.replace_messages(session_id, history)
+    return history
+
+
+def test_race_loser_adopts_winner_compacted_state(tmp_path: Path) -> None:
+    """Two real threads race one session: the loser must adopt, not double.
+
+    The winner compacts in place; the loser (mid-turn, holding the same
+    pre-compaction history plus its own live user turn) must come back with
+    the winner's compacted transcript plus its own turn — never the
+    pre-compression transcript, which is what downstream merges concatenate.
+    """
+    db = SessionDB(db_path=tmp_path / "state.db")
+    sid = "ADOPT_RACE"
+    db.create_session(sid, source="api")
+    history = _seed_history(db, sid, 20)
+
+    winner = _build_in_place_agent(db, sid)
+    loser = _build_in_place_agent(db, sid)
+    loser._compression_lock_wait_seconds = 15.0
+
+    winner_holds_lock = threading.Event()
+    # Set when a try_acquire for this session RETURNS FALSE, i.e. the loser has
+    # provably lost the race. Gating the winner on that (rather than on a sleep
+    # past "the loser thread started") is what makes this deterministic: a slow
+    # box could otherwise run the loser's acquire after the winner released,
+    # letting it win the lock and compress for real.
+    loser_lost_the_race = _signal_on_contention(db, sid)
+
+    def _winner_compress(*_a, **_kw):
+        winner_holds_lock.set()
+        # Hold the lock until the loser's acquire has actually failed.
+        assert loser_lost_the_race.wait(timeout=30)
+        return _compacted_payload()
+
+    winner.context_compressor.compress.side_effect = _winner_compress
+
+    winner_messages = [dict(msg) for msg in history]
+    # The loser is mid-turn: history + this turn's live user message.
+    loser_messages = [dict(msg) for msg in history]
+    loser_messages.append({"role": "user", "content": "what about the invoice?"})
+    loser._persist_user_message_idx = len(history)
+    pre_race_len = len(loser_messages)
+
+    winner_result: list = []
+    loser_result: list = []
+
+    def _run_winner():
+        compressed, _sp = winner._compress_context(
+            winner_messages, "sys", approx_tokens=120_000
+        )
+        winner_result.append(compressed)
+
+    def _run_loser():
+        assert winner_holds_lock.wait(timeout=30)
+        compressed, _sp = loser._compress_context(
+            loser_messages, "sys", approx_tokens=120_000
+        )
+        loser_result.append(compressed)
+
+    threads = [
+        threading.Thread(target=_run_winner, name="winner"),
+        threading.Thread(target=_run_loser, name="loser"),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+    assert not any(thread.is_alive() for thread in threads)
+
+    assert winner_result and loser_result
+    won = winner_result[0]
+    lost = loser_result[0]
+
+    # 1. No doubling: the loser's transcript is bounded by the winner's
+    #    compacted shape plus its own live turn — not 2x the pre-race list.
+    assert len(lost) <= len(won) + 1
+    assert len(lost) < pre_race_len
+    from agent.model_metadata import estimate_messages_tokens_rough
+
+    assert estimate_messages_tokens_rough(lost) < estimate_messages_tokens_rough(
+        loser_messages
+    )
+
+    # 2. The loser's result DERIVES from the winner's compacted state (it
+    #    carries the compaction summary) rather than the pre-race transcript.
+    assert any(
+        COMPACTION_SUMMARY in str(msg.get("content", "")) for msg in lost
+    )
+    assert not any(str(msg.get("content", "")).startswith("turn 0 ") for msg in lost)
+
+    # 3. The loser's own live turn survived the adoption exactly once.
+    assert [msg for msg in lost if msg.get("content") == "what about the invoice?"] == [
+        {"role": "user", "content": "what about the invoice?"}
+    ]
+
+    # 4. It adopted rather than re-compressed, and never forked the session.
+    loser.context_compressor.compress.assert_not_called()
+    assert loser.session_id == sid
+    assert _count_children(db, sid) == 0
+    assert db.get_session(sid)["end_reason"] is None
+    assert db.get_compression_lock_holder(sid) is None
+    # The adopted transcript is the session's live transcript, so downstream
+    # (gateway history_offset, flush baseline) must re-baseline like in-place.
+    assert loser._last_compaction_in_place is True
+    # 5. Token accounting is parked like a completed compaction, so the stale
+    #    pre-compaction prompt count cannot re-trigger compression against the
+    #    transcript we just adopted.
+    assert loser.context_compressor.last_prompt_tokens == -1
+    assert loser.context_compressor.awaiting_real_usage_after_compression is True
+
+
+def test_race_loser_adopts_rotated_child_and_preserves_live_tail(
+    tmp_path: Path,
+) -> None:
+    """A lock loser follows a rotating winner without dropping its live turn.
+
+    Upstream's canonical child-tip recovery owns the session/context-engine
+    rebind. AE-204 convergence must layer onto that recovery rather than
+    treating rotation as an unadoptable in-place result or resetting the
+    child flush cursor.
+    """
+    db = SessionDB(db_path=tmp_path / "state.db")
+    parent_sid = "ADOPT_ROTATED_RACE"
+    child_sid = "ADOPT_ROTATED_CHILD"
+    db.create_session(parent_sid, source="api")
+    history = _seed_history(db, parent_sid, 20)
+    compacted = _compacted_payload()
+    holder = "rotating_winner"
+    assert db.try_acquire_compression_lock(parent_sid, holder) is True
+    loser_contended = _signal_on_contention(db, parent_sid)
+
+    def _publish_rotated_child() -> None:
+        assert loser_contended.wait(timeout=20)
+        db.end_session(parent_sid, "compression")
+        db.create_session(
+            child_sid,
+            source="api",
+            parent_session_id=parent_sid,
+        )
+        db.replace_messages(child_sid, compacted)
+        db.release_compression_lock(parent_sid, holder)
+
+    publisher = threading.Thread(
+        target=_publish_rotated_child,
+        name="rotating-winner",
+        daemon=True,
+    )
+    publisher.start()
+
+    loser = _build_agent_with_db(db, parent_sid)
+    loser._compression_lock_wait_seconds = 10.0
+    messages = [dict(message) for message in history]
+    messages.append({"role": "user", "content": "preserve this live turn"})
+    loser._persist_user_message_idx = len(history)
+
+    adopted, _system_prompt = loser._compress_context(
+        messages,
+        "sys",
+        approx_tokens=120_000,
+    )
+    publisher.join(timeout=5)
+    assert not publisher.is_alive()
+
+    assert loser.session_id == child_sid
+    assert [message["content"] for message in adopted] == [
+        COMPACTION_SUMMARY,
+        "carrying on from the summary",
+        "preserve this live turn",
+    ]
+    assert loser._persist_user_message_idx == len(compacted)
+    assert loser._last_compression_attempt_in_place is False
+    assert loser._last_compaction_in_place is False
+    assert loser._compression_skipped_due_to_lock == holder
+    assert loser._flushed_db_message_session_id == child_sid
+    assert loser._last_flushed_db_idx == len(compacted)
+    loser.context_compressor.compress.assert_not_called()
+    loser.context_compressor.on_session_start.assert_called_once()
+
+    # The recovered child rows are seeded as already durable; only the loser's
+    # live tail is appended when the turn next flushes.
+    loser._flush_messages_to_session_db(adopted, None)
+    assert [row["content"] for row in db.get_messages(child_sid)] == [
+        COMPACTION_SUMMARY,
+        "carrying on from the summary",
+        "preserve this live turn",
+    ]
+    assert _count_children(db, parent_sid) == 1
+    assert db.get_compression_lock_holder(parent_sid) is None
+
+
+def test_lock_wait_cancellation_prevents_late_adoption(
+    tmp_path: Path,
+    caplog,
+) -> None:
+    """A host timeout revokes convergence before it can mutate live state."""
+    from agent.conversation_compression import CompressionCommitFence
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    session_id = "ADOPT_WAIT_CANCELLED"
+    db.create_session(session_id, source="api")
+    history = _seed_history(db, session_id, 12)
+    holder = "blocked_winner"
+    assert db.try_acquire_compression_lock(session_id, holder) is True
+    contended = _signal_on_contention(db, session_id)
+
+    agent = _build_in_place_agent(db, session_id)
+    agent._compression_lock_wait_seconds = 10.0
+    agent.status_callback = MagicMock()
+    fence = CompressionCommitFence()
+    result: list[tuple[list, str]] = []
+
+    def _run_loser() -> None:
+        result.append(
+            agent._compress_context(
+                history,
+                "sys",
+                approx_tokens=120_000,
+                commit_fence=fence,
+            )
+        )
+
+    with caplog.at_level(logging.INFO, logger="agent.conversation_compression"):
+        loser = threading.Thread(target=_run_loser, name="cancelled-lock-loser")
+        loser.start()
+        assert contended.wait(timeout=5)
+        assert fence.cancel_before_commit() is True
+        loser.join(timeout=3)
+
+    assert not loser.is_alive()
+    assert result and result[0][0] is history
+    assert agent.session_id == session_id
+    assert agent._compression_skipped_due_to_lock == holder
+    agent.context_compressor.compress.assert_not_called()
+    assert db.get_compression_lock_holder(session_id) == holder
+    assert any(
+        '"failure_class":"lock_contended"' in record.getMessage()
+        for record in caplog.records
+    )
+    agent.status_callback.assert_any_call(
+        "compacted",
+        "✓ Context compaction complete — continuing turn...",
+    )
+    db.release_compression_lock(session_id, holder)
+
+
+def test_adopted_state_is_not_reappended_by_the_next_flush(tmp_path: Path) -> None:
+    """Adopted rows are already durable — flushing must not duplicate them.
+
+    The winner releases synchronously after the loser's failed acquire, before
+    ``compress_context`` can perform its post-failure holder lookup. This pins
+    the real race where the pre-acquire observation is the only confirmed
+    holder evidence; treating the later ``None`` as an unconfirmed backend
+    failure would skip safe adoption and return the stale full transcript.
+    """
+    db = SessionDB(db_path=tmp_path / "state.db")
+    sid = "ADOPT_FLUSH"
+    db.create_session(sid, source="api")
+    history = _seed_history(db, sid, 12)
+
+    compacted = _compacted_payload()
+    db.archive_and_compact(sid, compacted)
+    held = db.try_acquire_compression_lock(sid, "external_holder")
+    assert held is True
+
+    agent = _build_in_place_agent(db, sid)
+    agent._compression_lock_wait_seconds = 10.0
+    messages = [dict(msg) for msg in history]
+    messages.append({"role": "user", "content": "live turn"})
+    agent._persist_user_message_idx = len(history)
+
+    real_acquire = db.try_acquire_compression_lock
+    released_before_failed_acquire_returned = threading.Event()
+
+    def _acquire_after_winner_finishes(
+        session_id: str,
+        holder: str,
+        ttl_seconds: float = 300.0,
+    ) -> bool:
+        acquired = real_acquire(session_id, holder, ttl_seconds=ttl_seconds)
+        if not acquired and session_id == sid:
+            db.release_compression_lock(sid, "external_holder")
+            assert db.get_compression_lock_holder(sid) is None
+            released_before_failed_acquire_returned.set()
+        return acquired
+
+    db.try_acquire_compression_lock = _acquire_after_winner_finishes
+    adopted, _sp = agent._compress_context(messages, "sys", approx_tokens=120_000)
+
+    assert released_before_failed_acquire_returned.is_set()
+    assert len(adopted) == len(compacted) + 1
+    active_before = len(db.get_messages(sid))
+    agent._flush_messages_to_session_db(adopted, None)
+    active_after = len(db.get_messages(sid))
+    # Only the un-persisted live turn was written; the adopted compacted rows
+    # were recognised as durable (this is the in-place doubling hazard that
+    # conversation_history_after_compression documents).
+    assert active_before == len(compacted)
+    assert active_after == len(compacted) + 1
+    summaries = [
+        row for row in db.get_messages(sid)
+        if COMPACTION_SUMMARY in str(row.get("content", ""))
+    ]
+    assert len(summaries) == 1
+
+
+def test_adoption_does_not_duplicate_an_already_flushed_tail(tmp_path: Path) -> None:
+    """A turn that flushed part of its tail before losing must not re-add it.
+
+    Multi-iteration turns flush as they go. When the winner compacts after
+    such a flush, those rows survive in the compacted live set, so appending
+    the in-memory tail wholesale would duplicate exactly that overlap.
+    """
+    db = SessionDB(db_path=tmp_path / "state.db")
+    sid = "ADOPT_OVERLAP"
+    db.create_session(sid, source="api")
+    history = _seed_history(db, sid, 12)
+
+    compacted = _compacted_payload()
+    db.archive_and_compact(sid, compacted)
+    # The loser's first tail message was already durable when the winner
+    # compacted, so it survives as an active row after the compaction.
+    db.append_message(sid, "user", "live turn")
+    held = db.try_acquire_compression_lock(sid, "external_holder")
+    assert held is True
+
+    agent = _build_in_place_agent(db, sid)
+    agent._compression_lock_wait_seconds = 10.0
+    messages = [dict(msg) for msg in history]
+    messages.append({"role": "user", "content": "live turn"})
+    messages.append({"role": "assistant", "content": "partial answer"})
+    agent._persist_user_message_idx = len(history)
+
+    releaser = _release_lock_when_contended(db, sid, "external_holder")
+    adopted, _sp = agent._compress_context(messages, "sys", approx_tokens=120_000)
+    releaser.join(timeout=5)
+
+    live_turns = [msg for msg in adopted if msg.get("content") == "live turn"]
+    assert len(live_turns) == 1, "already-flushed tail message was duplicated"
+    assert adopted[-1] == {"role": "assistant", "content": "partial answer"}
+    assert len(adopted) == len(compacted) + 2
+
+
+def test_holder_timeout_falls_back_with_its_own_log_tag(
+    tmp_path: Path, caplog
+) -> None:
+    """A crashed/hung holder must not deadlock the loser — bounded fallback."""
+    db = SessionDB(db_path=tmp_path / "state.db")
+    sid = "ADOPT_TIMEOUT"
+    db.create_session(sid, source="api")
+    history = _seed_history(db, sid, 12)
+
+    # A holder that never releases and never compacts (crashed mid-run).
+    assert db.try_acquire_compression_lock(sid, "crashed_holder") is True
+
+    agent = _build_in_place_agent(db, sid)
+    agent._compression_lock_wait_seconds = 0.4
+    messages = [dict(msg) for msg in history]
+    messages.append({"role": "user", "content": "live turn"})
+    agent._persist_user_message_idx = len(history)
+
+    started = time.monotonic()
+    with caplog.at_level(logging.WARNING, logger="agent.conversation_compression"):
+        returned, _sp = agent._compress_context(
+            messages, "sys", approx_tokens=120_000
+        )
+    elapsed = time.monotonic() - started
+
+    assert returned == messages
+    assert 0.3 <= elapsed < 10.0, "wait was not bounded by the configured budget"
+    assert not getattr(agent, "_last_compaction_in_place", False)
+    assert agent.session_id == sid
+    assert _count_children(db, sid) == 0
+    tags = [record.getMessage() for record in caplog.records]
+    assert any("compression skipped: holder timeout" in tag for tag in tags)
+    assert not any("no compacted state to adopt" in tag for tag in tags)
+
+
+def test_holder_release_without_compaction_keeps_the_skip_tag(
+    tmp_path: Path, caplog
+) -> None:
+    """Holder finished without compacting: skip, but under the distinct tag."""
+    db = SessionDB(db_path=tmp_path / "state.db")
+    sid = "ADOPT_NOTHING"
+    db.create_session(sid, source="api")
+    history = _seed_history(db, sid, 12)
+
+    assert db.try_acquire_compression_lock(sid, "aborting_holder") is True
+
+    agent = _build_in_place_agent(db, sid)
+    agent._compression_lock_wait_seconds = 10.0
+    messages = [dict(msg) for msg in history]
+
+    releaser = _release_lock_when_contended(db, sid, "aborting_holder")
+    with caplog.at_level(logging.WARNING, logger="agent.conversation_compression"):
+        returned, _sp = agent._compress_context(
+            messages, "sys", approx_tokens=120_000
+        )
+    releaser.join(timeout=5)
+
+    assert returned is messages
+    assert not getattr(agent, "_last_compaction_in_place", False)
+    tags = [record.getMessage() for record in caplog.records]
+    assert any("another path is compressing" in tag for tag in tags)
+    assert any("no compacted state to adopt" in tag for tag in tags)
+    assert not any("holder timeout" in tag for tag in tags)
+
+
+def test_ended_parent_without_live_child_is_not_adopted(tmp_path: Path) -> None:
+    """An ended parent without a canonical live continuation fails closed."""
+    from agent.conversation_compression import _adopt_concurrent_compaction
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    sid = "ADOPT_ROTATED"
+    db.create_session(sid, source="api")
+    history = _seed_history(db, sid, 12)
+    db.archive_and_compact(sid, _compacted_payload())
+    db.end_session(sid, "compression")
+
+    agent = _build_in_place_agent(db, sid)
+    messages = [dict(msg) for msg in history]
+    agent._persist_user_message_idx = len(history)
+
+    assert _adopt_concurrent_compaction(agent, messages) is None
+
+
+def test_adoption_declines_when_the_turn_anchor_is_untrustworthy(
+    tmp_path: Path,
+) -> None:
+    """Never split the list at an anchor that no longer names a user turn."""
+    from agent.conversation_compression import _adopt_concurrent_compaction
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    sid = "ADOPT_BAD_ANCHOR"
+    db.create_session(sid, source="api")
+    history = _seed_history(db, sid, 12)
+    db.archive_and_compact(sid, _compacted_payload())
+
+    agent = _build_in_place_agent(db, sid)
+    messages = [dict(msg) for msg in history]
+    messages.append({"role": "user", "content": "live turn"})
+
+    # Anchor points at an assistant row (stale after an earlier rewrite).
+    agent._persist_user_message_idx = 1
+    assert _adopt_concurrent_compaction(agent, messages) is None
+    # Out-of-range anchors are refused too.
+    agent._persist_user_message_idx = len(messages) + 5
+    assert _adopt_concurrent_compaction(agent, messages) is None
+    # A sound anchor still adopts.
+    agent._persist_user_message_idx = len(history)
+    adopted = _adopt_concurrent_compaction(agent, messages)
+    assert adopted is not None and len(adopted) == 3
+
+
+def test_uncompacted_session_is_never_adopted(tmp_path: Path) -> None:
+    """No compaction happened → nothing to adopt (holder still mid-summary)."""
+    from agent.conversation_compression import _adopt_concurrent_compaction
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    sid = "ADOPT_NO_COMPACTION"
+    db.create_session(sid, source="api")
+    history = _seed_history(db, sid, 12)
+
+    agent = _build_in_place_agent(db, sid)
+    messages = [dict(msg) for msg in history]
+    agent._persist_user_message_idx = len(history)
+
+    assert _adopt_concurrent_compaction(agent, messages) is None
+
+
+def test_shorter_live_set_without_a_summary_is_not_a_compaction(
+    tmp_path: Path,
+) -> None:
+    """Size alone is not proof: a shorter active set can mean no compaction.
+
+    The durable active set drops below this path's in-memory history for
+    reasons that have nothing to do with compaction — a best-effort flush
+    failure is swallowed, ``rewind_to_message`` soft-archives rows out of the
+    active set, alternation repair merges rows. Without positive proof that a
+    summary was written, adoption would launder an UNCOMPACTED transcript as a
+    compaction and hand downstream exactly the list that gets re-concatenated.
+    """
+    from agent.conversation_compression import _adopt_concurrent_compaction
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    sid = "ADOPT_NO_SUMMARY"
+    db.create_session(sid, source="api")
+    history = _seed_history(db, sid, 12)
+    # Two rows never reached the store, so the active set is strictly shorter
+    # than the history this path holds — with nothing ever compacted.
+    db.replace_messages(sid, history[:10])
+
+    agent = _build_in_place_agent(db, sid)
+    messages = [dict(msg) for msg in history]
+    messages.append({"role": "user", "content": "live turn"})
+    agent._persist_user_message_idx = len(history)
+
+    # Every size guard passes (10 < 12, adopted 11 < 13) — only the summary
+    # proof stands between this and a bogus adoption.
+    assert _adopt_concurrent_compaction(agent, messages) is None
+
+    # The same shape WITH a real summary in the stored set is adoptable.
+    db.replace_messages(sid, _compacted_payload())
+    adopted = _adopt_concurrent_compaction(agent, messages)
+    assert adopted is not None
+    assert len(adopted) == len(_compacted_payload()) + 1
+
+
+def test_aborted_holder_is_not_mistaken_for_a_winner(
+    tmp_path: Path, caplog
+) -> None:
+    """Holder aborts having written nothing → skip, never a fake adoption.
+
+    An aux-model failure mid-summary aborts the holder's compression and it
+    releases the lock having written no summary. If the loser adopted on the
+    size guards alone it would log ``compression adopted``, claim an in-place
+    compaction, and park token accounting — all for a transcript that was
+    never compacted.
+    """
+    db = SessionDB(db_path=tmp_path / "state.db")
+    sid = "ADOPT_ABORTED_HOLDER"
+    db.create_session(sid, source="api")
+    history = _seed_history(db, sid, 12)
+    # Pre-existing deficit (swallowed flush failure), no compaction anywhere.
+    db.replace_messages(sid, history[:10])
+
+    assert db.try_acquire_compression_lock(sid, "aborting_holder") is True
+
+    agent = _build_in_place_agent(db, sid)
+    agent._compression_lock_wait_seconds = 10.0
+    agent.context_compressor.last_prompt_tokens = 90_000
+    agent.context_compressor.awaiting_real_usage_after_compression = False
+    messages = [dict(msg) for msg in history]
+    messages.append({"role": "user", "content": "live turn"})
+    agent._persist_user_message_idx = len(history)
+
+    releaser = _release_lock_when_contended(db, sid, "aborting_holder")
+    with caplog.at_level(logging.INFO, logger="agent.conversation_compression"):
+        returned, _sp = agent._compress_context(
+            messages, "sys", approx_tokens=120_000
+        )
+    releaser.join(timeout=5)
+
+    assert returned is messages
+    agent.context_compressor.compress.assert_not_called()
+    assert not getattr(agent, "_last_compaction_in_place", False)
+    # Token accounting stays live: nothing was compacted, so the next cycle
+    # must keep grading the real (uncompacted) transcript.
+    assert agent.context_compressor.last_prompt_tokens == 90_000
+    assert agent.context_compressor.awaiting_real_usage_after_compression is False
+    assert agent.session_id == sid
+    assert _count_children(db, sid) == 0
+    tags = [record.getMessage() for record in caplog.records]
+    assert any("no compacted state to adopt" in tag for tag in tags)
+    assert not any("compression adopted" in tag for tag in tags)
+
+
+def test_compression_lock_wait_budget_precedence_and_clamp(monkeypatch) -> None:
+    """Attribute → env → default, always clamped to the lease TTL."""
+    from agent.conversation_compression import (
+        COMPRESSION_LOCK_WAIT_ENV,
+        COMPRESSION_LOCK_WAIT_SECONDS_DEFAULT,
+        _compression_lock_wait_budget,
+    )
+
+    class _Agent:
+        _compression_lock_wait_seconds = None
+
+    agent = _Agent()
+    monkeypatch.delenv(COMPRESSION_LOCK_WAIT_ENV, raising=False)
+    assert _compression_lock_wait_budget(agent, 300.0) == (
+        COMPRESSION_LOCK_WAIT_SECONDS_DEFAULT
+    )
+    # The lease is the hard ceiling: waiting past it can only stall behind a
+    # holder whose row is already reclaimable.
+    assert _compression_lock_wait_budget(agent, 5.0) == 5.0
+
+    monkeypatch.setenv(COMPRESSION_LOCK_WAIT_ENV, "12.5")
+    assert _compression_lock_wait_budget(agent, 300.0) == 12.5
+    monkeypatch.setenv(COMPRESSION_LOCK_WAIT_ENV, "not-a-number")
+    assert _compression_lock_wait_budget(agent, 300.0) == (
+        COMPRESSION_LOCK_WAIT_SECONDS_DEFAULT
+    )
+
+    agent._compression_lock_wait_seconds = 3.0
+    assert _compression_lock_wait_budget(agent, 300.0) == 3.0
+    agent._compression_lock_wait_seconds = -1
+    assert _compression_lock_wait_budget(agent, 300.0) == 0.0
+
+
+def test_holder_wait_aborts_on_interrupt(tmp_path: Path) -> None:
+    """An interrupted turn must stop waiting immediately."""
+    from agent.conversation_compression import _wait_for_compression_holder
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    sid = "ADOPT_INTERRUPT"
+    db.create_session(sid, source="api")
+    assert db.try_acquire_compression_lock(sid, "stuck_holder") is True
+
+    agent = _build_in_place_agent(db, sid)
+    agent._interrupt_requested = True
+
+    started = time.monotonic()
+    released, waited = _wait_for_compression_holder(
+        agent, db, sid, "stuck_holder", 30.0
+    )
+    assert released is False
+    assert waited < 1.0
+    assert time.monotonic() - started < 1.0
+
+
+def test_manual_forced_compression_never_adopts(tmp_path: Path, caplog) -> None:
+    """``/compress here N`` hands us a HEAD SLICE — adoption would corrupt it.
+
+    Manual compression passes ``force=True`` and, in partial mode, only the
+    head of the transcript (the caller re-appends the verbatim tail). The
+    session-wide compacted transcript is not a valid substitute for that
+    slice, so forced callers keep the historical immediate skip: no wait, no
+    adoption, original log tag.
+    """
+    db = SessionDB(db_path=tmp_path / "state.db")
+    sid = "ADOPT_FORCED"
+    db.create_session(sid, source="api")
+    history = _seed_history(db, sid, 20)
+    db.archive_and_compact(sid, _compacted_payload())
+    assert db.try_acquire_compression_lock(sid, "external_holder") is True
+
+    agent = _build_in_place_agent(db, sid)
+    # Long budget on purpose: a forced call must not spend any of it.
+    agent._compression_lock_wait_seconds = 30.0
+    head = [dict(msg) for msg in history[:12]]
+
+    started = time.monotonic()
+    with caplog.at_level(logging.WARNING, logger="agent.conversation_compression"):
+        returned, _sp = agent._compress_context(
+            head, "sys", approx_tokens=120_000, force=True
+        )
+    elapsed = time.monotonic() - started
+
+    assert returned is head
+    assert elapsed < 5.0, "forced compression waited on the holder"
+    assert not getattr(agent, "_last_compaction_in_place", False)
+    tags = [record.getMessage() for record in caplog.records]
+    assert any(
+        "compression skipped: another path is compressing" in tag
+        and "no compacted state to adopt" not in tag
+        for tag in tags
+    )
+    assert not any("holder timeout" in tag for tag in tags)

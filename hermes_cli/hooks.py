@@ -243,6 +243,18 @@ _DEFAULT_PAYLOADS = {
         "injected_char_count": 166,
         "estimated_injected_tokens": 42,
         "reused_for_all_iterations": True,
+        # Per-memory identity of the injected block, in injection order.
+        # ``score`` is None when the memory backend exposes no relevance
+        # score; ``text`` is a snippet (the full text is in injected_block).
+        # Empty list whenever status is not "injected".
+        "memories": [
+            {
+                "id": "mem-1",
+                "text": "Synthetic recalled memory",
+                "score": None,
+                "type": "world",
+            },
+        ],
     },
     "subagent_stop": {
         "parent_session_id": "parent-sess",

@@ -177,6 +177,19 @@ class MemoryProvider(ABC):
         """
         return ""
 
+    def consume_prefetch_memories(self) -> List[Dict[str, Any]]:
+        """Return and clear per-memory structure behind the last prefetch().
+
+        Purely observational traceability (AE-194): the injected text is
+        still the only thing the model sees. Providers that can name the
+        individual memories they injected should return one dict per memory
+        with at least ``id``, ``text`` (snippet), ``score`` and ``type``, and
+        an empty list when the last prefetch injected nothing. Called once
+        per turn, after prefetch(), so the value must be consumed (cleared)
+        to keep a later turn from re-reporting stale memories.
+        """
+        return []
+
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
         """Queue a background recall for the NEXT turn.
 

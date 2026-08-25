@@ -33,12 +33,15 @@ from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.api_server import (
     APIServerAdapter,
     ResponseStore,
+    ThreadSafeAsyncQueue,
     _IdempotencyCache,
     _append_request_identity_prompt,
     _derive_chat_session_id,
     _hermes_version,
     _redact_api_error_text,
     _request_agent_overrides,
+    _responses_usage_payload,
+    _session_usage_snapshot,
     check_api_server_requirements,
     cors_middleware,
     make_response_store,
@@ -343,6 +346,9 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_post("/v1/chat/completions", adapter._handle_chat_completions)
     app.router.add_post("/v1/responses", adapter._handle_responses)
     app.router.add_get("/v1/responses/{response_id}", adapter._handle_get_response)
+    app.router.add_post(
+        "/v1/responses/{response_id}/cancel", adapter._handle_cancel_response
+    )
     app.router.add_delete("/v1/responses/{response_id}", adapter._handle_delete_response)
     app.router.add_post(
         "/api/platforms/{platform}/events",
@@ -561,6 +567,8 @@ class TestAgentExecution:
         assert usage["compressions"] == 2
         assert usage["cost_status"] == "estimated"
         assert usage["cost_usd"] == 0.0123
+        assert usage["cache_read_tokens"] == 3
+        assert usage["cache_write_tokens"] == 2
         assert mock_cost.call_count == 1
 
     @pytest.mark.asyncio
@@ -908,6 +916,181 @@ class TestRunEventCallback:
         assert event["child_session_id"] == "child-sess-42"
         for field in ("preview", "goal", "summary", "output_tail"):
             assert secret not in event[field], field
+
+
+# ---------------------------------------------------------------------------
+# _session_usage_snapshot — prompt-cache split and honest context reporting.
+#
+# The envelope's aggregate ``input_tokens`` is prompt-inclusive, so consumers
+# that want "fresh input" need the cached buckets published alongside it. The
+# context trio must never be fabricated: a run-cumulative counter is not a
+# context size, and reporting one clamps a consumer's context bar to 100% and
+# fakes a "compaction imminent" warning.
+# ---------------------------------------------------------------------------
+
+
+class _UsageSnapshotAgent:
+    """Minimal agent-shaped object for _session_usage_snapshot unit tests."""
+
+    def __init__(self, **attrs):
+        self.session_prompt_tokens = 100
+        self.session_completion_tokens = 20
+        self.session_total_tokens = 120
+        for name, value in attrs.items():
+            setattr(self, name, value)
+
+
+class _StubCompressor:
+    def __init__(self, last_prompt_tokens, context_length=8192, compression_count=2):
+        self.last_prompt_tokens = last_prompt_tokens
+        self.context_length = context_length
+        self.compression_count = compression_count
+
+
+class TestSessionUsageSnapshotCacheSplit:
+    def test_publishes_parent_scope_cache_split(self):
+        agent = _UsageSnapshotAgent(
+            session_cache_read_tokens=70,
+            session_cache_write_tokens=5,
+        )
+
+        usage = _session_usage_snapshot(agent)
+
+        assert usage["input_tokens"] == 100
+        assert usage["output_tokens"] == 20
+        assert usage["total_tokens"] == 120
+        assert usage["cache_read_tokens"] == 70
+        assert usage["cache_write_tokens"] == 5
+        # Existing keys are untouched by the additive split.
+        assert usage["scope"] == "run_aggregate"
+        assert usage["completeness"] == "complete"
+        assert usage["warnings"] == []
+        assert usage["breakdown"]["parent"] == {
+            "input_tokens": 100,
+            "output_tokens": 20,
+            "total_tokens": 120,
+        }
+
+    def test_cache_split_reports_zero_when_counters_absent(self):
+        usage = _session_usage_snapshot(_UsageSnapshotAgent())
+
+        assert usage["cache_read_tokens"] == 0
+        assert usage["cache_write_tokens"] == 0
+
+    def test_cache_split_ignores_malformed_counters(self):
+        agent = _UsageSnapshotAgent(
+            session_cache_read_tokens="lots",
+            session_cache_write_tokens=None,
+        )
+
+        usage = _session_usage_snapshot(agent)
+
+        assert usage["cache_read_tokens"] == 0
+        assert usage["cache_write_tokens"] == 0
+
+    def test_responses_payload_passes_cache_split_through(self):
+        payload = _responses_usage_payload(
+            {
+                "input_tokens": 100,
+                "output_tokens": 20,
+                "total_tokens": 120,
+                "cache_read_tokens": 70,
+                "cache_write_tokens": 5,
+            }
+        )
+
+        assert payload["cache_read_tokens"] == 70
+        assert payload["cache_write_tokens"] == 5
+
+
+class TestSessionUsageSnapshotContext:
+    def test_reports_context_trio_from_a_real_reading(self):
+        agent = _UsageSnapshotAgent(
+            context_compressor=_StubCompressor(4096),
+        )
+
+        usage = _session_usage_snapshot(agent)
+
+        assert usage["context_used"] == 4096
+        assert usage["context_max"] == 8192
+        assert usage["context_percent"] == 50
+        assert usage["compressions"] == 2
+
+    def test_omits_context_trio_before_any_provider_reading(self):
+        """A 0 reading means "not measured yet", not "empty context"."""
+        agent = _UsageSnapshotAgent(
+            context_compressor=_StubCompressor(0),
+        )
+
+        usage = _session_usage_snapshot(agent)
+
+        assert "context_used" not in usage
+        assert "context_max" not in usage
+        assert "context_percent" not in usage
+        # Compaction reporting is independent of the context reading.
+        assert usage["compressions"] == 2
+
+    def test_omits_context_trio_for_post_compaction_sentinel(self):
+        """The -1 sentinel parks the reading until real usage arrives."""
+        agent = _UsageSnapshotAgent(
+            context_compressor=_StubCompressor(-1),
+        )
+
+        usage = _session_usage_snapshot(agent)
+
+        assert "context_used" not in usage
+        assert "context_max" not in usage
+        assert "context_percent" not in usage
+        assert usage["compressions"] == 2
+
+    def test_omits_context_trio_when_engine_does_not_track_the_reading(self):
+        class _NoReadingEngine:
+            context_length = 8192
+            compression_count = 0
+
+        agent = _UsageSnapshotAgent(context_compressor=_NoReadingEngine())
+
+        usage = _session_usage_snapshot(agent)
+
+        assert "context_used" not in usage
+        assert "context_max" not in usage
+        assert "context_percent" not in usage
+        assert usage["compressions"] == 0
+
+    def test_never_substitutes_run_cumulative_totals_for_context_used(self):
+        """session_total_tokens is tokens processed, not a context size.
+
+        Substituting it pinned the reported context at 100% for any run whose
+        cumulative processing exceeded the window, even with a nearly empty
+        conversation.
+        """
+        agent = _UsageSnapshotAgent(
+            session_prompt_tokens=900_000,
+            session_completion_tokens=100_000,
+            session_total_tokens=1_000_000,
+            context_compressor=_StubCompressor(0),
+        )
+
+        usage = _session_usage_snapshot(agent)
+
+        assert usage["total_tokens"] == 1_000_000
+        assert "context_used" not in usage
+        assert "context_percent" not in usage
+
+    def test_responses_payload_omits_absent_context_keys(self):
+        payload = _responses_usage_payload(
+            {
+                "input_tokens": 100,
+                "output_tokens": 20,
+                "total_tokens": 120,
+                "compressions": 3,
+            }
+        )
+
+        assert payload["compressions"] == 3
+        assert "context_used" not in payload
+        assert "context_max" not in payload
+        assert "context_percent" not in payload
 
 
 # ---------------------------------------------------------------------------
@@ -2353,6 +2536,647 @@ class TestResponsesEndpoint:
                 if message["role"] == "user"
             ] == [user["content"], second_user["content"]]
 
+    # ------------------------------------------------------------------
+    # Staging history doubling (AE-204 family / staging 2026-08-11)
+    #
+    # On staging, Hindsight prefetch stamps an ``api_content`` sidecar on
+    # the current turn's user row (agent/turn_context.py). The sidecar is
+    # not underscore-prefixed, so ``_response_prefix_projection`` kept it
+    # and the expected-prefix match failed on the very first turn — the
+    # fallthrough then stored ``prior + user + result["messages"]``, i.e.
+    # the current user row twice, adjacent. Every later turn,
+    # ``repair_message_sequence`` merged those adjacent user rows in the
+    # agent's transcript, so BOTH prefix checks failed and the fallthrough
+    # re-embedded the whole prior history: h(n+1) = 2*h(n) + 2.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _simulate_staging_agent_turn(conversation_history, user_message, reply):
+        """Mimic run_conversation's transcript shape on staging.
+
+        Two real perturbations are reproduced:
+        - ``repair_message_sequence`` pass 2 (agent/agent_runtime_helpers.py)
+          merges consecutive user rows with a blank-line separator and drops
+          their stale ``api_content`` sidecar.
+        - Hindsight memory prefetch stamps the ``api_content`` sidecar and
+          the ``_db_persisted`` marker on this turn's user row
+          (agent/turn_context.py).
+        """
+        messages = []
+        for msg in conversation_history:
+            if (
+                messages
+                and isinstance(msg, dict)
+                and msg.get("role") == "user"
+                and isinstance(messages[-1], dict)
+                and messages[-1].get("role") == "user"
+                and isinstance(messages[-1].get("content"), str)
+                and isinstance(msg.get("content"), str)
+            ):
+                merged = dict(messages[-1])
+                merged["content"] = merged["content"] + "\n\n" + msg["content"]
+                merged.pop("api_content", None)
+                messages[-1] = merged
+                continue
+            messages.append(msg)
+        messages.append({
+            "role": "user",
+            "content": user_message,
+            "api_content": (
+                "<recalled_memories>staging recall block</recalled_memories>"
+                "\n\n" + str(user_message)
+            ),
+            "_db_persisted": True,
+        })
+        messages.append({
+            "role": "assistant",
+            "content": reply,
+            "_db_persisted": True,
+        })
+        return messages
+
+    @pytest.mark.asyncio
+    async def test_memory_sidecar_chained_turns_store_each_message_once(self, adapter):
+        """Reproduces the staging 2n+2 doubling across chained turns.
+
+        Before the fix, stored history lengths grew 3 -> 8 -> 18 (each turn
+        re-embedding the whole prior history); the staging Langfuse evidence
+        continued 18 -> 35 -> 67. After the fix each real message is stored
+        exactly once per turn: 2 -> 4 -> 6.
+        """
+        turns = [
+            ("staging turn one", "answer one"),
+            ("staging turn two", "answer two"),
+            ("staging turn three", "answer three"),
+        ]
+
+        def _make_mock(reply):
+            async def _mock_run_agent(**kwargs):
+                return (
+                    {
+                        "final_response": reply,
+                        "messages": self._simulate_staging_agent_turn(
+                            kwargs["conversation_history"],
+                            kwargs["user_message"],
+                            reply,
+                        ),
+                        "api_calls": 1,
+                    },
+                    {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+                )
+            return _mock_run_agent
+
+        app = _create_app(adapter)
+        prev_id = None
+        stored_histories = []
+        async with TestClient(TestServer(app)) as cli:
+            for user_text, reply in turns:
+                payload = {"model": "hermes-agent", "input": user_text}
+                if prev_id:
+                    payload["previous_response_id"] = prev_id
+                with patch.object(
+                    adapter, "_run_agent", side_effect=_make_mock(reply)
+                ):
+                    resp = await cli.post("/v1/responses", json=payload)
+                assert resp.status == 200
+                data = await resp.json()
+                prev_id = data["id"]
+                stored_histories.append(
+                    adapter._response_store.get(prev_id)["conversation_history"]
+                )
+
+        for turn_number, history in enumerate(stored_histories, start=1):
+            for user_text, reply in turns[:turn_number]:
+                user_rows = [
+                    m for m in history
+                    if m.get("role") == "user" and user_text in str(m.get("content"))
+                ]
+                assert len(user_rows) == 1, (
+                    f"after turn {turn_number}, user text {user_text!r} is stored "
+                    f"{len(user_rows)} times (history len {len(history)})"
+                )
+                assistant_rows = [
+                    m for m in history
+                    if m.get("role") == "assistant" and reply in str(m.get("content"))
+                ]
+                assert len(assistant_rows) == 1, (
+                    f"after turn {turn_number}, reply {reply!r} is stored "
+                    f"{len(assistant_rows)} times"
+                )
+        assert [len(h) for h in stored_histories] == [2, 4, 6]
+
+    @pytest.mark.asyncio
+    async def test_memory_sidecar_on_first_turn_stores_user_once(self, adapter):
+        """The api_content sidecar must not defeat first-turn prefix detection."""
+        user_text = "hello with recall"
+        agent_messages = [
+            {
+                "role": "user",
+                "content": user_text,
+                "api_content": "<recalled_memories>x</recalled_memories>\n\n" + user_text,
+                "_db_persisted": True,
+            },
+            {"role": "assistant", "content": "hi", "_db_persisted": True},
+        ]
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (
+                    {
+                        "final_response": "hi",
+                        "messages": list(agent_messages),
+                        "api_calls": 1,
+                    },
+                    {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+                )
+                resp = await cli.post(
+                    "/v1/responses",
+                    json={"model": "hermes-agent", "input": user_text},
+                )
+
+            assert resp.status == 200
+            data = await resp.json()
+            stored = adapter._response_store.get(data["id"])["conversation_history"]
+            assert stored == agent_messages
+            assert [m["role"] for m in stored] == ["user", "assistant"]
+
+    @pytest.mark.asyncio
+    async def test_perturbed_prior_history_never_reembeds_prior(self, adapter):
+        """Repair-merged prior rows must not trigger prior re-embedding.
+
+        When alternation repair rewrote the prior rows inside the agent's
+        transcript (so neither prefix check can match), the transcript is
+        still authoritative — the stored history must be adopted from it,
+        never concatenated after the prior history again.
+        """
+        prior_history = [
+            {"role": "user", "content": "first question"},
+            {"role": "user", "content": "second question"},
+            {"role": "assistant", "content": "combined answer"},
+        ]
+        adapter._response_store.put(
+            "resp_prev",
+            {
+                "response": {"id": "resp_prev", "status": "completed"},
+                "conversation_history": list(prior_history),
+                "session_id": "api-test-session",
+            },
+        )
+        # repair merged the adjacent prior user rows, then the turn ran.
+        agent_messages = [
+            {"role": "user", "content": "first question\n\nsecond question"},
+            {"role": "assistant", "content": "combined answer"},
+            {"role": "user", "content": "third question", "_db_persisted": True},
+            {"role": "assistant", "content": "third answer", "_db_persisted": True},
+        ]
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (
+                    {
+                        "final_response": "third answer",
+                        "messages": list(agent_messages),
+                        "api_calls": 1,
+                    },
+                    {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+                )
+                resp = await cli.post(
+                    "/v1/responses",
+                    json={
+                        "model": "hermes-agent",
+                        "input": "third question",
+                        "previous_response_id": "resp_prev",
+                    },
+                )
+
+            assert resp.status == 200
+            data = await resp.json()
+            stored = adapter._response_store.get(data["id"])["conversation_history"]
+            assert stored == agent_messages
+            for needle in ("first question", "second question", "third question"):
+                rows = [
+                    m for m in stored
+                    if m.get("role") == "user" and needle in str(m.get("content"))
+                ]
+                assert len(rows) == 1, f"{needle!r} stored {len(rows)} times"
+
+    @pytest.mark.asyncio
+    async def test_tool_bearing_perturbed_turn_keeps_tool_rows_once(self, adapter):
+        """Perturbed transcripts with tool calls keep every tool row exactly once."""
+        prior_history = [
+            {"role": "user", "content": "look something up"},
+            {"role": "user", "content": "please"},
+            {"role": "assistant", "content": "done"},
+        ]
+        adapter._response_store.put(
+            "resp_prev",
+            {
+                "response": {"id": "resp_prev", "status": "completed"},
+                "conversation_history": list(prior_history),
+                "session_id": "api-test-session",
+            },
+        )
+        agent_messages = [
+            {"role": "user", "content": "look something up\n\nplease"},
+            {"role": "assistant", "content": "done"},
+            {
+                "role": "user",
+                "content": "read the file",
+                "api_content": "<recalled_memories>y</recalled_memories>\n\nread the file",
+            },
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "function": {"name": "read_file", "arguments": '{"path":"a.txt"}'},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": '{"content":"data"}'},
+            {"role": "assistant", "content": "file says data"},
+        ]
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (
+                    {
+                        "final_response": "file says data",
+                        "messages": list(agent_messages),
+                        "api_calls": 1,
+                    },
+                    {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+                )
+                resp = await cli.post(
+                    "/v1/responses",
+                    json={
+                        "model": "hermes-agent",
+                        "input": "read the file",
+                        "previous_response_id": "resp_prev",
+                    },
+                )
+
+            assert resp.status == 200
+            data = await resp.json()
+            stored = adapter._response_store.get(data["id"])["conversation_history"]
+            assert stored == agent_messages
+            tool_rows = [m for m in stored if m.get("role") == "tool"]
+            assert len(tool_rows) == 1
+            # Output items replay only the current turn's tool artifacts:
+            # one function_call and one function_call_output for call_1.
+            output_types = [item["type"] for item in data["output"]]
+            assert output_types.count("function_call") == 1
+            assert output_types.count("function_call_output") == 1
+            assert "call_1" in json.dumps(data["output"])
+
+    @pytest.mark.asyncio
+    async def test_suffix_only_result_messages_still_concatenate(self, adapter):
+        """Assistant/tool-only suffix results keep the concatenation semantics."""
+        prior_history = [
+            {"role": "user", "content": "What is 1+1?"},
+            {"role": "assistant", "content": "2"},
+        ]
+        adapter._response_store.put(
+            "resp_prev",
+            {
+                "response": {"id": "resp_prev", "status": "completed"},
+                "conversation_history": list(prior_history),
+                "session_id": "api-test-session",
+            },
+        )
+        suffix_messages = [
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {"id": "call_add", "function": {"name": "add", "arguments": '{"a":2,"b":1}'}}
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_add", "content": "3"},
+            {"role": "assistant", "content": "3"},
+        ]
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (
+                    {
+                        "final_response": "3",
+                        "messages": list(suffix_messages),
+                        "api_calls": 1,
+                    },
+                    {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+                )
+                resp = await cli.post(
+                    "/v1/responses",
+                    json={
+                        "model": "hermes-agent",
+                        "input": "Now add 1 more",
+                        "previous_response_id": "resp_prev",
+                    },
+                )
+
+            assert resp.status == 200
+            data = await resp.json()
+            stored = adapter._response_store.get(data["id"])["conversation_history"]
+            assert stored == prior_history + [
+                {"role": "user", "content": "Now add 1 more"}
+            ] + suffix_messages
+
+    @pytest.mark.asyncio
+    async def test_suffix_starting_at_current_user_row_prepends_prior_once(self, adapter):
+        """A suffix that already includes this turn's user row must not duplicate it."""
+        prior_history = [
+            {"role": "user", "content": "What is 1+1?"},
+            {"role": "assistant", "content": "2"},
+        ]
+        adapter._response_store.put(
+            "resp_prev",
+            {
+                "response": {"id": "resp_prev", "status": "completed"},
+                "conversation_history": list(prior_history),
+                "session_id": "api-test-session",
+            },
+        )
+        suffix_messages = [
+            {"role": "user", "content": "Now add 1 more"},
+            {"role": "assistant", "content": "3"},
+        ]
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (
+                    {
+                        "final_response": "3",
+                        "messages": list(suffix_messages),
+                        "api_calls": 1,
+                    },
+                    {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+                )
+                resp = await cli.post(
+                    "/v1/responses",
+                    json={
+                        "model": "hermes-agent",
+                        "input": "Now add 1 more",
+                        "previous_response_id": "resp_prev",
+                    },
+                )
+
+            assert resp.status == 200
+            data = await resp.json()
+            stored = adapter._response_store.get(data["id"])["conversation_history"]
+            assert stored == prior_history + suffix_messages
+            user_rows = [
+                m for m in stored
+                if m.get("role") == "user" and m.get("content") == "Now add 1 more"
+            ]
+            assert len(user_rows) == 1
+
+    @pytest.mark.asyncio
+    async def test_nudge_bearing_suffix_preserves_prior_history(self, adapter):
+        """A suffix with a mid-turn user-role nudge must not drop prior turns.
+
+        conversation_loop.py appends user-role rows mid-turn (recovery and
+        verification nudges, continue markers), so a mocked/older host could
+        return a suffix whose LAST user row is a nudge rather than the turn
+        anchor. The current-user anchor must still find this turn's user row
+        at index 0 and prepend the prior history exactly once.
+        """
+        prior_history = [
+            {"role": "user", "content": "What is 1+1?"},
+            {"role": "assistant", "content": "2"},
+        ]
+        adapter._response_store.put(
+            "resp_prev",
+            {
+                "response": {"id": "resp_prev", "status": "completed"},
+                "conversation_history": list(prior_history),
+                "session_id": "api-test-session",
+            },
+        )
+        suffix_messages = [
+            {"role": "user", "content": "Now add 1 more"},
+            {"role": "assistant", "content": ""},
+            {
+                "role": "user",
+                "content": "[System: Continue now. Execute the required tool calls.]",
+            },
+            {"role": "assistant", "content": "3"},
+        ]
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (
+                    {
+                        "final_response": "3",
+                        "messages": list(suffix_messages),
+                        "api_calls": 1,
+                    },
+                    {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+                )
+                resp = await cli.post(
+                    "/v1/responses",
+                    json={
+                        "model": "hermes-agent",
+                        "input": "Now add 1 more",
+                        "previous_response_id": "resp_prev",
+                    },
+                )
+
+            assert resp.status == 200
+            data = await resp.json()
+            stored = adapter._response_store.get(data["id"])["conversation_history"]
+            assert stored == prior_history + suffix_messages
+            assert stored[0] == prior_history[0], "prior history must be preserved"
+            current_rows = [
+                m for m in stored
+                if m.get("role") == "user" and m.get("content") == "Now add 1 more"
+            ]
+            assert len(current_rows) == 1
+
+    @pytest.mark.asyncio
+    async def test_nudge_only_suffix_without_current_user_keeps_prior_and_user(self, adapter):
+        """A nudge-bearing suffix lacking this turn's user row keeps the
+        legacy ``prior + current_user + suffix`` shape — adopt-verbatim must
+        never fire without structural proof that the result embeds prior
+        history, or the prior turns would be silently dropped."""
+        prior_history = [
+            {"role": "user", "content": "What is 1+1?"},
+            {"role": "assistant", "content": "2"},
+        ]
+        adapter._response_store.put(
+            "resp_prev",
+            {
+                "response": {"id": "resp_prev", "status": "completed"},
+                "conversation_history": list(prior_history),
+                "session_id": "api-test-session",
+            },
+        )
+        suffix_messages = [
+            {"role": "assistant", "content": ""},
+            {
+                "role": "user",
+                "content": "[System: Continue now. Execute the required tool calls.]",
+            },
+            {"role": "assistant", "content": "3"},
+        ]
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (
+                    {
+                        "final_response": "3",
+                        "messages": list(suffix_messages),
+                        "api_calls": 1,
+                    },
+                    {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+                )
+                resp = await cli.post(
+                    "/v1/responses",
+                    json={
+                        "model": "hermes-agent",
+                        "input": "Now add 1 more",
+                        "previous_response_id": "resp_prev",
+                    },
+                )
+
+            assert resp.status == 200
+            data = await resp.json()
+            stored = adapter._response_store.get(data["id"])["conversation_history"]
+            assert stored == prior_history + [
+                {"role": "user", "content": "Now add 1 more"}
+            ] + suffix_messages
+            assert stored[0] == prior_history[0], "prior history must be preserved"
+
+    @pytest.mark.asyncio
+    async def test_turn_after_incomplete_snapshot_stores_each_message_once(self, adapter):
+        """Chaining off an incomplete snapshot (trailing user row) must not double.
+
+        An aborted stream persists ``prior + user`` with no assistant reply.
+        On the next turn the agent's alternation repair merges that trailing
+        user row with the new user message, so no exact current-user row
+        exists in the transcript — the store must still keep each real
+        message exactly once.
+        """
+        incomplete_history = [
+            {"role": "user", "content": "first message"},
+        ]
+        adapter._response_store.put(
+            "resp_prev",
+            {
+                "response": {"id": "resp_prev", "status": "incomplete"},
+                "conversation_history": list(incomplete_history),
+                "session_id": "api-test-session",
+            },
+        )
+        # repair merged the orphaned user row into this turn's user message.
+        agent_messages = [
+            {"role": "user", "content": "first message\n\nsecond message"},
+            {"role": "assistant", "content": "answer", "_db_persisted": True},
+        ]
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (
+                    {
+                        "final_response": "answer",
+                        "messages": list(agent_messages),
+                        "api_calls": 1,
+                    },
+                    {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+                )
+                resp = await cli.post(
+                    "/v1/responses",
+                    json={
+                        "model": "hermes-agent",
+                        "input": "second message",
+                        "previous_response_id": "resp_prev",
+                    },
+                )
+
+            assert resp.status == 200
+            data = await resp.json()
+            stored = adapter._response_store.get(data["id"])["conversation_history"]
+            assert stored == agent_messages
+            first_rows = [
+                m for m in stored
+                if m.get("role") == "user" and "first message" in str(m.get("content"))
+            ]
+            assert len(first_rows) == 1
+
+    @pytest.mark.asyncio
+    async def test_streamed_memory_sidecar_chained_turns_store_each_message_once(self, adapter):
+        """The streaming persistence path shares the doubling fix."""
+        turns = [
+            ("stream turn one", "reply one"),
+            ("stream turn two", "reply two"),
+        ]
+
+        def _make_mock(reply):
+            async def _mock_run_agent(**kwargs):
+                cb = kwargs.get("stream_delta_callback")
+                if cb:
+                    cb(reply)
+                return (
+                    {
+                        "final_response": reply,
+                        "messages": self._simulate_staging_agent_turn(
+                            kwargs["conversation_history"],
+                            kwargs["user_message"],
+                            reply,
+                        ),
+                        "api_calls": 1,
+                    },
+                    {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+                )
+            return _mock_run_agent
+
+        app = _create_app(adapter)
+        prev_id = None
+        stored_histories = []
+        async with TestClient(TestServer(app)) as cli:
+            for user_text, reply in turns:
+                payload = {
+                    "model": "hermes-agent",
+                    "input": user_text,
+                    "stream": True,
+                }
+                if prev_id:
+                    payload["previous_response_id"] = prev_id
+                with patch.object(
+                    adapter, "_run_agent", side_effect=_make_mock(reply)
+                ):
+                    resp = await cli.post("/v1/responses", json=payload)
+                    body = await resp.text()
+                assert resp.status == 200
+                prev_id = None
+                for event in _parse_sse_events(body):
+                    if event.get("type") == "response.completed":
+                        prev_id = event["response"]["id"]
+                        break
+                assert prev_id
+                stored_histories.append(
+                    adapter._response_store.get(prev_id)["conversation_history"]
+                )
+
+        for turn_number, history in enumerate(stored_histories, start=1):
+            for user_text, _reply in turns[:turn_number]:
+                rows = [
+                    m for m in history
+                    if m.get("role") == "user" and user_text in str(m.get("content"))
+                ]
+                assert len(rows) == 1, (
+                    f"after streamed turn {turn_number}, {user_text!r} stored "
+                    f"{len(rows)} times"
+                )
+        assert [len(h) for h in stored_histories] == [2, 4]
+
     @pytest.mark.asyncio
     async def test_previous_response_id_stores_compacted_transcript_as_authoritative(self, adapter):
         """After compression, previous_response_id must resume compacted history."""
@@ -2717,6 +3541,105 @@ class TestResponsesStreaming:
             assert get_resp.status == 200
             stored = await get_resp.json()
             assert stored["usage"] == usage
+
+    @pytest.mark.asyncio
+    async def test_stream_emits_compression_lifecycle_events(self, adapter):
+        """Compaction hooks surface as response.context_compression.* SSE events."""
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            async def _mock_run_agent(**kwargs):
+                compression_cb = kwargs.get("compression_event_callback")
+                delta_cb = kwargs.get("stream_delta_callback")
+                assert compression_cb is not None
+                compression_cb("context_compression_started", {
+                    "session_id": "sess-1",
+                    "pre_message_count": 42,
+                    "pre_tokens": 180000,
+                    "model": "gpt-5.6-sol",
+                    "focus_topic": None,
+                })
+                compression_cb("context_compression_completed", {
+                    "session_id": "sess-1",
+                    "pre_message_count": 42,
+                    "post_message_count": 11,
+                    "pre_tokens": 180000,
+                    "post_tokens": 60000,
+                    "quality_gate_passed": True,
+                })
+                if delta_cb:
+                    delta_cb("Continuing after compaction")
+                return (
+                    {"final_response": "Continuing after compaction", "messages": [], "api_calls": 1},
+                    {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
+                )
+
+            with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent):
+                resp = await cli.post(
+                    "/v1/responses",
+                    json={"model": "hermes-agent", "input": "hi", "stream": True},
+                )
+                assert resp.status == 200
+                body = await resp.text()
+
+            assert "event: response.context_compression.started" in body
+            assert "event: response.context_compression.completed" in body
+            events = _parse_sse_events(body)
+            started = next(
+                e for e in events
+                if e.get("type") == "response.context_compression.started"
+            )
+            assert started["pre_message_count"] == 42
+            assert started["pre_tokens"] == 180000
+            assert "sequence_number" in started
+            # Free-text hook fields never reach the client stream.
+            assert "model" not in started
+            assert "focus_topic" not in started
+            completed = next(
+                e for e in events
+                if e.get("type") == "response.context_compression.completed"
+            )
+            assert completed["post_message_count"] == 11
+            assert completed["post_tokens"] == 60000
+            assert completed["quality_gate_passed"] is True
+
+    @pytest.mark.asyncio
+    async def test_stream_compression_event_whitelist_and_unknown_phase(self, adapter):
+        """Aborted events drop raw error text; unknown phases are not emitted."""
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            async def _mock_run_agent(**kwargs):
+                compression_cb = kwargs.get("compression_event_callback")
+                compression_cb("context_compression_aborted", {
+                    "session_id": "sess-1",
+                    "pre_message_count": 40,
+                    "abort_reason": "provider exploded: secret-detail",
+                    "quality_gate_passed": False,
+                })
+                compression_cb("context_compression_bogus", {"pre_message_count": 1})
+                return (
+                    {"final_response": "ok", "messages": [], "api_calls": 1},
+                    {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                )
+
+            with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent):
+                resp = await cli.post(
+                    "/v1/responses",
+                    json={"model": "hermes-agent", "input": "hi", "stream": True},
+                )
+                assert resp.status == 200
+                body = await resp.text()
+
+            assert "event: response.context_compression.aborted" in body
+            assert "secret-detail" not in body
+            assert "context_compression.bogus" not in body
+            assert "context_compression_bogus" not in body
+            aborted = next(
+                e for e in _parse_sse_events(body)
+                if e.get("type") == "response.context_compression.aborted"
+            )
+            assert aborted["pre_message_count"] == 40
+            assert aborted["quality_gate_passed"] is False
+            assert "abort_reason" not in aborted
 
     @pytest.mark.asyncio
     async def test_stream_failed_preserves_usage_and_structured_error(self, adapter):
@@ -3226,6 +4149,842 @@ class TestGetResponse:
             assert data2["id"] == response_id
             assert data2["object"] == "response"
             assert data2["status"] == "completed"
+
+
+# ---------------------------------------------------------------------------
+# POST /v1/responses/{response_id}/cancel
+# ---------------------------------------------------------------------------
+
+
+class TestCancelResponse:
+    """Terminate an abandoned streaming response without destroying it.
+
+    A headless client that loses its SSE stream needs two things the pinned
+    gateway could not give it: the runtime to stop executing tools on its
+    behalf, and the stored envelope to survive so recovery and forensics can
+    still read what the run did.  DELETE only ever offered the second half
+    inverted — it removes exactly the record the client came back for.
+    """
+
+    @staticmethod
+    def _start_stream(adapter, *, agent_ref, stream_q, agent_task, response_id):
+        """Drive _write_sse_responses as a task, as _handle_responses does.
+
+        Returns the writer task, the StreamResponse patcher, and the list of
+        SSE payloads written so far — tests wait on an actual emitted event
+        rather than on a sleep, since the writer batches text deltas.
+        """
+        import gateway.platforms.api_server as api_mod
+
+        written: list[str] = []
+
+        class _FakeStreamResponse:
+            async def prepare(self, req):
+                pass
+
+            async def write(self, payload):
+                written.append(payload.decode() if isinstance(payload, bytes) else str(payload))
+
+        fake_request = MagicMock()
+        fake_request.headers = {}
+        agent_task.add_done_callback(lambda _fut: stream_q.put_nowait(None))
+        patcher = patch.object(
+            api_mod.web, "StreamResponse", return_value=_FakeStreamResponse()
+        )
+        patcher.start()
+        writer = asyncio.ensure_future(
+            adapter._write_sse_responses(
+                request=fake_request,
+                response_id=response_id,
+                model="hermes-agent",
+                created_at=int(time.time()),
+                stream_q=stream_q,
+                agent_task=agent_task,
+                agent_ref=agent_ref,
+                conversation_history=[],
+                user_message="long running turn",
+                instructions=None,
+                conversation=None,
+                store=True,
+                session_id=None,
+            )
+        )
+        return writer, patcher, written
+
+    @staticmethod
+    async def _await_event(written: list, event_type: str) -> None:
+        for _ in range(200):
+            await asyncio.sleep(0.01)
+            if any(event_type in payload for payload in written):
+                return
+        raise AssertionError(f"SSE event {event_type} never arrived")
+
+    @pytest.mark.asyncio
+    async def test_cancel_live_response_stops_agent_and_preserves_envelope(self, adapter):
+        """The acceptance case: a live turn is stopped, its record survives."""
+        import gateway.platforms.api_server as api_mod
+
+        agent = MagicMock()
+        agent_ref = [agent, None]
+        stream_q = api_mod.ThreadSafeAsyncQueue()
+
+        async def _agent_coro():
+            stream_q.put_nowait("partial answer")
+            await asyncio.sleep(30)
+            return ({}, {})
+
+        agent_task = asyncio.ensure_future(_agent_coro())
+        response_id = f"resp_{uuid.uuid4().hex[:28]}"
+        writer, patcher, written = self._start_stream(
+            adapter,
+            agent_ref=agent_ref,
+            stream_q=stream_q,
+            agent_task=agent_task,
+            response_id=response_id,
+        )
+        try:
+            app = _create_app(adapter)
+            async with TestClient(TestServer(app)) as cli:
+                await self._await_event(written, "response.output_text.delta")
+                assert adapter._response_store.get(response_id)["response"]["status"] == (
+                    "in_progress"
+                )
+
+                resp = await cli.post(f"/v1/responses/{response_id}/cancel")
+                assert resp.status == 200
+                body = await resp.json()
+                assert body["id"] == response_id
+                assert body["object"] == "response"
+                assert body["status"] == "cancelled"
+
+                # The agent loop was revoked, not merely detached from the stream.
+                agent.interrupt.assert_called_once()
+
+                with pytest.raises(asyncio.CancelledError):
+                    await writer
+
+                # GET still serves the envelope — this is what DELETE destroys.
+                stored_resp = await cli.get(f"/v1/responses/{response_id}")
+                assert stored_resp.status == 200
+                stored_body = await stored_resp.json()
+                assert stored_body["status"] == "cancelled"
+                output_text = "".join(
+                    part.get("text", "")
+                    for item in stored_body.get("output", [])
+                    if item.get("type") == "message"
+                    for part in item.get("content", [])
+                )
+                assert "partial answer" in output_text
+        finally:
+            patcher.stop()
+            adapter._inflight_responses.pop(response_id, None)
+
+    @pytest.mark.asyncio
+    async def test_cancelled_envelope_carries_usage_accrued_before_the_cancel(
+        self, adapter
+    ):
+        """An abandoned run's spend has to survive its cancellation.
+
+        The writer's ``usage`` is only filled in when the agent task returns,
+        so a cancel that beats the agent to the end published zeros — an
+        abandoned headless run that had already paid for completed turns
+        looked free to everything reading the envelope.
+        """
+        import gateway.platforms.api_server as api_mod
+
+        agent = _make_api_agent()
+        agent.session_prompt_tokens = 120
+        agent.session_completion_tokens = 45
+        agent.session_total_tokens = 165
+        agent.session_api_calls = 2
+        agent_ref = [agent, None]
+        stream_q = api_mod.ThreadSafeAsyncQueue()
+
+        async def _agent_coro():
+            stream_q.put_nowait("partial answer")
+            await asyncio.sleep(30)
+            return ({}, {})
+
+        agent_task = asyncio.ensure_future(_agent_coro())
+        response_id = f"resp_{uuid.uuid4().hex[:28]}"
+        writer, patcher, written = self._start_stream(
+            adapter,
+            agent_ref=agent_ref,
+            stream_q=stream_q,
+            agent_task=agent_task,
+            response_id=response_id,
+        )
+        try:
+            app = _create_app(adapter)
+            async with TestClient(TestServer(app)) as cli:
+                await self._await_event(written, "response.output_text.delta")
+
+                resp = await cli.post(f"/v1/responses/{response_id}/cancel")
+                assert resp.status == 200
+                usage = (await resp.json())["usage"]
+                assert usage["input_tokens"] == 120
+                assert usage["output_tokens"] == 45
+                assert usage["total_tokens"] == 165
+                # Turn-boundary counters are all that exist: tokens spent
+                # inside the request in flight at the interrupt are reported
+                # by nobody, so this is an honest undercount, not a total.
+                assert usage["completeness"] == "partial"
+                assert "run_interrupted_before_completion" in usage["warnings"]
+
+                with pytest.raises(asyncio.CancelledError):
+                    await writer
+
+                # The stored envelope is what run-cost accounting reads back.
+                stored_body = await (await cli.get(f"/v1/responses/{response_id}")).json()
+                assert stored_body["usage"]["total_tokens"] == 165
+        finally:
+            patcher.stop()
+            adapter._inflight_responses.pop(response_id, None)
+
+    def test_interrupted_usage_snapshot_skips_the_pricing_lookup(self, adapter):
+        """Cost resolution can block on a provider request.
+
+        Both interrupted-usage callers read the agent from the event loop
+        while its own thread is still running, so that snapshot must not reach
+        the pricing path — no envelope field is worth stalling the gateway
+        for. The ordinary end-of-run snapshot, taken on the executor thread,
+        still prices.
+        """
+        import gateway.platforms.api_server as api_mod
+
+        agent = _make_api_agent()
+        agent.model = "claude-opus-4"
+        agent.provider = "anthropic"
+        agent.base_url = ""
+
+        with patch("agent.usage_pricing.estimate_usage_cost") as priced:
+            snapshot = api_mod._interrupted_usage_snapshot(agent)
+        priced.assert_not_called()
+        assert snapshot["total_tokens"] == 3
+        assert "cost_usd" not in snapshot
+        assert "cost_status" not in snapshot
+
+        with patch("agent.usage_pricing.estimate_usage_cost") as priced:
+            api_mod._session_usage_snapshot(agent)
+        priced.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_incomplete_envelope_carries_usage_accrued_before_the_unwind(
+        self, adapter
+    ):
+        """The disconnect unwind had the identical zero-usage gap.
+
+        ``incomplete`` is the record a client that lost its stream comes back
+        to, so it has to account for the run the same way ``cancelled`` does.
+        """
+        import gateway.platforms.api_server as api_mod
+
+        class _DisconnectingStreamResponse:
+            async def prepare(self, req):
+                pass
+
+            async def write(self, payload):
+                raise ConnectionResetError("client went away")
+
+        agent = _make_api_agent()
+        agent.session_prompt_tokens = 90
+        agent.session_completion_tokens = 30
+        agent.session_total_tokens = 120
+        agent.session_api_calls = 1
+        agent_ref = [agent, None]
+        stream_q = ThreadSafeAsyncQueue()
+
+        async def _agent_coro():
+            await asyncio.sleep(30)
+            return ({}, {})
+
+        agent_task = asyncio.ensure_future(_agent_coro())
+        agent_task.add_done_callback(lambda _fut: stream_q.put_nowait(None))
+        response_id = f"resp_{uuid.uuid4().hex[:28]}"
+        fake_request = MagicMock()
+        fake_request.headers = {}
+
+        with patch.object(
+            api_mod.web, "StreamResponse", return_value=_DisconnectingStreamResponse()
+        ):
+            await adapter._write_sse_responses(
+                request=fake_request,
+                response_id=response_id,
+                model="hermes-agent",
+                created_at=int(time.time()),
+                stream_q=stream_q,
+                agent_task=agent_task,
+                agent_ref=agent_ref,
+                conversation_history=[],
+                user_message="long running turn",
+                instructions=None,
+                conversation=None,
+                store=True,
+                session_id="session-disconnect-usage",
+            )
+
+        stored = adapter._response_store.get(response_id)["response"]
+        assert stored["status"] == "incomplete"
+        assert stored["usage"]["input_tokens"] == 90
+        assert stored["usage"]["output_tokens"] == 30
+        assert stored["usage"]["total_tokens"] == 120
+        assert stored["usage"]["completeness"] == "partial"
+        assert "run_interrupted_before_completion" in stored["usage"]["warnings"]
+
+    @pytest.mark.asyncio
+    async def test_cancel_before_the_first_provider_response_reports_unavailable(
+        self, adapter
+    ):
+        """An unknown spend must not be published as a measured zero.
+
+        Cancelling during the very first provider request leaves nothing
+        committed, and a bare ``{0, 0, 0}`` carries no way to tell that apart
+        from a run that genuinely cost nothing — consumers read it as a
+        reading. The aggregate's own ``unavailable`` says which it is.
+        """
+        agent = _make_api_agent()
+        agent.session_prompt_tokens = 0
+        agent.session_completion_tokens = 0
+        agent.session_total_tokens = 0
+        agent.session_api_calls = 0
+        agent_ref = [agent, None]
+        stream_q = ThreadSafeAsyncQueue()
+
+        async def _agent_coro():
+            await asyncio.sleep(30)
+            return ({}, {})
+
+        agent_task = asyncio.ensure_future(_agent_coro())
+        response_id = f"resp_{uuid.uuid4().hex[:28]}"
+        writer, patcher, written = self._start_stream(
+            adapter,
+            agent_ref=agent_ref,
+            stream_q=stream_q,
+            agent_task=agent_task,
+            response_id=response_id,
+        )
+        try:
+            app = _create_app(adapter)
+            async with TestClient(TestServer(app)) as cli:
+                await self._await_event(written, "response.created")
+
+                resp = await cli.post(f"/v1/responses/{response_id}/cancel")
+                usage = (await resp.json())["usage"]
+                assert usage["total_tokens"] == 0
+                assert usage["completeness"] == "unavailable"
+                assert "no_provider_usage_reported" in usage["warnings"]
+                assert "run_interrupted_before_completion" in usage["warnings"]
+
+                with pytest.raises(asyncio.CancelledError):
+                    await writer
+        finally:
+            patcher.stop()
+            adapter._inflight_responses.pop(response_id, None)
+
+    @pytest.mark.asyncio
+    async def test_unwind_after_the_agent_finished_publishes_its_own_snapshot(
+        self, adapter
+    ):
+        """The agent can beat the writer to the end and still be unwound.
+
+        ``_run_agent`` drops its ``agent_ref`` on the executor thread before
+        the task resolves, so a disconnect during the final drain finds no
+        live agent to read while the finished task already holds a complete
+        snapshot. Falling back to zeros there discards a figure the gateway
+        genuinely has.
+        """
+        import gateway.platforms.api_server as api_mod
+
+        class _DropOnDeltaStreamResponse:
+            async def prepare(self, req):
+                pass
+
+            async def write(self, payload):
+                text = payload.decode() if isinstance(payload, bytes) else str(payload)
+                if "output_text.delta" in text:
+                    raise ConnectionResetError("client went away")
+
+        agent = _make_api_agent()
+        agent_ref = [agent, None]
+        stream_q = ThreadSafeAsyncQueue()
+
+        async def _agent_coro():
+            stream_q.put_nowait("partial answer")
+            # Mirrors _run_agent's executor finally: the ref is cleared before
+            # the future resolves.
+            agent_ref[0] = None
+            return (
+                {"final_response": "partial answer", "messages": [], "api_calls": 1},
+                {
+                    "input_tokens": 90,
+                    "output_tokens": 30,
+                    "total_tokens": 120,
+                    "scope": "run_aggregate",
+                    "completeness": "complete",
+                    "warnings": [],
+                },
+            )
+
+        agent_task = asyncio.ensure_future(_agent_coro())
+        agent_task.add_done_callback(lambda _fut: stream_q.put_nowait(None))
+        response_id = f"resp_{uuid.uuid4().hex[:28]}"
+        fake_request = MagicMock()
+        fake_request.headers = {}
+
+        with patch.object(
+            api_mod.web,
+            "StreamResponse",
+            return_value=_DropOnDeltaStreamResponse(),
+        ):
+            await adapter._write_sse_responses(
+                request=fake_request,
+                response_id=response_id,
+                model="hermes-agent",
+                created_at=int(time.time()),
+                stream_q=stream_q,
+                agent_task=agent_task,
+                agent_ref=agent_ref,
+                conversation_history=[],
+                user_message="long running turn",
+                instructions=None,
+                conversation=None,
+                store=True,
+                session_id="session-late-disconnect",
+            )
+
+        stored = adapter._response_store.get(response_id)["response"]
+        assert stored["status"] == "incomplete"
+        assert stored["usage"]["total_tokens"] == 120
+        # The run itself finished; only its delivery was abandoned, so the
+        # agent's own completeness stands rather than being downgraded.
+        assert stored["usage"]["completeness"] == "complete"
+        assert "run_interrupted_before_completion" not in stored["usage"]["warnings"]
+
+    @pytest.mark.asyncio
+    async def test_terminal_unstored_stream_reports_already_terminal(self, adapter):
+        """``store=false`` leaves no envelope to read terminality from.
+
+        The stored record is this route's usual witness, so a turn that had
+        already finished without one was answered 200 — reporting containment
+        of a run there was nothing left to contain. The in-flight entry knows
+        the turn is over even when nothing was written down.
+        """
+        import gateway.platforms.api_server as api_mod
+
+        release = asyncio.Event()
+        written: list[str] = []
+
+        class _ParkedStreamResponse:
+            """Holds the stream open on its terminal event.
+
+            The entry is unregistered the moment the writer returns, so the
+            window this asserts on only exists while the terminal write is
+            still in flight.
+            """
+
+            async def prepare(self, req):
+                pass
+
+            async def write(self, payload):
+                text = payload.decode() if isinstance(payload, bytes) else str(payload)
+                written.append(text)
+                if "response.completed" in text:
+                    await release.wait()
+
+        agent = MagicMock()
+        agent_ref = [agent, None]
+        stream_q = ThreadSafeAsyncQueue()
+
+        async def _agent_coro():
+            return (
+                {"final_response": "done", "messages": [], "api_calls": 1},
+                {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+            )
+
+        agent_task = asyncio.ensure_future(_agent_coro())
+        agent_task.add_done_callback(lambda _fut: stream_q.put_nowait(None))
+        response_id = f"resp_{uuid.uuid4().hex[:28]}"
+        fake_request = MagicMock()
+        fake_request.headers = {}
+
+        with patch.object(
+            api_mod.web, "StreamResponse", return_value=_ParkedStreamResponse()
+        ):
+            writer = asyncio.ensure_future(
+                adapter._write_sse_responses(
+                    request=fake_request,
+                    response_id=response_id,
+                    model="hermes-agent",
+                    created_at=int(time.time()),
+                    stream_q=stream_q,
+                    agent_task=agent_task,
+                    agent_ref=agent_ref,
+                    conversation_history=[],
+                    user_message="short turn",
+                    instructions=None,
+                    conversation=None,
+                    store=False,
+                    session_id=None,
+                )
+            )
+            try:
+                app = _create_app(adapter)
+                async with TestClient(TestServer(app)) as cli:
+                    await self._await_event(written, "response.completed")
+                    assert adapter._response_store.get(response_id) is None
+
+                    resp = await cli.post(f"/v1/responses/{response_id}/cancel")
+                    assert resp.status == 409
+                    assert (await resp.json())["error"]["code"] == (
+                        "response_already_terminal"
+                    )
+                    agent.interrupt.assert_not_called()
+            finally:
+                release.set()
+                await writer
+                adapter._inflight_responses.pop(response_id, None)
+
+    @pytest.mark.asyncio
+    async def test_repeat_cancel_reports_already_terminal(self, adapter):
+        """Idempotency: the second cancel is answered 409, not 200."""
+        agent = MagicMock()
+        agent_ref = [agent, None]
+        stream_q = ThreadSafeAsyncQueue()
+
+        async def _agent_coro():
+            await asyncio.sleep(30)
+            return ({}, {})
+
+        agent_task = asyncio.ensure_future(_agent_coro())
+        response_id = f"resp_{uuid.uuid4().hex[:28]}"
+        writer, patcher, written = self._start_stream(
+            adapter,
+            agent_ref=agent_ref,
+            stream_q=stream_q,
+            agent_task=agent_task,
+            response_id=response_id,
+        )
+        try:
+            app = _create_app(adapter)
+            async with TestClient(TestServer(app)) as cli:
+                await self._await_event(written, "response.created")
+
+                assert (await cli.post(f"/v1/responses/{response_id}/cancel")).status == 200
+                repeat = await cli.post(f"/v1/responses/{response_id}/cancel")
+                assert repeat.status == 409
+                assert (await repeat.json())["error"]["code"] == "response_already_terminal"
+
+                with pytest.raises(asyncio.CancelledError):
+                    await writer
+        finally:
+            patcher.stop()
+            adapter._inflight_responses.pop(response_id, None)
+
+    @pytest.mark.asyncio
+    async def test_cancel_completed_response_returns_409(self, adapter):
+        """A finished response cannot be cancelled, and says so distinguishably."""
+        mock_result = {"final_response": "Hello!", "messages": [], "api_calls": 1}
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (
+                    mock_result,
+                    {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                )
+                created = await cli.post(
+                    "/v1/responses", json={"model": "hermes-agent", "input": "Hi"}
+                )
+            response_id = (await created.json())["id"]
+
+            resp = await cli.post(f"/v1/responses/{response_id}/cancel")
+            assert resp.status == 409
+            body = await resp.json()
+            assert body["error"]["code"] == "response_already_terminal"
+
+            # 409 must not have mutated the record.
+            stored = await cli.get(f"/v1/responses/{response_id}")
+            assert (await stored.json())["status"] == "completed"
+
+    @pytest.mark.asyncio
+    async def test_cancel_incomplete_response_returns_409(self, adapter):
+        """A disconnect-detected turn is already contained; report that."""
+        response_id = "resp_incomplete"
+        adapter._response_store.put(
+            response_id,
+            {
+                "response": {
+                    "id": response_id,
+                    "object": "response",
+                    "status": "incomplete",
+                },
+                "conversation_history": [],
+                "instructions": None,
+                "session_id": None,
+            },
+        )
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(f"/v1/responses/{response_id}/cancel")
+            assert resp.status == 409
+
+    @pytest.mark.asyncio
+    async def test_cancel_unknown_id_returns_openai_error_body(self, adapter):
+        """404 must carry an OpenAI error body.
+
+        The agent-platform worker distinguishes "the gateway knows this route
+        and has never seen that id" from "this build has no cancel route" by
+        the presence of that body; a bare framework 404 reads as unsupported.
+        """
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post("/v1/responses/resp_nonexistent/cancel")
+            assert resp.status == 404
+            body = await resp.json()
+            assert isinstance(body.get("error"), dict)
+            assert body["error"]["code"] == "response_not_found"
+
+    @pytest.mark.asyncio
+    async def test_cancel_orphaned_in_progress_record_marks_it_terminal(self, adapter):
+        """A record this process holds no stream for still becomes terminal.
+
+        Left by a gateway that restarted mid-turn: the executor thread is
+        already gone, so flipping the shared record is complete containment.
+        """
+        response_id = "resp_orphan"
+        adapter._response_store.put(
+            response_id,
+            {
+                "response": {
+                    "id": response_id,
+                    "object": "response",
+                    "status": "in_progress",
+                    "output": [],
+                },
+                "conversation_history": [{"role": "user", "content": "hi"}],
+                "instructions": None,
+                "session_id": "sess-orphan",
+            },
+        )
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(f"/v1/responses/{response_id}/cancel")
+            assert resp.status == 200
+            assert (await resp.json())["status"] == "cancelled"
+
+        stored = adapter._response_store.get(response_id)
+        assert stored["response"]["status"] == "cancelled"
+        assert stored["conversation_history"] == [{"role": "user", "content": "hi"}]
+        assert stored["session_id"] == "sess-orphan"
+
+    @pytest.mark.asyncio
+    async def test_cancel_requires_auth(self, auth_adapter):
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post("/v1/responses/resp_any/cancel")
+            assert resp.status == 401
+
+    def test_cancel_route_is_registered(self, adapter):
+        assert (
+            "POST",
+            "/v1/responses/{response_id}/cancel",
+            adapter._handle_cancel_response,
+        ) in adapter._http_route_table()
+
+    def test_cancel_parks_interrupt_reason_before_the_agent_exists(self, adapter):
+        """The construction window must not swallow a cancel."""
+        agent_ref = [None, None]
+        entry = {"agent_ref": agent_ref, "task": None, "cancelled": False}
+
+        assert adapter._interrupt_inflight_response(entry, "resp_early") is False
+        assert agent_ref[1]
+
+    @pytest.mark.asyncio
+    async def test_parked_interrupt_fires_when_the_agent_appears(self, adapter):
+        """_run_agent honors the parked reason before running a single tool."""
+        mock_agent = _make_api_agent()
+        agent_ref = [None, "Cancelled via /v1/responses/{id}/cancel"]
+
+        with patch.object(adapter, "_create_agent", return_value=mock_agent):
+            await adapter._run_agent(
+                user_message="hello",
+                conversation_history=[],
+                session_id="session-parked-interrupt",
+                agent_ref=agent_ref,
+            )
+
+        mock_agent.interrupt.assert_called_once_with(
+            "Cancelled via /v1/responses/{id}/cancel"
+        )
+
+    @pytest.mark.asyncio
+    async def test_single_slot_agent_ref_is_untouched(self, adapter):
+        """Every other _run_agent caller passes [None]; leave them alone."""
+        mock_agent = _make_api_agent()
+        agent_ref = [None]
+
+        with patch.object(adapter, "_create_agent", return_value=mock_agent):
+            await adapter._run_agent(
+                user_message="hello",
+                conversation_history=[],
+                session_id="session-single-slot",
+                agent_ref=agent_ref,
+            )
+
+        mock_agent.interrupt.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_cancel_halts_tool_execution_on_the_executor_thread(self, adapter):
+        """The stop must reach the executor thread, not just the stream.
+
+        ``_run_agent`` runs the agent on a thread pool, so cancelling its
+        asyncio wrapper detaches the stream and leaves the tool loop running —
+        the exact orphan this route exists to end.  Drive the real executor
+        path with an agent that keeps calling tools until something interrupts
+        it, and assert the loop stops advancing once the HTTP cancel lands.
+        """
+        interrupted = threading.Event()
+        started = threading.Event()
+        tool_calls: list[int] = []
+
+        class _LoopingAgent:
+            """Calls a tool every tick until interrupted, like a real loop."""
+
+            session_prompt_tokens = 0
+            session_completion_tokens = 0
+            session_total_tokens = 0
+            session_id = "session-cancel-tools"
+            _session_messages: list = []
+
+            def interrupt(self, reason=None):
+                interrupted.set()
+
+            def run_conversation(self, **kwargs):
+                started.set()
+                deadline = time.monotonic() + 5
+                while not interrupted.is_set() and time.monotonic() < deadline:
+                    tool_calls.append(len(tool_calls))
+                    time.sleep(0.01)
+                return {"final_response": "", "messages": [], "api_calls": len(tool_calls)}
+
+            def shutdown_memory_provider(self):
+                pass
+
+            def close(self):
+                pass
+
+        agent_ref = [None, None]
+        stream_q = ThreadSafeAsyncQueue()
+        response_id = f"resp_{uuid.uuid4().hex[:28]}"
+
+        with patch.object(adapter, "_create_agent", return_value=_LoopingAgent()):
+            agent_task = asyncio.ensure_future(
+                adapter._run_agent(
+                    user_message="run tools until stopped",
+                    conversation_history=[],
+                    session_id="session-cancel-tools",
+                    agent_ref=agent_ref,
+                )
+            )
+            writer, patcher, written = self._start_stream(
+                adapter,
+                agent_ref=agent_ref,
+                stream_q=stream_q,
+                agent_task=agent_task,
+                response_id=response_id,
+            )
+            try:
+                app = _create_app(adapter)
+                async with TestClient(TestServer(app)) as cli:
+                    for _ in range(200):
+                        await asyncio.sleep(0.01)
+                        if started.is_set() and tool_calls:
+                            break
+                    assert tool_calls, "agent never reached its tool loop"
+
+                    resp = await cli.post(f"/v1/responses/{response_id}/cancel")
+                    assert resp.status == 200
+                    assert (await resp.json())["status"] == "cancelled"
+
+                    assert interrupted.wait(timeout=2), "interrupt never reached the thread"
+                    calls_at_cancel = len(tool_calls)
+                    # Long enough for ~25 more ticks had the loop survived.
+                    await asyncio.sleep(0.25)
+                    assert len(tool_calls) <= calls_at_cancel + 1
+
+                    with pytest.raises(asyncio.CancelledError):
+                        await writer
+            finally:
+                interrupted.set()
+                patcher.stop()
+                adapter._inflight_responses.pop(response_id, None)
+
+    @pytest.mark.asyncio
+    async def test_writer_crash_interrupts_agent_before_recording_incomplete(self, adapter):
+        """``incomplete`` is this route's already-terminal answer, so it must
+        never outlive a running agent.
+
+        The writer's generic-exception unwind (a failed SSE write that is not
+        an ``OSError``, a serialization bug) abandons the turn without the
+        client having disconnected — nothing else will stop the executor
+        thread afterwards.  Left uninterrupted, the record reads ``incomplete``
+        while tools keep running and a later cancel answers 409 for a run
+        nothing contained.
+        """
+        import gateway.platforms.api_server as api_mod
+
+        class _ExplodingStreamResponse:
+            async def prepare(self, req):
+                pass
+
+            async def write(self, payload):
+                raise RuntimeError("transport is closing")
+
+        agent = MagicMock()
+        agent_ref = [agent, None]
+        stream_q = ThreadSafeAsyncQueue()
+
+        async def _agent_coro():
+            await asyncio.sleep(30)
+            return ({}, {})
+
+        agent_task = asyncio.ensure_future(_agent_coro())
+        agent_task.add_done_callback(lambda _fut: stream_q.put_nowait(None))
+        response_id = f"resp_{uuid.uuid4().hex[:28]}"
+        fake_request = MagicMock()
+        fake_request.headers = {}
+
+        with patch.object(
+            api_mod.web, "StreamResponse", return_value=_ExplodingStreamResponse()
+        ):
+            await adapter._write_sse_responses(
+                request=fake_request,
+                response_id=response_id,
+                model="hermes-agent",
+                created_at=int(time.time()),
+                stream_q=stream_q,
+                agent_task=agent_task,
+                agent_ref=agent_ref,
+                conversation_history=[],
+                user_message="long running turn",
+                instructions=None,
+                conversation=None,
+                store=True,
+                session_id="session-writer-crash",
+            )
+
+        assert adapter._response_store.get(response_id)["response"]["status"] == "incomplete"
+        agent.interrupt.assert_called_once()
+        with pytest.raises(asyncio.CancelledError):
+            await agent_task
+        assert response_id not in adapter._inflight_responses
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(f"/v1/responses/{response_id}/cancel")
+            assert resp.status == 409
 
 
 # ---------------------------------------------------------------------------

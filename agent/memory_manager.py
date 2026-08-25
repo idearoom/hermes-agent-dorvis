@@ -381,6 +381,10 @@ class MemoryManager:
             raise ValueError("external_prefetch_timeout must be positive")
         self._external_prefetch_threads: Dict[str, threading.Thread] = {}
         self._external_prefetch_lock = threading.Lock()
+        # Per-memory structure behind the most recent prefetch_all(), keyed by
+        # nothing but recency: it is rebuilt every prefetch_all() call and read
+        # once by the turn prologue (AE-194). Observational only.
+        self._last_prefetch_memories: List[Dict[str, Any]] = []
         # Background executor for end-of-turn sync/prefetch. Lazily created on
         # first use so the common builtin-only path spawns no extra threads.
         # A single worker serializes a provider's writes (turn N must land
@@ -528,6 +532,7 @@ class MemoryManager:
         Returns merged context text labeled by provider. Empty providers
         are skipped. Failures in one provider don't block others.
         """
+        self._last_prefetch_memories = []
         clean_query = self._strip_skill_scaffolding(query)
         if not clean_query:
             return ""
@@ -537,12 +542,38 @@ class MemoryManager:
                 result = self._prefetch_provider(provider, clean_query, session_id=session_id)
                 if result and result.strip():
                     parts.append(result)
+                    self._last_prefetch_memories.extend(
+                        self._collect_prefetch_memories(provider)
+                    )
             except Exception as e:
                 logger.debug(
                     "Memory provider '%s' prefetch failed (non-fatal): %s",
                     provider.name, e,
                 )
         return "\n\n".join(parts)
+
+    @staticmethod
+    def _collect_prefetch_memories(provider: MemoryProvider) -> List[Dict[str, Any]]:
+        """Drain one provider's per-memory recall structure (AE-194).
+
+        Traceability only: a provider that cannot name its memories, or that
+        raises here, contributes nothing and never affects the injected text.
+        """
+        try:
+            records = provider.consume_prefetch_memories()
+        except Exception as exc:
+            logger.debug(
+                "Memory provider '%s' returned no recall structure: %s",
+                getattr(provider, "name", "?"), exc,
+            )
+            return []
+        if not isinstance(records, list):
+            return []
+        return [record for record in records if isinstance(record, dict)]
+
+    def last_prefetch_memories(self) -> List[Dict[str, Any]]:
+        """Per-memory structure behind the most recent ``prefetch_all``."""
+        return list(self._last_prefetch_memories)
 
     def _prefetch_provider(
         self, provider: MemoryProvider, query: str, *, session_id: str = ""

@@ -8,6 +8,7 @@ lives in ``test_session_store_pg.py`` (guarded by HERMES_STATE_TEST_DSN).
 
 import inspect
 import sqlite3
+import threading
 
 import pytest
 
@@ -148,6 +149,102 @@ def test_transaction_shim_emulates_sqlite_changes_for_v26_lineage_writes(
     result = conn.execute("SELECT changes()")
 
     assert result.fetchone()[0] == 7
+# ── Null-safe IS ? / IS NOT ? → IS [NOT] DISTINCT FROM %s ──────────────────
+
+
+def test_is_placeholder_becomes_is_not_distinct_from():
+    out = _translate_sql(
+        "SELECT 1 FROM messages WHERE content IS ?", with_params=True
+    )
+    assert out == "SELECT 1 FROM messages WHERE content IS NOT DISTINCT FROM %s"
+
+
+def test_multiple_is_placeholders_all_rewritten():
+    out = _translate_sql(
+        "DELETE FROM t WHERE type IS ? AND name IS ? AND rowid <> ?",
+        with_params=True,
+    )
+    assert out == (
+        "DELETE FROM t WHERE type IS NOT DISTINCT FROM %s "
+        "AND name IS NOT DISTINCT FROM %s AND rowid <> %s"
+    )
+
+
+def test_is_not_placeholder_becomes_is_distinct_from():
+    out = _translate_sql(
+        "SELECT 1 FROM messages WHERE content IS NOT ?", with_params=True
+    )
+    assert out == "SELECT 1 FROM messages WHERE content IS DISTINCT FROM %s"
+
+
+def test_is_null_and_is_not_null_untouched():
+    sql = "SELECT 1 FROM t WHERE a IS NULL AND b IS NOT NULL AND c IS ?"
+    out = _translate_sql(sql, with_params=True)
+    assert out == (
+        "SELECT 1 FROM t WHERE a IS NULL AND b IS NOT NULL "
+        "AND c IS NOT DISTINCT FROM %s"
+    )
+
+
+def test_is_placeholder_inside_literal_untouched():
+    sql = "SELECT 'x IS ?' AS note FROM t WHERE content IS ?"
+    out = _translate_sql(sql, with_params=True)
+    assert out == (
+        "SELECT 'x IS ?' AS note FROM t WHERE content IS NOT DISTINCT FROM %s"
+    )
+
+
+def test_is_placeholder_composes_with_like_and_qmark_rewrites():
+    sql = (
+        "SELECT 1 FROM t WHERE title LIKE ? AND content IS ? "
+        "AND note = 'a%' AND id = ?"
+    )
+    out = _translate_sql(sql, with_params=True)
+    assert out == (
+        "SELECT 1 FROM t WHERE title ILIKE %s "
+        "AND content IS NOT DISTINCT FROM %s "
+        "AND note = 'a%%' AND id = %s"
+    )
+
+
+def test_is_placeholder_untouched_without_params():
+    # Mirrors the ``?`` behavior: no params → psycopg does no format pass,
+    # and a bare ``?`` would not be a placeholder anyway.
+    sql = "SELECT 1 FROM t WHERE content IS ?"
+    assert _translate_sql(sql, with_params=False) == sql
+
+
+def test_identifier_ending_in_is_not_mangled():
+    out = _translate_sql(
+        "SELECT 1 FROM t WHERE analysis = ? AND thesis IS ?", with_params=True
+    )
+    assert out == (
+        "SELECT 1 FROM t WHERE analysis = %s AND thesis IS NOT DISTINCT FROM %s"
+    )
+
+
+def test_api_content_backfill_statement_translates_to_valid_pg():
+    # The exact statement ``SessionDB.set_latest_user_api_content`` executes
+    # (hermes_state.py). Before the IS-rewrite this translated to
+    # ``... AND content IS %s`` — a Postgres syntax error — which made the
+    # in-place compaction api_content backfill fail on every PG turn
+    # ("in-place compaction api_content backfill failed", agent/turn_context.py).
+    sqlite_sql = (
+        "UPDATE messages SET api_content = ? WHERE id = ("
+        "SELECT id FROM messages "
+        "WHERE session_id = ? AND role = 'user' AND active = 1 "
+        "ORDER BY id DESC LIMIT 1"
+        ") AND content IS ?"
+    )
+    out = _translate_sql(sqlite_sql, with_params=True)
+    assert out == (
+        "UPDATE messages SET api_content = %s WHERE id = ("
+        "SELECT id FROM messages "
+        "WHERE session_id = %s AND role = 'user' AND active = 1 "
+        "ORDER BY id DESC LIMIT 1"
+        ") AND content IS NOT DISTINCT FROM %s"
+    )
+    assert "IS %s" not in out
 
 
 # ── FTS5 → tsquery ─────────────────────────────────────────────────────────
@@ -860,6 +957,9 @@ def test_api_server_opens_the_default_profile_through_dispatch(monkeypatch):
     monkeypatch.setattr(hermes_state_pg, "PgSessionDB", _FakePg)
 
     server = APIServerAdapter.__new__(APIServerAdapter)
+    server._session_db_cache_lock = threading.Lock()
+    server._session_db_cache_closed = False
+    server._session_dbs = {}
     db = APIServerAdapter._open_and_cache_session_db(
         server, hermes_state.DEFAULT_DB_PATH.parent
     )

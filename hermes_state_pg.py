@@ -882,8 +882,10 @@ _JSON_SET_CHILD_RESET_RE = re.compile(
 )
 _INSERT_OR_IGNORE_RE = re.compile(r"^(\s*)INSERT\s+OR\s+IGNORE\s+INTO\b", re.IGNORECASE)
 _LIKE_RE = re.compile(r"\bLIKE\b")
-_IS_NOT_QMARK_RE = re.compile(r"\bIS\s+NOT\s+\?", re.IGNORECASE)
-_IS_QMARK_RE = re.compile(r"\bIS\s+\?", re.IGNORECASE)
+# SQLite's null-safe comparison against a bind parameter — ``col IS ?`` /
+# ``col IS NOT ?`` — has no direct Postgres spelling. Rewrite it only on the
+# parameterized execution path, before the generic qmark conversion.
+_IS_PARAM_RE = re.compile(r"\bIS\s+(NOT\s+)?\?", re.IGNORECASE)
 _INSERT_MESSAGES_RE = re.compile(r"^\s*INSERT\s+INTO\s+messages\s*\(", re.IGNORECASE)
 
 # ── Whole-statement overrides ──────────────────────────────────────────────
@@ -986,8 +988,9 @@ def _translate_sql(sql: str, *, with_params: bool) -> str:
     """Rewrite a SessionDB SQLite statement into its Postgres equivalent.
 
     Literal-aware: ``?``→``%s``, ``LIKE``→``ILIKE`` (SQLite LIKE is
-    ASCII-case-insensitive) and ``%``→``%%`` escaping only apply outside
-    single-quoted string literals; ``json_extract``/hex-literal/
+    ASCII-case-insensitive), null-safe ``IS ?``/``IS NOT ?`` →
+    ``IS [NOT] DISTINCT FROM %s`` and ``%``→``%%`` escaping only apply
+    outside single-quoted string literals; ``json_extract``/hex-literal/
     ``INSERT OR IGNORE`` rewrites run on the raw statement first because
     their patterns intentionally span literals.
     """
@@ -1033,14 +1036,19 @@ def _translate_sql(sql: str, *, with_params: bool) -> str:
             out.append(seg.replace("%", "%%") if with_params else seg)
             continue
         seg = _LIKE_RE.sub("ILIKE", seg)
-        # SQLite's ``expr IS ?`` / ``IS NOT ?`` are null-safe equality /
-        # inequality. PostgreSQL only accepts literal NULL/TRUE/FALSE after
-        # IS, so preserve the semantics with its null-safe operators before
-        # converting qmark placeholders.
-        seg = _IS_NOT_QMARK_RE.sub("IS DISTINCT FROM ?", seg)
-        seg = _IS_QMARK_RE.sub("IS NOT DISTINCT FROM ?", seg)
         if with_params:
-            seg = seg.replace("%", "%%").replace("?", "%s")
+            # Escape existing percents first so the placeholder emitted by the
+            # null-safe rewrite is not escaped a second time.
+            seg = seg.replace("%", "%%")
+            seg = _IS_PARAM_RE.sub(
+                lambda match: (
+                    "IS DISTINCT FROM %s"
+                    if match.group(1)
+                    else "IS NOT DISTINCT FROM %s"
+                ),
+                seg,
+            )
+            seg = seg.replace("?", "%s")
         out.append(seg)
     sql = "".join(out)
     if ignore:

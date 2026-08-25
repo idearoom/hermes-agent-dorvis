@@ -105,6 +105,7 @@ Endpoints:
 ```
 POST /v1/chat/completions        OpenAI Chat Completions (streaming via SSE)
 POST /v1/responses               OpenAI Responses API (stateful)
+POST /v1/responses/{id}/cancel   Stop an in-flight response, keeping its envelope
 POST /v1/runs                    Start a run, returns run_id (202)
 GET  /v1/runs/{id}               Run status
 GET  /v1/runs/{id}/events        SSE stream of lifecycle events

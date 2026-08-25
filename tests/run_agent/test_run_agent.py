@@ -3235,6 +3235,9 @@ class TestRunConversation:
         agent._memory_manager = MagicMock()
         agent._memory_manager.providers = [SimpleNamespace(name="hindsight")]
         agent._memory_manager.prefetch_all.return_value = "remembered fact"
+        agent._memory_manager.last_prefetch_memories.return_value = [
+            {"id": "fact-1", "text": "remembered fact", "score": None, "type": "world"}
+        ]
         resp = _mock_response(content="Final answer", finish_reason="stop")
         agent.client.chat.completions.create.return_value = resp
 
@@ -3260,6 +3263,116 @@ class TestRunConversation:
         assert payload["status"] == "injected"
         assert "remembered fact" in payload["injected_block"]
         assert payload["request_metadata"] == request_metadata
+        # AE-194: per-memory identity rides the same payload.
+        assert payload["memories"] == [
+            {"id": "fact-1", "text": "remembered fact", "score": None, "type": "world"}
+        ]
+        # ...and the same memories reach the terminal response metadata, which
+        # is the only structured channel the web app can read (the injected
+        # <memory-context> block stays scrubbed from streamed text).
+        recall = result["response_metadata"]["dorvis_memory_recall"]
+        assert recall["provider"] == "hindsight"
+        assert recall["status"] == "injected"
+        assert recall["count"] == 1
+        assert recall["memories"] == payload["memories"]
+        assert recall["injected_char_count"] == payload["injected_char_count"]
+
+    def test_memory_context_hook_survives_alternation_repair_compaction(self, agent):
+        """AE-196: repair shrinks ``messages`` between the prologue and the
+        api_messages build, so the current-turn index goes stale.
+
+        The history below is the exact shape api_server hands every follow-up
+        web turn: the prior user message appears twice (once clean, once with
+        the ``api_content`` sidecar), which the consecutive-user repair pass
+        merges away right before the request is built. With a stale index the
+        current-turn branch never matched, so the hook never fired and the
+        response metadata lost ``dorvis_memory_recall`` — while the model still
+        received the memories through the replayed sidecar.
+        """
+        self._setup_agent(agent)
+        agent._memory_manager = MagicMock()
+        agent._memory_manager.providers = [SimpleNamespace(name="hindsight")]
+        agent._memory_manager.prefetch_all.return_value = "remembered fact"
+        agent._memory_manager.last_prefetch_memories.return_value = [
+            {"id": "fact-1", "text": "remembered fact", "score": None, "type": "world"}
+        ]
+        history = [
+            {"role": "user", "content": "prior question"},
+            {
+                "role": "user",
+                "content": "prior question",
+                "api_content": "prior question\n\n<memory-context>\nold\n</memory-context>",
+            },
+            {"role": "assistant", "content": "prior answer"},
+        ]
+        resp = _mock_response(content="Final answer", finish_reason="stop")
+        agent.client.chat.completions.create.return_value = resp
+
+        hook_calls = []
+
+        def _record_hook(name, **kwargs):
+            hook_calls.append((name, kwargs))
+            return []
+
+        with (
+            patch("hermes_cli.plugins.invoke_hook", side_effect=_record_hook),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation(
+                "follow-up question", conversation_history=history
+            )
+
+        # The duplicated user row really was merged away this turn.
+        assert len(result["messages"]) < len(history) + 2
+
+        memory_calls = [kw for name, kw in hook_calls if name == "memory_context_injected"]
+        assert len(memory_calls) == 1
+        payload = memory_calls[0]
+        assert payload["status"] == "injected"
+        assert "remembered fact" in payload["injected_block"]
+        assert payload["memories"] == [
+            {"id": "fact-1", "text": "remembered fact", "score": None, "type": "world"}
+        ]
+        recall = result["response_metadata"]["dorvis_memory_recall"]
+        assert recall["count"] == 1
+        assert recall["memories"] == payload["memories"]
+
+        # The reported block is exactly what went on the wire for this turn.
+        sent = agent.client.chat.completions.create.call_args.kwargs["messages"]
+        current = [m for m in sent if m.get("role") == "user"][-1]
+        assert current["content"].startswith("follow-up question")
+        assert payload["injected_block"] in current["content"]
+
+    def test_memory_context_hook_reports_no_memories_when_recall_is_empty(self, agent):
+        self._setup_agent(agent)
+        agent._memory_manager = MagicMock()
+        agent._memory_manager.providers = [SimpleNamespace(name="hindsight")]
+        agent._memory_manager.prefetch_all.return_value = ""
+        agent._memory_manager.last_prefetch_memories.return_value = []
+        resp = _mock_response(content="Final answer", finish_reason="stop")
+        agent.client.chat.completions.create.return_value = resp
+
+        hook_calls = []
+
+        def _record_hook(name, **kwargs):
+            hook_calls.append((name, kwargs))
+            return []
+
+        with (
+            patch("hermes_cli.plugins.invoke_hook", side_effect=_record_hook),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("what do you remember?")
+
+        memory_calls = [kw for name, kw in hook_calls if name == "memory_context_injected"]
+        assert len(memory_calls) == 1
+        assert memory_calls[0]["status"] == "empty"
+        assert memory_calls[0]["memories"] == []
+        assert "dorvis_memory_recall" not in result.get("response_metadata", {})
 
     def test_terminal_task_closes_logical_calls_before_metrics_scope(self, agent):
         from agent import relay_runtime

@@ -647,6 +647,32 @@ def test_api_content_and_effect_disposition_round_trip(pg_db):
     assert msg.get("effect_disposition") == "none"
 
 
+def test_set_latest_user_api_content_backfills_on_pg(pg_db):
+    """The in-place compaction api_content backfill must work on Postgres.
+
+    Regression guard: ``set_latest_user_api_content`` uses SQLite's
+    null-safe ``content IS ?``; without the translator's
+    ``IS NOT DISTINCT FROM`` rewrite this raised a Postgres syntax error
+    on every call ("in-place compaction api_content backfill failed").
+    """
+    sid = pg_db.create_session("sess-backfill", "webui")
+    pg_db.append_message(sid, "user", "old turn")
+    pg_db.append_message(sid, "assistant", "reply")
+    pg_db.append_message(sid, "user", "turn text")
+
+    assert (
+        pg_db.set_latest_user_api_content(sid, "turn text", "turn text\n\nCTX")
+        == 1
+    )
+    msgs = pg_db.get_messages(sid)
+    assert msgs[-1]["api_content"] == "turn text\n\nCTX"
+    assert msgs[0].get("api_content") is None  # only the newest user row
+
+    # The defensive content guard still holds: mismatched content → 0 rows.
+    assert pg_db.set_latest_user_api_content(sid, "other text", "nope") == 0
+    assert pg_db.get_messages(sid)[-1]["api_content"] == "turn text\n\nCTX"
+
+
 # ── Env-var dispatch, end to end ───────────────────────────────────────────
 
 
