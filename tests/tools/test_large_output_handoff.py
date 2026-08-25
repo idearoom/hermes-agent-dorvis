@@ -1,7 +1,9 @@
+import getpass
 import json
-import os
 from pathlib import Path
 import tempfile
+
+import pytest
 
 import tools.large_output_handoff as large_output_handoff
 from tools.large_output_handoff import (
@@ -68,13 +70,23 @@ def test_maybe_transform_large_output_redacts_before_handoff(monkeypatch, tmp_pa
     assert "***" in persisted
 
 
+@pytest.mark.parametrize(
+    ("uid", "username", "expected_owner"),
+    [
+        (8675309, "ignored", "8675309"),
+        (None, r"DOMAIN\Test User", "DOMAIN-Test-User"),
+    ],
+)
 def test_write_large_output_handoff_falls_back_when_first_dir_is_unwritable(
     monkeypatch,
     tmp_path,
+    uid,
+    username,
+    expected_owner,
 ):
     primary = tmp_path / "primary"
     fallback_root = tmp_path / "tmp"
-    fallback_dir = fallback_root / f"hermes-large-outputs-{os.getuid()}"
+    fallback_dir = fallback_root / f"hermes-large-outputs-{expected_owner}"
     real_ensure = large_output_handoff._ensure_writable_dir
 
     def fail_primary_once(directory):
@@ -84,6 +96,16 @@ def test_write_large_output_handoff_falls_back_when_first_dir_is_unwritable(
 
     monkeypatch.setenv("HERMES_LARGE_OUTPUT_DIR", str(primary))
     monkeypatch.setattr(tempfile, "gettempdir", lambda: str(fallback_root))
+    if uid is None:
+        monkeypatch.delattr(large_output_handoff.os, "getuid", raising=False)
+    else:
+        monkeypatch.setattr(
+            large_output_handoff.os,
+            "getuid",
+            lambda: uid,
+            raising=False,
+        )
+    monkeypatch.setattr(getpass, "getuser", lambda: username)
     monkeypatch.setattr(
         large_output_handoff,
         "_ensure_writable_dir",

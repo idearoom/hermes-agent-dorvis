@@ -1452,7 +1452,14 @@ class TestCaptureAppFilterNoMatch:
              "structuredContent": None},
         ]
 
-        backend.capture(mode="ax")
+        # Exercise the Linux-only target-selection branch even when this
+        # portability suite is run on a macOS developer host.
+        with patch("tools.computer_use.cua_backend.sys.platform", "linux"), \
+             patch(
+                 "tools.computer_use.cua_backend._linux_x11_active_window_id",
+                 return_value=None,
+             ):
+            backend.capture(mode="ax")
 
         assert backend._active_pid == 200
         assert backend._active_window_id == 2
@@ -2391,8 +2398,15 @@ class TestCapturePayloadBudget:
         cap = CaptureResult(mode="som", width=1024, height=768,
                             png_b64="iVBORw0KGgo=", elements=elements,
                             app="X", window_title="t", png_bytes_len=10)
-        with patch("model_tools._run_async",
-                   return_value=json.dumps({"analysis": "a screen"})):
+        def _run_async_stub(coro):
+            # _route_capture_through_aux_vision correctly constructs the
+            # vision coroutine before handing it to model_tools._run_async.
+            # This synchronous test double must consume it too; otherwise the
+            # test itself leaks an unawaited coroutine at garbage collection.
+            coro.close()
+            return json.dumps({"analysis": "a screen"})
+
+        with patch("model_tools._run_async", side_effect=_run_async_stub):
             out = cu_tool._route_capture_through_aux_vision(
                 cap, "summary",
                 visible_elements=elements[:5], truncated_elements=45,

@@ -87,9 +87,10 @@ class TestLastReferenceMetricsAccessor:
 
         client.last_reference_metrics()
 
-        usage, cost = client.consume_reference_usage()
+        usage, cost, warnings = client.consume_reference_usage()
         assert usage.input_tokens == 5
         assert cost == 0.05
+        assert warnings == ()
 
 
 class TestConversationLoopHelper:

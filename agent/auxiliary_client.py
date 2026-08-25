@@ -3472,6 +3472,7 @@ def _relay_sync_stream(
         base_url=str(getattr(client, "base_url", "") or ""),
         api_mode=api_mode,
         request=kwargs,
+        completed_response_predicate=lambda value: hasattr(value, "choices"),
     )
 _RUNTIME_MAIN_COMPAT_SNAPSHOT: Tuple[Any, ...] = ("", "", "", "", "", "")
 _RUNTIME_MAIN_COMPAT_LOCK = threading.Lock()

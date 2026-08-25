@@ -8,6 +8,7 @@ and return a small JSON reference that callers can parse deterministically.
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import getpass
 import hashlib
 import json
 import os
@@ -103,7 +104,10 @@ def write_large_output_handoff(
 def _handoff_dir() -> Path:
     explicit = os.getenv("HERMES_LARGE_OUTPUT_DIR")
     candidates = [Path(explicit)] if explicit else [Path(DEFAULT_HANDOFF_DIR)]
-    candidates.append(Path(tempfile.gettempdir()) / f"hermes-large-outputs-{os.getuid()}")
+    candidates.append(
+        Path(tempfile.gettempdir())
+        / f"hermes-large-outputs-{_temporary_handoff_owner()}"
+    )
 
     errors: list[str] = []
     seen: set[str] = set()
@@ -122,6 +126,14 @@ def _handoff_dir() -> Path:
         "No writable Hermes large-output handoff directory; tried "
         + "; ".join(errors)
     )
+
+
+def _temporary_handoff_owner() -> str:
+    """Return a filesystem-safe per-user key on POSIX and Windows."""
+    getuid = getattr(os, "getuid", None)
+    if callable(getuid):
+        return str(getuid())
+    return _safe_component(getpass.getuser())
 
 
 def _safe_component(value: str) -> str:

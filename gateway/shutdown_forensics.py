@@ -220,10 +220,10 @@ def spawn_async_diagnostic(
     except OSError:
         return None
 
-    # Inline shell so we don't have to ship a helper script.  bash -c is
-    # available on every POSIX target we support; on Windows we just skip
-    # the snapshot (the platform doesn't ship ps anyway).
-    if sys.platform == "win32":
+    # This diagnostic intentionally uses Linux process-forensics primitives:
+    # GNU timeout/ps flags, pstree, /proc, and dmesg. Other supported hosts
+    # keep the fast synchronous snapshot and skip this optional subprocess.
+    if not sys.platform.startswith("linux"):
         return None
 
     script = (

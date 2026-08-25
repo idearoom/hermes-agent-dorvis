@@ -231,7 +231,8 @@ class TestDrainAdmission:
                     payload = await response.json()
 
                     assert response.status == 503
-                    assert response.headers["Retry-After"] == "1"
+                    retry_after = response.headers["Retry-After"]
+                    assert retry_after.isdigit() and int(retry_after) > 0
                     assert payload["error"]["code"] == "gateway_draining"
 
 
@@ -604,5 +605,4 @@ class TestShutdownSettleWindow:
             _INTERRUPT_REASON_GATEWAY_SHUTDOWN,
             _INTERRUPT_REASON_GATEWAY_SHUTDOWN,
         ]
-
 

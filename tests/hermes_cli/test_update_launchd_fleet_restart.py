@@ -214,6 +214,15 @@ class TestGetServicePidsScoping:
             gw, "_locate_launchd_gateway_service", lambda label: located[label]
         )
 
+        def fake_launchctl_run(cmd, **_kwargs):
+            # _get_service_pids(all_profiles=True) supplements derived labels
+            # with a prefix scan. Keep this unit fixture off the host's real
+            # launchd fleet while still exercising the empty-scan behavior.
+            assert cmd == ["launchctl", "list"]
+            return _completed(0, "")
+
+        monkeypatch.setattr(gw.subprocess, "run", fake_launchctl_run)
+
     def test_all_profiles_returns_every_gateway_service_pid(self, monkeypatch):
         """The update sweep's exclude-set must protect ALL freshly-restarted
         services, not only the invoking profile's (else the sweep SIGTERMs

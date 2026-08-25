@@ -247,7 +247,7 @@ def test_failed_compaction_preserves_reported_usage_as_captured(monkeypatch):
         TurnResult(
             error="compact failed",
             token_usage_last={
-                "inputTokens": 5,
+                "inputTokens": 8,
                 "cachedInputTokens": 3,
                 "outputTokens": 2,
                 "reasoningOutputTokens": 1,

@@ -316,8 +316,8 @@ class TestSecurityInvariantsAcrossModes(unittest.TestCase):
     def test_api_keys_scrubbed_in_strict_mode(self):
         code = (
             "import os\n"
-            "print('KEY=' + os.environ.get('OPENAI_API_KEY', 'MISSING'))\n"
-            "print('TOK=' + os.environ.get('ANTHROPIC_API_KEY', 'MISSING'))\n"
+            "print('OPENAI_PRESENT=' + str('OPENAI_API_KEY' in os.environ))\n"
+            "print('ANTHROPIC_PRESENT=' + str('ANTHROPIC_API_KEY' in os.environ))\n"
         )
         with patch.dict(os.environ, {
             "OPENAI_API_KEY": "sk-should-not-leak",
@@ -325,8 +325,11 @@ class TestSecurityInvariantsAcrossModes(unittest.TestCase):
         }):
             result = self._run(code, mode="strict")
         self.assertEqual(result["status"], "success")
-        self.assertIn("KEY=MISSING", result["output"])
-        self.assertIn("TOK=MISSING", result["output"])
+        # Labels ending in KEY/TOKEN are intentionally output-redacted, even
+        # when their value is an innocent MISSING sentinel. Assert presence
+        # booleans so the child-process check remains unambiguous.
+        self.assertIn("OPENAI_PRESENT=False", result["output"])
+        self.assertIn("ANTHROPIC_PRESENT=False", result["output"])
         self.assertNotIn("sk-should-not-leak", result["output"])
         self.assertNotIn("ant-should-not-leak", result["output"])
 
@@ -334,9 +337,9 @@ class TestSecurityInvariantsAcrossModes(unittest.TestCase):
         """CRITICAL: the project-mode default does NOT leak user credentials."""
         code = (
             "import os\n"
-            "print('KEY=' + os.environ.get('OPENAI_API_KEY', 'MISSING'))\n"
-            "print('TOK=' + os.environ.get('ANTHROPIC_API_KEY', 'MISSING'))\n"
-            "print('SEC=' + os.environ.get('GITHUB_TOKEN', 'MISSING'))\n"
+            "print('OPENAI_PRESENT=' + str('OPENAI_API_KEY' in os.environ))\n"
+            "print('ANTHROPIC_PRESENT=' + str('ANTHROPIC_API_KEY' in os.environ))\n"
+            "print('GITHUB_PRESENT=' + str('GITHUB_TOKEN' in os.environ))\n"
         )
         with patch.dict(os.environ, {
             "OPENAI_API_KEY": "sk-should-not-leak",
@@ -345,7 +348,11 @@ class TestSecurityInvariantsAcrossModes(unittest.TestCase):
         }):
             result = self._run(code, mode="project")
         self.assertEqual(result["status"], "success")
-        for needle in ("KEY=MISSING", "TOK=MISSING", "SEC=MISSING"):
+        for needle in (
+            "OPENAI_PRESENT=False",
+            "ANTHROPIC_PRESENT=False",
+            "GITHUB_PRESENT=False",
+        ):
             self.assertIn(needle, result["output"])
         for leaked in ("sk-should-not-leak", "ant-should-not-leak", "ghp-should-not-leak"):
             self.assertNotIn(leaked, result["output"])

@@ -108,9 +108,13 @@ def _record_codex_app_server_usage(agent, turn) -> dict[str, Any]:
     inputTokens, cachedInputTokens, outputTokens, reasoningOutputTokens,
     totalTokens.
 
-    Hermes' canonical prompt bucket includes uncached input + cached input.
-    The Codex app-server protocol does not currently expose cache-write tokens,
-    so that bucket remains zero on this runtime.
+    Codex follows the Responses API contract: ``inputTokens`` already includes
+    cached input, ``cachedInputTokens`` is a subset, and ``outputTokens``
+    already includes reasoning output. Hermes stores the disjoint canonical
+    buckets, so those subsets must be removed from their parent bucket rather
+    than added to prompt/completion/total a second time. Newer app-server builds
+    may also expose ``cacheWriteInputTokens``; older builds simply leave it at
+    zero.
 
     Even when Codex omits usage for a turn, Hermes should still count that turn
     as one API call for session/status accounting.
@@ -160,16 +164,29 @@ def _record_codex_app_server_usage(agent, turn) -> dict[str, Any]:
     from agent.runtime_usage import validate_primary_usage_components
     validate_primary_usage_components(agent, usage)
 
-    input_tokens = _coerce_usage_int(usage.get("inputTokens"))
+    input_total = _coerce_usage_int(usage.get("inputTokens"))
     cache_read_tokens = _coerce_usage_int(usage.get("cachedInputTokens"))
+    cache_write_tokens = _coerce_usage_int(usage.get("cacheWriteInputTokens"))
     output_tokens = _coerce_usage_int(usage.get("outputTokens"))
     reasoning_tokens = _coerce_usage_int(usage.get("reasoningOutputTokens"))
+
+    if cache_read_tokens + cache_write_tokens > input_total:
+        # Keep exact top-level input/total accounting and fail conservatively
+        # for pricing when a malformed provider breakdown claims more cached
+        # tokens than exist in the prompt. The raw dictionary remains attached
+        # to CanonicalUsage for diagnostics, and validation above marks the run
+        # partial via cache_tokens_exceed_input_tokens.
+        input_tokens = input_total
+        cache_read_tokens = 0
+        cache_write_tokens = 0
+    else:
+        input_tokens = input_total - cache_read_tokens - cache_write_tokens
 
     canonical_usage = CanonicalUsage(
         input_tokens=input_tokens,
         output_tokens=output_tokens,
         cache_read_tokens=cache_read_tokens,
-        cache_write_tokens=0,
+        cache_write_tokens=cache_write_tokens,
         reasoning_tokens=reasoning_tokens,
         raw_usage=usage,
     )

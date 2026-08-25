@@ -274,6 +274,11 @@ def _make_monitor_job(hermes_env, script_body: str):
         schedule="every 5m",
         monitor_script="mon.sh",
         deliver="local",
+        # Inference routing is outside these monitor-gate tests. Pin both axes
+        # so the provider/model drift guard cannot couple them to the host's
+        # ambient config before _install_agent_stubs installs the fake runtime.
+        provider="test",
+        model="test-model",
     )
 
 
