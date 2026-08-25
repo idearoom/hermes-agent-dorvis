@@ -2,7 +2,6 @@
 
 import os
 import struct
-import tempfile
 import time
 import wave
 from pathlib import Path
@@ -121,44 +120,39 @@ def fake_clock(monkeypatch):
 # detect_audio_environment — WSL / SSH / Docker detection
 # ============================================================================
 
+@pytest.mark.linux_only
 class TestPulseSocketReachable:
-    def test_stale_socket_file_not_reachable(self, monkeypatch):
+    def test_stale_socket_file_not_reachable(self, monkeypatch, tmp_path):
         """A socket file with no listener should not count as reachable."""
         import socket as _socket
-        # Darwin's sockaddr_un limit is only 104 bytes; pytest's descriptive
-        # tmp_path routinely exceeds it before /pulse/native is appended.
-        with tempfile.TemporaryDirectory(prefix="hvp-", dir="/tmp") as short_dir:
-            runtime_dir = Path(short_dir)
-            sock_path = runtime_dir / "pulse" / "native"
-            sock_path.parent.mkdir(parents=True)
-            # Create + bind, then close so the path is a stale socket file.
-            s = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
-            s.bind(str(sock_path))
-            s.close()
-            monkeypatch.delenv("PULSE_SERVER", raising=False)
-            monkeypatch.delenv("PULSE_RUNTIME_PATH", raising=False)
-            monkeypatch.setenv("XDG_RUNTIME_DIR", str(runtime_dir))
-            from tools.voice_mode import _pulse_socket_reachable
-            assert _pulse_socket_reachable() is False
+        sock_path = tmp_path / "pulse" / "native"
+        sock_path.parent.mkdir(parents=True)
+        # Create + bind, then close so the path is a stale socket file.
+        s = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+        s.bind(str(sock_path))
+        s.close()
+        monkeypatch.delenv("PULSE_SERVER", raising=False)
+        monkeypatch.delenv("PULSE_RUNTIME_PATH", raising=False)
+        monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+        from tools.voice_mode import _pulse_socket_reachable
+        assert _pulse_socket_reachable() is False
 
-    def test_listening_socket_reachable_via_xdg_runtime(self, monkeypatch):
+    def test_listening_socket_reachable_via_xdg_runtime(self, monkeypatch, tmp_path):
         """A live PulseAudio-style socket under XDG_RUNTIME_DIR is reachable (#35622)."""
         import socket as _socket
-        with tempfile.TemporaryDirectory(prefix="hvp-", dir="/tmp") as short_dir:
-            runtime_dir = Path(short_dir)
-            sock_path = runtime_dir / "pulse" / "native"
-            sock_path.parent.mkdir(parents=True)
-            server = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
-            server.bind(str(sock_path))
-            server.listen(1)
-            try:
-                monkeypatch.delenv("PULSE_SERVER", raising=False)
-                monkeypatch.delenv("PULSE_RUNTIME_PATH", raising=False)
-                monkeypatch.setenv("XDG_RUNTIME_DIR", str(runtime_dir))
-                from tools.voice_mode import _pulse_socket_reachable
-                assert _pulse_socket_reachable() is True
-            finally:
-                server.close()
+        sock_path = tmp_path / "pulse" / "native"
+        sock_path.parent.mkdir(parents=True)
+        server = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+        server.bind(str(sock_path))
+        server.listen(1)
+        try:
+            monkeypatch.delenv("PULSE_SERVER", raising=False)
+            monkeypatch.delenv("PULSE_RUNTIME_PATH", raising=False)
+            monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+            from tools.voice_mode import _pulse_socket_reachable
+            assert _pulse_socket_reachable() is True
+        finally:
+            server.close()
 
 class TestDetectAudioEnvironment:
     def test_clean_environment_is_available(self, monkeypatch):
@@ -216,7 +210,10 @@ class TestDetectAudioEnvironment:
                             lambda: (MagicMock(), MagicMock()))
 
         proc_version = tmp_path / "proc_version"
-        proc_version.write_text("Linux 5.15.0-microsoft-standard-WSL2")
+        proc_version.write_text(
+            "Linux 5.15.0-microsoft-standard-WSL2",
+            encoding="utf-8",
+        )
 
         _real_open = open
         def _fake_open(f, *a, **kw):
@@ -1398,6 +1395,7 @@ class TestWSL2PowerShellFallback:
             return next(it)
         return _side_effect
 
+    @pytest.mark.linux_only
     def test_powershell_pipeline_preserves_real_exit_status(self, sample_wav):
         """Regression (review of #63768): the shell pipeline must preserve
         the (ffmpeg && powershell) exit status past the unconditional
@@ -1421,7 +1419,6 @@ class TestWSL2PowerShellFallback:
             return m
 
         with patch("tools.voice_mode._is_wsl2_env", return_value=True), \
-             patch("tools.voice_mode.platform.system", return_value="Linux"), \
              patch("tools.voice_mode._import_audio", side_effect=ImportError), \
              patch("tools.voice_mode.shutil.which",
                    side_effect=lambda x: f"/bin/{x}" if x in ("powershell.exe", "ffmpeg", "ffplay", "sh") else (x if x.startswith("/") else None)), \
@@ -1448,6 +1445,7 @@ class TestWSL2PowerShellFallback:
             "Shell pipeline must preserve the real exit status past cleanup: " + sh_script
         )
 
+    @pytest.mark.linux_only
     def test_wsl2_unique_temp_filename(self, monkeypatch, tmp_path, sample_wav):
         """Two concurrent calls must use different temp WAV filenames."""
         from unittest.mock import patch, MagicMock
@@ -1475,8 +1473,7 @@ class TestWSL2PowerShellFallback:
                 return io.StringIO("Linux Microsoft WSL2")
             return real_open(path, *args, **kwargs)
 
-        with patch("tools.voice_mode.platform.system", return_value="Linux"), \
-             patch("builtins.open", side_effect=_fake_open), \
+        with patch("builtins.open", side_effect=_fake_open), \
              patch("tools.voice_mode.shutil.which", side_effect=lambda x: f"/bin/{x}" if x in ("powershell.exe", "ffmpeg", "ffplay") else None), \
              patch("tools.voice_mode.subprocess.check_output", side_effect=_capture_check_output), \
              patch("tools.voice_mode.subprocess.Popen", return_value=MagicMock(returncode=0, wait=lambda **k: 0)), \
