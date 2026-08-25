@@ -14,7 +14,9 @@ Covers the three seams the integration relies on:
 import json
 import os
 import stat
+import subprocess
 import time
+from pathlib import Path
 
 import pytest
 
@@ -22,11 +24,21 @@ import tools.browser_use_cli as bu_cli
 
 
 @pytest.fixture(autouse=True)
-def _clean_env(monkeypatch):
+def _clean_env(monkeypatch, tmp_path):
     monkeypatch.delenv("BU_NAME", raising=False)
     monkeypatch.delenv("BU_AUTOSPAWN", raising=False)
     monkeypatch.delenv("BROWSER_USE_API_KEY", raising=False)
+    harness_runtime = tmp_path / "browser-harness-runtime"
+    monkeypatch.setattr(
+        bu_cli, "_browser_harness_runtime_dir", lambda env=None: harness_runtime
+    )
     yield
+    # Browser Harness daemons are process-global. Unit fakes do not create a
+    # real daemon to stop, so clear only the in-memory ownership ledger between
+    # examples; lifecycle behavior itself is covered through the public cleanup
+    # seam below.
+    with bu_cli._daemon_registry_lock:
+        bu_cli._daemon_names_by_task.clear()
 
 
 def _fake_cli(tmp_path, body):
@@ -397,8 +409,8 @@ class TestBackendCdpResolution:
 
     def test_named_session_composes_with_provider_backend(self, tmp_path, monkeypatch):
         """session=<name> composes with a configured provider backend: the
-        name keys its OWN provider browser (bu-named-<name>), so concurrent
-        named sessions never share one browser (#86894)."""
+        trusted task namespace keys its OWN provider browser, so unrelated
+        tasks can never collide even when their friendly names match."""
         import tools.browser_tool as bt
 
         seen = []
@@ -414,9 +426,11 @@ class TestBackendCdpResolution:
         monkeypatch.setattr(bu_cli, "_find_cli", lambda: [cli])
         result = json.loads(bu_cli.browser_exec("print(1)", session="r7k2"))
         assert result["success"] is True
-        assert seen == ["bu-named-r7k2"]
-        assert "bu:r7k2" in result["output"]
-        assert "ws:wss://browser.example/cdp/bu-named-r7k2" in result["output"]
+        assert len(seen) == 1
+        assert seen[0].startswith("bu-named-hermes-")
+        daemon_name = seen[0].removeprefix("bu-named-")
+        assert f"bu:{daemon_name}" in result["output"]
+        assert f"ws:wss://browser.example/cdp/{seen[0]}" in result["output"]
 
     def test_named_session_key_stable_across_tasks(self, monkeypatch):
         """The same session name maps to the same provider cache key no
@@ -487,10 +501,10 @@ class TestOwnTabPreamble:
         # model code still present, after the preamble
         assert result["output"].index("_hermes_ensure_own_tab") < result["output"].index("print('payload')")
 
-    def test_unnamed_session_gets_no_preamble(self, tmp_path, monkeypatch):
+    def test_automatic_task_session_gets_own_tab_preamble(self, tmp_path, monkeypatch):
         result = self._run(tmp_path, monkeypatch, session="")
         assert result["success"] is True
-        assert "_hermes_ensure_own_tab" not in result["output"]
+        assert "_hermes_ensure_own_tab" in result["output"]
 
     def test_named_provider_browser_skips_preamble(self, tmp_path, monkeypatch):
         """Per-name provider browsers are private — preamble would leak a tab."""
@@ -800,17 +814,47 @@ class TestBrowserExec:
     def test_code_piped_on_stdin(self, tmp_path, monkeypatch):
         cli = _fake_cli(tmp_path, 'code=$(cat)\necho "got:$code"\n')
         monkeypatch.setattr(bu_cli, "_find_cli", lambda: [cli])
-        result = json.loads(bu_cli.browser_exec('print("hi")'))
+        result = json.loads(bu_cli.browser_exec('print("hi")', task_id="task-a"))
         assert result["success"] is True
         assert result["exit_code"] == 0
-        assert 'got:print("hi")' in result["output"]
+        assert 'print("hi")' in result["output"]
         assert "session" not in result
 
-    def test_session_sets_bu_name(self, tmp_path, monkeypatch):
+    def test_task_identity_sets_stable_private_daemon_name(self, tmp_path, monkeypatch):
         cli = _fake_cli(tmp_path, 'cat > /dev/null\necho "bu:$BU_NAME"\n')
         monkeypatch.setattr(bu_cli, "_find_cli", lambda: [cli])
-        result = json.loads(bu_cli.browser_exec("print(1)", session="r7k2"))
-        assert "bu:r7k2" in result["output"]
+        first = json.loads(bu_cli.browser_exec("print(1)", task_id="task-a"))
+        second = json.loads(bu_cli.browser_exec("print(2)", task_id="task-a"))
+        other = json.loads(bu_cli.browser_exec("print(3)", task_id="task-b"))
+
+        first_name = first["output"].strip().removeprefix("bu:")
+        second_name = second["output"].strip().removeprefix("bu:")
+        other_name = other["output"].strip().removeprefix("bu:")
+        assert first_name.startswith("hermes-")
+        assert first_name == second_name
+        assert first_name != other_name
+
+    def test_friendly_session_name_is_namespaced_by_task(self, tmp_path, monkeypatch):
+        cli = _fake_cli(tmp_path, 'cat > /dev/null\necho "bu:$BU_NAME"\n')
+        monkeypatch.setattr(bu_cli, "_find_cli", lambda: [cli])
+        first = json.loads(
+            bu_cli.browser_exec("print(1)", session="research", task_id="task-a")
+        )
+        other = json.loads(
+            bu_cli.browser_exec("print(2)", session="research", task_id="task-b")
+        )
+        assert first["output"] != other["output"]
+        assert first["session"] == "research"
+        assert other["session"] == "research"
+
+    def test_session_sets_namespaced_bu_name(self, tmp_path, monkeypatch):
+        cli = _fake_cli(tmp_path, 'cat > /dev/null\necho "bu:$BU_NAME"\n')
+        monkeypatch.setattr(bu_cli, "_find_cli", lambda: [cli])
+        result = json.loads(
+            bu_cli.browser_exec("print(1)", session="r7k2", task_id="task-a")
+        )
+        assert "bu:hermes-" in result["output"]
+        assert "bu:r7k2" not in result["output"]
         assert result["session"] == "r7k2"
 
     def test_invalid_session_name_rejected(self, monkeypatch, tmp_path):
@@ -834,6 +878,211 @@ class TestBrowserExec:
         monkeypatch.setattr(bu_cli, "_MIN_TIMEOUT_S", 1)
         result = json.loads(bu_cli.browser_exec("print(1)", timeout_s=1))
         assert "timed out" in result["error"]
+
+    def test_large_stdout_is_handed_off_to_the_task_workspace(
+        self, tmp_path, monkeypatch
+    ):
+        cli = _fake_cli(
+            tmp_path,
+            'cat > /dev/null\n'
+            'python3 -c "print(\'x\' * 25000)"\n',
+        )
+        monkeypatch.setattr(bu_cli, "_find_cli", lambda: [cli])
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        monkeypatch.setattr(bu_cli, "_workspace_dir", lambda task_id: str(workspace))
+
+        result = json.loads(bu_cli.browser_exec("print(1)", task_id="large-output"))
+
+        assert result["success"] is True
+        assert len(result["output"].encode("utf-8")) <= bu_cli._STDOUT_PREVIEW_BYTES
+        output_path = result["output_path"]
+        assert output_path.startswith(str(workspace))
+        assert len(Path(output_path).read_text(encoding="utf-8").strip()) == 25000
+        assert "saved" in result["output"].lower()
+
+    def test_stdout_capture_discards_bytes_beyond_hard_file_cap(
+        self, tmp_path, monkeypatch
+    ):
+        cli = _fake_cli(
+            tmp_path,
+            'cat > /dev/null\npython3 -c "print(\'x\' * 25000)"\n',
+        )
+        monkeypatch.setattr(bu_cli, "_find_cli", lambda: [cli])
+        monkeypatch.setattr(bu_cli, "_STDOUT_FILE_CAP_BYTES", 10_000)
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        monkeypatch.setattr(bu_cli, "_workspace_dir", lambda task_id: str(workspace))
+
+        result = json.loads(bu_cli.browser_exec("print(1)", task_id="hard-cap"))
+
+        assert result["success"] is True
+        assert Path(result["output_path"]).stat().st_size == 10_000
+        assert "truncated" in result["output"].lower()
+
+
+class TestBrowserExecCleanup:
+    def test_orphan_reaper_stops_only_daemons_whose_owner_process_died(
+        self, tmp_path, monkeypatch
+    ):
+        alive_name = "hermes-alive"
+        dead_name = "hermes-dead"
+        monkeypatch.setattr(
+            bu_cli, "_browser_harness_runtime_dir", lambda env=None: tmp_path
+        )
+        bu_cli._write_daemon_owner_marker({}, alive_name, owner_pid=os.getpid())
+        bu_cli._write_daemon_owner_marker({}, dead_name, owner_pid=999_999_999)
+        stopped = []
+        monkeypatch.setattr(
+            bu_cli,
+            "_stop_browser_exec_daemon",
+            lambda name: stopped.append(name) or True,
+        )
+
+        bu_cli.reap_orphaned_browser_exec_daemons()
+
+        assert stopped == [dead_name]
+
+    def test_cleanup_racing_first_start_is_retried_after_exec(
+        self, monkeypatch
+    ):
+        """A turn cleanup can land after ownership registration but before
+        Browser Harness has created its daemon. The completed exec must notice
+        that ownership was withdrawn and issue a second, idempotent reload so
+        a daemon that started late cannot be stranded.
+        """
+        calls = []
+
+        def fake_reload(cmd, **kwargs):
+            daemon_name = kwargs["env"]["BU_NAME"]
+            calls.append(("reload", daemon_name))
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        def fake_exec(cmd, code, stdout, stderr, **kwargs):
+            daemon_name = kwargs["env"]["BU_NAME"]
+            calls.append(("run", daemon_name))
+            bu_cli.cleanup_browser_exec("racing-task")
+            stdout.write(b"ok\n")
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        monkeypatch.setattr(bu_cli, "_find_cli", lambda: ["/fake/browser-use"])
+        monkeypatch.setattr(bu_cli.subprocess, "run", fake_reload)
+        monkeypatch.setattr(bu_cli, "_run_browser_cli", fake_exec)
+
+        result = json.loads(
+            bu_cli.browser_exec("print(1)", task_id="racing-task")
+        )
+
+        assert result["success"] is True
+        daemon_name = next(name for kind, name in calls if kind == "run")
+        assert calls.count(("reload", daemon_name)) == 2
+
+    def test_failed_post_race_cleanup_remains_owned_for_shutdown_retry(
+        self, monkeypatch
+    ):
+        reloads = 0
+
+        def fake_reload(cmd, **kwargs):
+            nonlocal reloads
+            reloads += 1
+            return subprocess.CompletedProcess(cmd, 0 if reloads == 1 else 7, "", "")
+
+        def fake_exec(cmd, code, stdout, stderr, **kwargs):
+            bu_cli.cleanup_browser_exec("racing-retry")
+            stdout.write(b"ok\n")
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        monkeypatch.setattr(bu_cli, "_find_cli", lambda: ["/fake/browser-use"])
+        monkeypatch.setattr(bu_cli.subprocess, "run", fake_reload)
+        monkeypatch.setattr(bu_cli, "_run_browser_cli", fake_exec)
+
+        json.loads(bu_cli.browser_exec("print(1)", task_id="racing-retry"))
+
+        daemon_name = bu_cli._daemon_name("racing-retry")
+        with bu_cli._daemon_registry_lock:
+            assert daemon_name in bu_cli._daemon_names_by_task["racing-retry"]
+
+    def test_one_task_cannot_exhaust_browserless_with_named_sessions(
+        self, tmp_path, monkeypatch
+    ):
+        cli = _fake_cli(tmp_path, "cat > /dev/null\n")
+        monkeypatch.setattr(bu_cli, "_find_cli", lambda: [cli])
+
+        for index in range(bu_cli._MAX_DAEMONS_PER_TASK):
+            result = json.loads(
+                bu_cli.browser_exec(
+                    "print(1)", session=f"session-{index}", task_id="bounded-task"
+                )
+            )
+            assert result["success"] is True
+
+        refused = json.loads(
+            bu_cli.browser_exec(
+                "print(1)", session="one-too-many", task_id="bounded-task"
+            )
+        )
+        assert "session limit" in refused["error"].lower()
+
+    def test_task_cleanup_stops_every_daemon_owned_by_that_task(
+        self, tmp_path, monkeypatch
+    ):
+        log = tmp_path / "calls.log"
+        cli = _fake_cli(
+            tmp_path,
+            'if [ "${1:-}" = "--reload" ]; then '
+            'echo "reload:$BU_NAME" >> "$CALL_LOG"; exit 0; fi\n'
+            'cat > /dev/null\n'
+            'echo "run:$BU_NAME" >> "$CALL_LOG"\n',
+        )
+        monkeypatch.setattr(bu_cli, "_find_cli", lambda: [cli])
+        monkeypatch.setattr(
+            bu_cli,
+            "_base_subprocess_env",
+            lambda: {"PATH": os.environ.get("PATH", ""), "CALL_LOG": str(log)},
+        )
+
+        json.loads(bu_cli.browser_exec("print(1)", task_id="task-a"))
+        json.loads(
+            bu_cli.browser_exec("print(2)", session="parallel", task_id="task-a")
+        )
+        json.loads(bu_cli.browser_exec("print(3)", task_id="task-b"))
+        bu_cli.cleanup_browser_exec("task-a")
+
+        lines = log.read_text(encoding="utf-8").splitlines()
+        task_a_runs = {line.removeprefix("run:") for line in lines[:2]}
+        reloaded = {
+            line.removeprefix("reload:")
+            for line in lines
+            if line.startswith("reload:")
+        }
+        assert reloaded == task_a_runs
+        assert len(reloaded) == 2
+
+    def test_standard_browser_cleanup_delegates_to_browser_exec(self, monkeypatch):
+        import tools.browser_tool as browser_tool
+
+        cleaned = []
+        monkeypatch.setattr(
+            bu_cli, "cleanup_browser_exec", lambda task_id: cleaned.append(task_id)
+        )
+        browser_tool.cleanup_browser("task-a")
+        assert cleaned == ["task-a"]
+
+    def test_failed_cleanup_remains_owned_for_shutdown_retry(
+        self, tmp_path, monkeypatch
+    ):
+        cli = _fake_cli(
+            tmp_path,
+            'if [ "${1:-}" = "--reload" ]; then exit 7; fi\n'
+            'cat > /dev/null\n',
+        )
+        monkeypatch.setattr(bu_cli, "_find_cli", lambda: [cli])
+        json.loads(bu_cli.browser_exec("print(1)", task_id="retry-cleanup"))
+
+        bu_cli.cleanup_browser_exec("retry-cleanup")
+
+        with bu_cli._daemon_registry_lock:
+            assert bu_cli._daemon_names_by_task["retry-cleanup"]
 
 
 class TestFindCliManagedBin:

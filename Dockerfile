@@ -267,6 +267,23 @@ RUN touch ./README.md
 RUN uv sync --frozen --no-install-project --extra all --extra messaging --extra otlp --extra anthropic --extra bedrock --extra azure-identity --extra hindsight --extra matrix && \
     uv pip check --python /opt/hermes/.venv/bin/python
 
+# ---------- Browser CLI engine ----------
+# Hermes' browser_exec integration invokes the Browser Use stdin protocol,
+# whose implementation lives in the much smaller browser-harness package.
+# Install that engine directly (12 packages rather than browser-use's full
+# agent SDK dependency tree), constrain it to the reviewed pre-1.0 window,
+# and use lowest-direct resolution so this image selects the reviewed floor.
+# The executable and its venv live in the immutable image rather than
+# HERMES_HOME's /opt/data volume.
+ARG BROWSER_HARNESS_VERSION=0.1.9
+ENV UV_TOOL_DIR=/opt/hermes/.uv-tools
+ENV UV_TOOL_BIN_DIR=/opt/hermes/bin
+RUN mkdir -p "${UV_TOOL_BIN_DIR}" && \
+    uv tool install --python /usr/bin/python3 --resolution lowest-direct \
+        "browser-harness>=${BROWSER_HARNESS_VERSION},<0.3" && \
+    ln -sf /opt/hermes/bin/browser-harness /opt/hermes/bin/browser-use && \
+    /opt/hermes/bin/browser-use --version | grep -Fx "${BROWSER_HARNESS_VERSION}"
+
 # ---------- Frontend build (cached independently from Python source) ----------
 # Copy only the frontend source trees first so that Python-only changes don't
 # invalidate the (relatively slow) web + ui-tui build layer.

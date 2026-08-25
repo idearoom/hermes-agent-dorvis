@@ -1784,6 +1784,20 @@ def _emergency_cleanup_all_sessions():
                 _session_last_activity.clear()
                 _recording_sessions.clear()
 
+    # Browser Harness daemons are tracked independently from the built-in
+    # agent-browser session map. Always sweep them on process exit, including a
+    # process that used only browser_exec and therefore has no _active_sessions.
+    try:
+        from tools.browser_use_cli import (
+            cleanup_all_browser_exec,
+            reap_orphaned_browser_exec_daemons,
+        )
+
+        cleanup_all_browser_exec()
+        reap_orphaned_browser_exec_daemons()
+    except Exception as e:
+        logger.debug("Browser Harness exit cleanup failed: %s", e, exc_info=True)
+
     # Sweep orphans from other crashed hermes processes.  Safe even if we
     # never used the browser — uses owner_pid liveness to avoid reaping
     # daemons owned by other live hermes processes.
@@ -2143,8 +2157,11 @@ def _browser_cleanup_thread_worker():
         if cycle % reap_every_cycles == 0:
             try:
                 _reap_orphaned_browser_sessions()
+                from tools.browser_use_cli import reap_orphaned_browser_exec_daemons
+
+                reap_orphaned_browser_exec_daemons()
             except Exception as e:
-                logger.warning("Orphan reap error: %s", e)
+                logger.warning("Orphan reap error: %s", e, exc_info=True)
         cycle += 1
 
         try:
@@ -4948,6 +4965,22 @@ def cleanup_browser(task_id: Optional[str] = None) -> None:
     if task_id is None:
         task_id = "default"
 
+    # Browser Use mode owns a separate, process-global Browser Harness daemon
+    # per trusted task identity. It is not represented in _active_sessions, so
+    # close it explicitly through the same public cleanup boundary used for
+    # agent-browser and provider sessions.
+    try:
+        from tools.browser_use_cli import cleanup_browser_exec
+
+        cleanup_browser_exec(task_id)
+    except Exception as exc:
+        logger.warning(
+            "Browser Harness cleanup failed for task %s: %s",
+            task_id,
+            exc,
+            exc_info=True,
+        )
+
     # Expand to the full set of session keys to reap. For a bare task_id
     # that includes the cloud/primary key + the local sidecar if one exists.
     if _is_local_sidecar_key(task_id):
@@ -5073,6 +5106,13 @@ def cleanup_all_browsers() -> None:
         task_ids = list(_active_sessions.keys())
     for task_id in task_ids:
         cleanup_browser(task_id)
+
+    try:
+        from tools.browser_use_cli import cleanup_all_browser_exec
+
+        cleanup_all_browser_exec()
+    except Exception as exc:
+        logger.warning("Browser Harness global cleanup failed: %s", exc, exc_info=True)
 
     # Tear down CDP supervisors for all tasks so background threads exit.
     try:

@@ -4,15 +4,21 @@ When browser.backend is "browser-use", the model gets ``browser_exec`` tool
 instead of default browser tools
 """
 
+import hashlib
 import json
 import logging
 import os
 import re
 import shutil
 import subprocess
+import tempfile
+import threading
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+
+import psutil
 
 from utils import is_truthy_value
 
@@ -75,10 +81,139 @@ del _hermes_ensure_own_tab
 _DEFAULT_TIMEOUT_S = 300
 _MIN_TIMEOUT_S = 5
 _MAX_TIMEOUT_S = 1800
-_STDERR_CAP_CHARS = 4000
+_STDERR_PREVIEW_BYTES = 4000
+_STDOUT_PREVIEW_BYTES = 20_000
+_STDOUT_TAIL_SCAN_BYTES = 4096
+_STDOUT_FILE_CAP_BYTES = 10 * 1024 * 1024
+_STDERR_FILE_CAP_BYTES = 64 * 1024
+_MAX_DAEMONS_PER_TASK = 4
 
 # Filesystem-safe task ids for per-task workspace dirs.
 _TASK_ID_SAFE_RE = re.compile(r"[^A-Za-z0-9._-]+")
+
+# Browser Harness daemon ownership is runtime-derived, never model-derived.
+# ``BU_NAME`` selects a process-global IPC socket, so forwarding the friendly
+# ``session`` argument verbatim would let two unrelated gateway tasks attach to
+# the same daemon. Keep the user-facing name for ergonomics, but hash it with
+# trusted task identity before it reaches the subprocess.
+_daemon_registry_lock = threading.RLock()
+_daemon_names_by_task: Dict[str, set[str]] = {}
+_OWNER_MARKER_SUFFIX = ".hermes-owner.json"
+_DAEMON_NAME_RE = re.compile(r"\Ahermes-[A-Za-z0-9_-]{1,56}\Z")
+
+
+class _BoundedSubprocessCapture:
+    """Drain one child stream without allowing memory or disk growth."""
+
+    def __init__(self, *, preview_bytes: int, tail_bytes: int, file_cap_bytes: int):
+        self.preview_bytes = preview_bytes
+        self.tail_bytes = tail_bytes
+        self.file_cap_bytes = file_cap_bytes
+        self.total_bytes = 0
+        self.persisted_bytes = 0
+        self.preview = bytearray()
+        self.tail = bytearray()
+        self._reader_fd, self._writer_fd = os.pipe()
+        self._temp = tempfile.NamedTemporaryFile(
+            prefix="hermes-browser-exec-", delete=False
+        )
+        self.path = self._temp.name
+        self._finished = False
+        self._thread = threading.Thread(target=self._drain, daemon=True)
+        self._thread.start()
+
+    def fileno(self) -> int:
+        return self._writer_fd
+
+    def write(self, data: bytes) -> int:
+        """Support unit fakes that write to subprocess stdout directly."""
+        if isinstance(data, str):
+            data = data.encode()
+        return os.write(self._writer_fd, data)
+
+    def _drain(self) -> None:
+        try:
+            with os.fdopen(self._reader_fd, "rb", closefd=True) as stream:
+                while True:
+                    chunk = stream.read(64 * 1024)
+                    if not chunk:
+                        break
+                    self.total_bytes += len(chunk)
+                    if len(self.preview) < self.preview_bytes:
+                        remaining = self.preview_bytes - len(self.preview)
+                        self.preview.extend(chunk[:remaining])
+                    if self.tail_bytes:
+                        self.tail.extend(chunk)
+                        if len(self.tail) > self.tail_bytes:
+                            del self.tail[:-self.tail_bytes]
+                    if self.persisted_bytes < self.file_cap_bytes:
+                        remaining = self.file_cap_bytes - self.persisted_bytes
+                        persisted = chunk[:remaining]
+                        self._temp.write(persisted)
+                        self.persisted_bytes += len(persisted)
+        finally:
+            self._temp.flush()
+            self._temp.close()
+
+    def finish(self) -> None:
+        if self._finished:
+            return
+        self._finished = True
+        try:
+            os.close(self._writer_fd)
+        except OSError:
+            pass
+        self._thread.join()
+
+    def discard(self) -> None:
+        self.finish()
+        try:
+            os.unlink(self.path)
+        except OSError:
+            pass
+
+
+def _bounded_preview_with_note(preview: bytes, note: str, limit_bytes: int) -> str:
+    note_bytes = note.encode("utf-8")
+    prefix = preview[: max(0, limit_bytes - len(note_bytes))]
+    return prefix.decode("utf-8", errors="ignore") + note
+
+
+def _run_browser_cli(
+    cmd: List[str],
+    code: str,
+    stdout_capture: _BoundedSubprocessCapture,
+    stderr_capture: _BoundedSubprocessCapture,
+    *,
+    timeout: int,
+    env: dict,
+    popen_extra: dict,
+) -> subprocess.CompletedProcess:
+    spawn_extra = dict(popen_extra)
+    if os.name != "nt":
+        spawn_extra["start_new_session"] = True
+    proc = subprocess.Popen(
+        cmd,
+        stdin=subprocess.PIPE,
+        stdout=stdout_capture,
+        stderr=stderr_capture,
+        text=True,
+        env=env,
+        **spawn_extra,
+    )
+    try:
+        proc.communicate(input=code, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            parent = psutil.Process(proc.pid)
+            for child in parent.children(recursive=True):
+                child.kill()
+            parent.kill()
+        except (OSError, psutil.Error):
+            proc.kill()
+        proc.wait()
+        raise
+    return subprocess.CompletedProcess(cmd, proc.returncode)
 
 # Screenshot paths printed by capture_screenshot() in the exec output.
 # Two alternatives: POSIX absolute (/tmp/shot.png) and Windows drive-letter
@@ -398,6 +533,192 @@ def _workspace_dir(task_id: Optional[str]) -> Optional[str]:
         return None
 
 
+def _task_key(task_id: Optional[str]) -> str:
+    return str(task_id or "default")
+
+
+def _process_start_time(pid: int) -> Optional[float]:
+    try:
+        return float(psutil.Process(pid).create_time())
+    except (OSError, psutil.Error):
+        return None
+
+
+def _browser_harness_runtime_dir(env: Optional[dict] = None) -> Path:
+    source = env or os.environ
+    explicit = source.get("BH_RUNTIME_DIR") or source.get("BH_TMP_DIR")
+    if explicit:
+        return Path(explicit).expanduser().resolve()
+    harness_home = source.get("BH_HOME") or source.get("BROWSER_HARNESS_HOME")
+    if harness_home:
+        return Path(harness_home).expanduser().resolve() / "runtime"
+    xdg_home = source.get("XDG_CONFIG_HOME")
+    if xdg_home:
+        return Path(xdg_home).expanduser().resolve() / "browser-harness" / "runtime"
+    home = Path(source.get("HOME") or Path.home()).expanduser().resolve()
+    return home / ".config" / "browser-harness" / "runtime"
+
+
+def _owner_marker_path(env: dict, daemon_name: str) -> Path:
+    return _browser_harness_runtime_dir(env) / f"bu-{daemon_name}{_OWNER_MARKER_SUFFIX}"
+
+
+def _write_daemon_owner_marker(
+    env: dict, daemon_name: str, *, owner_pid: Optional[int] = None
+) -> None:
+    owner_pid = os.getpid() if owner_pid is None else owner_pid
+    marker = _owner_marker_path(env, daemon_name)
+    try:
+        marker.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        temporary = marker.with_name(f".{marker.name}.{os.getpid()}.tmp")
+        temporary.write_text(
+            json.dumps(
+                {"owner_pid": owner_pid, "owner_started": _process_start_time(owner_pid)}
+            ),
+            encoding="utf-8",
+        )
+        temporary.replace(marker)
+    except OSError as exc:
+        logger.warning("Could not record Browser Harness ownership: %s", exc)
+
+
+def _remove_daemon_owner_marker(env: dict, daemon_name: str) -> None:
+    try:
+        _owner_marker_path(env, daemon_name).unlink(missing_ok=True)
+    except OSError as exc:
+        logger.debug("Could not remove Browser Harness ownership marker: %s", exc)
+
+
+def _daemon_name(task_id: Optional[str], session_name: str = "") -> str:
+    """Return a stable, opaque Browser Harness daemon name for one task.
+
+    The same task + friendly session pair intentionally reuses a daemon across
+    calls. Different tasks can never collide even when the model supplies the
+    same friendly name. The digest also avoids exposing chat/session IDs in
+    process listings, socket filenames, and CLI output.
+    """
+    owner = f"{os.getpid()}:{_process_start_time(os.getpid()) or 0}"
+    material = f"{owner}\0{_task_key(task_id)}\0{session_name or 'default'}".encode()
+    return f"hermes-{hashlib.sha256(material).hexdigest()[:32]}"
+
+
+def _register_daemon(task_id: Optional[str], daemon_name: str) -> bool:
+    with _daemon_registry_lock:
+        daemon_names = _daemon_names_by_task.setdefault(_task_key(task_id), set())
+        if daemon_name not in daemon_names and len(daemon_names) >= _MAX_DAEMONS_PER_TASK:
+            return False
+        daemon_names.add(daemon_name)
+        return True
+
+
+def _unregister_daemon(task_id: Optional[str], daemon_name: str) -> None:
+    task_key = _task_key(task_id)
+    with _daemon_registry_lock:
+        daemon_names = _daemon_names_by_task.get(task_key)
+        if not daemon_names:
+            return
+        daemon_names.discard(daemon_name)
+        if not daemon_names:
+            _daemon_names_by_task.pop(task_key, None)
+
+
+def _daemon_is_owned(task_id: Optional[str], daemon_name: str) -> bool:
+    with _daemon_registry_lock:
+        return daemon_name in _daemon_names_by_task.get(_task_key(task_id), set())
+
+
+def _stop_browser_exec_daemon(daemon_name: str) -> bool:
+    """Ask Browser Harness to close one verified, namespaced daemon."""
+    cmd = _find_cli()
+    if not cmd:
+        logger.warning(
+            "Cannot stop Browser Harness daemon %s: CLI is unavailable",
+            daemon_name,
+        )
+        return False
+    env = _base_subprocess_env()
+    env["BU_NAME"] = daemon_name
+    try:
+        proc = subprocess.run(
+            [*cmd, "--reload"],
+            capture_output=True,
+            text=True,
+            timeout=20,
+            env=env,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        logger.warning("Browser Harness cleanup failed for %s: %s", daemon_name, exc)
+        return False
+    if proc.returncode != 0:
+        logger.warning(
+            "Browser Harness cleanup failed for %s (exit %s): %s",
+            daemon_name,
+            proc.returncode,
+            (proc.stderr or proc.stdout or "").strip()[:1000],
+        )
+        return False
+    _remove_daemon_owner_marker(env, daemon_name)
+    return True
+
+
+def reap_orphaned_browser_exec_daemons(env: Optional[dict] = None) -> None:
+    """Stop Browser Harness daemons whose owning Hermes process disappeared."""
+    env = env or _base_subprocess_env()
+    runtime_dir = _browser_harness_runtime_dir(env)
+    try:
+        markers = sorted(runtime_dir.glob(f"bu-hermes-*{_OWNER_MARKER_SUFFIX}"))
+    except OSError:
+        return
+    for marker in markers:
+        daemon_name = marker.name.removeprefix("bu-").removesuffix(
+            _OWNER_MARKER_SUFFIX
+        )
+        if not _DAEMON_NAME_RE.match(daemon_name):
+            continue
+        try:
+            owner = json.loads(marker.read_text(encoding="utf-8"))
+            owner_pid = int(owner["owner_pid"])
+            recorded_start = owner.get("owner_started")
+        except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
+            continue
+        try:
+            from gateway.status import _pid_exists
+
+            alive = _pid_exists(owner_pid)
+        except Exception:
+            alive = False
+        if alive and recorded_start is not None:
+            current_start = _process_start_time(owner_pid)
+            alive = current_start is not None and abs(current_start - float(recorded_start)) < 0.01
+        if alive:
+            continue
+        if _stop_browser_exec_daemon(daemon_name):
+            try:
+                marker.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def cleanup_browser_exec(task_id: Optional[str] = None) -> None:
+    """Stop every Browser Harness daemon owned by one trusted task."""
+    task_key = _task_key(task_id)
+    with _daemon_registry_lock:
+        daemon_names = sorted(_daemon_names_by_task.pop(task_key, set()))
+    failed = {name for name in daemon_names if not _stop_browser_exec_daemon(name)}
+    if failed:
+        # Preserve failed ownership so process-shutdown cleanup can retry.
+        with _daemon_registry_lock:
+            _daemon_names_by_task.setdefault(task_key, set()).update(failed)
+
+
+def cleanup_all_browser_exec() -> None:
+    """Stop all Browser Harness daemons created by this Hermes process."""
+    with _daemon_registry_lock:
+        task_ids = list(_daemon_names_by_task)
+    for task_id in task_ids:
+        cleanup_browser_exec(task_id)
+
+
 def _find_screenshot(stdout: str, since: float) -> Optional[str]:
     """Return the last screenshot path printed during this exec, or None.
 
@@ -466,11 +787,10 @@ def _resolve_backend_cdp(
     4. Nothing configured: return None; the harness attaches to local
        Chrome (or Browser Use cloud via BU_AUTOSPAWN for legacy configs).
 
-    ``session_name`` (the tool's ``session`` argument / BU_NAME) keys the
-    provider session cache when set, so every distinct name gets its OWN
-    cloud browser and the same name reuses one — that is what makes named
-    sessions actually concurrent-safe on provider backends instead of all
-    names sharing a single per-task browser.
+    ``session_name`` is the trusted task-scoped daemon identity derived from
+    the tool's friendly ``session`` argument. It keys the provider cache so
+    every distinct session gets its own browser without allowing gateway tasks
+    that chose the same friendly name to collide.
 
     Returns an error string on provider failure, None on success.
     """
@@ -572,13 +892,21 @@ def browser_exec(
         )
 
     env = _base_subprocess_env()
+    reap_orphaned_browser_exec_daemons(env)
     if session:
         if not _SESSION_RE.match(session):
             return tool_error(
                 f"Invalid session name {session!r}: use 1-64 letters, digits, "
                 "dashes, or underscores (e.g. 'r7k2')."
             )
-        env["BU_NAME"] = session
+    daemon_name = _daemon_name(task_id, session)
+    env["BU_NAME"] = daemon_name
+    if not _register_daemon(task_id, daemon_name):
+        return tool_error(
+            f"Browser session limit reached for this task ({_MAX_DAEMONS_PER_TASK}). "
+            "Reuse an existing session name instead of creating another browser."
+        )
+    _write_daemon_owner_marker(env, daemon_name)
     # Route through the configured browser backend (Browserbase, Firecrawl,
     # Nous gateway, CDP override, local Chrome, …). Named sessions compose
     # with the backend: BU_NAME namespaces the harness daemon (its IPC
@@ -587,8 +915,10 @@ def browser_exec(
     # each other's daemon (#86894). Browser Use direct-API cloud configs
     # are the one exception: the CLI manages named cloud browsers natively,
     # and _resolve_backend_cdp skips provider resolution for them.
-    backend_err = _resolve_backend_cdp(env, task_id, session_name=session)
+    backend_err = _resolve_backend_cdp(env, task_id, session_name=daemon_name)
     if backend_err:
+        _unregister_daemon(task_id, daemon_name)
+        _remove_daemon_owner_marker(env, daemon_name)
         return tool_error(backend_err)
 
     # On a SHARED browser (local Chrome / CDP override) a fresh named daemon
@@ -597,7 +927,7 @@ def browser_exec(
     # the model's code. Private per-name browsers (provider-keyed or BU
     # cloud) skip this: no one to collide with, and the extra tab would leak.
     private_browser = env.pop(_PRIVATE_BROWSER_SENTINEL, None)
-    if session and not private_browser:
+    if not private_browser:
         code = _OWN_TAB_PREAMBLE + code
 
     workspace = _workspace_dir(task_id)
@@ -628,43 +958,113 @@ def browser_exec(
             logger.debug("Windows hide-flags unavailable: %s", e)
 
     started = time.time()
+    stdout_capture = _BoundedSubprocessCapture(
+        preview_bytes=_STDOUT_PREVIEW_BYTES,
+        tail_bytes=_STDOUT_TAIL_SCAN_BYTES,
+        file_cap_bytes=_STDOUT_FILE_CAP_BYTES,
+    )
+    stderr_capture = _BoundedSubprocessCapture(
+        preview_bytes=_STDERR_PREVIEW_BYTES,
+        tail_bytes=0,
+        file_cap_bytes=_STDERR_FILE_CAP_BYTES,
+    )
     try:
-        proc = subprocess.run(
-            cmd,
-            input=code,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            env=env,
-            **popen_extra,
-        )
-    except subprocess.TimeoutExpired:
-        return tool_error(
-            f"browser-use exec timed out after {timeout}s. The daemon may "
-            "still be working; retry with a larger timeout_s (max "
-            f"{_MAX_TIMEOUT_S}), or split the work into several calls that "
-            "append to workspace files — anything already written to the "
-            "workspace is preserved."
-        )
-    except OSError as e:
-        return tool_error(f"Failed to launch browser-use CLI: {e}")
+        try:
+            proc = _run_browser_cli(
+                cmd,
+                code,
+                stdout_capture,
+                stderr_capture,
+                timeout=timeout,
+                env=env,
+                popen_extra=popen_extra,
+            )
+        except subprocess.TimeoutExpired:
+            return tool_error(
+                f"browser-use exec timed out after {timeout}s. The daemon may "
+                "still be working; retry with a larger timeout_s (max "
+                f"{_MAX_TIMEOUT_S}), or split the work into several calls that "
+                "append to workspace files — anything already written to the "
+                "workspace is preserved."
+            )
+        except OSError as e:
+            return tool_error(f"Failed to launch browser-use CLI: {e}")
+
+        stdout_capture.finish()
+        stderr_capture.finish()
+        stdout_bytes = bytes(stdout_capture.preview)
+        stdout_size = stdout_capture.total_bytes
+        stdout_tail = bytes(stdout_capture.tail)
+        stderr_bytes = bytes(stderr_capture.preview)
+
+        stdout = stdout_bytes.decode("utf-8", errors="replace")
+        stderr = stderr_bytes.decode("utf-8", errors="replace").strip()
+        output_path = None
+        if stdout_size > _STDOUT_PREVIEW_BYTES:
+            if workspace:
+                output_path = str(
+                    Path(workspace) / f"browser-exec-output-{uuid.uuid4().hex}.txt"
+                )
+                try:
+                    shutil.copyfile(stdout_capture.path, output_path)
+                    if stdout_size > _STDOUT_FILE_CAP_BYTES:
+                        handoff_note = (
+                            f"\n… (output truncated after {_STDOUT_FILE_CAP_BYTES} bytes "
+                            f"of {stdout_size}; captured output saved to {output_path})"
+                        )
+                    else:
+                        handoff_note = (
+                            f"\n… (output exceeded {_STDOUT_PREVIEW_BYTES} bytes; "
+                            f"complete output saved to {output_path})"
+                        )
+                    stdout = _bounded_preview_with_note(
+                        stdout_bytes, handoff_note, _STDOUT_PREVIEW_BYTES
+                    )
+                except OSError as exc:
+                    logger.warning("Could not persist browser_exec output: %s", exc)
+                    output_path = None
+                    truncation_note = (
+                        f"\n… (output truncated at {_STDOUT_PREVIEW_BYTES} bytes)"
+                    )
+                    stdout = _bounded_preview_with_note(
+                        stdout_bytes, truncation_note, _STDOUT_PREVIEW_BYTES
+                    )
+            else:
+                truncation_note = f"\n… (output truncated at {_STDOUT_PREVIEW_BYTES} bytes)"
+                stdout = _bounded_preview_with_note(
+                    stdout_bytes, truncation_note, _STDOUT_PREVIEW_BYTES
+                )
+    finally:
+        stdout_capture.discard()
+        stderr_capture.discard()
+        # A cancellation can race the daemon's first startup: cleanup may
+        # successfully reload before Browser Harness has created the socket,
+        # then this exec can finish starting it. Ownership removal is the
+        # cancellation signal; repeat reload after the subprocess boundary so
+        # a late-starting daemon cannot escape the task cleanup sweep.
+        if not _daemon_is_owned(task_id, daemon_name):
+            if not _stop_browser_exec_daemon(daemon_name):
+                _register_daemon(task_id, daemon_name)
+                _write_daemon_owner_marker(env, daemon_name)
 
     result = {
         "success": proc.returncode == 0,
         "exit_code": proc.returncode,
-        "output": proc.stdout,
+        "output": stdout,
     }
     if workspace:
         result["workspace"] = workspace
     if session:
         result["session"] = session
-    stderr = (proc.stderr or "").strip()
     if stderr:
-        if len(stderr) > _STDERR_CAP_CHARS:
-            stderr = stderr[:_STDERR_CAP_CHARS] + "\n… (stderr truncated)"
+        if stderr_capture.total_bytes > _STDERR_PREVIEW_BYTES:
+            stderr += "\n… (stderr truncated)"
         result["stderr"] = stderr
+    if output_path:
+        result["output_path"] = output_path
 
-    screenshot = _find_screenshot(proc.stdout, started)
+    screenshot_scan = stdout + stdout_tail.decode("utf-8", errors="replace")
+    screenshot = _find_screenshot(screenshot_scan, started)
     if screenshot:
         result["screenshot_path"] = screenshot
         native = _native_screenshot_result(result, screenshot)
@@ -799,7 +1199,7 @@ BROWSER_EXEC_SCHEMA = {
             },
             "session": {
                 "type": "string",
-                "description": "Named isolated browser session (sets BU_NAME): each name gets its own harness daemon — and on cloud backends its own browser — so concurrent tasks don't clobber each other. Omit for the shared default session. Reuse the same name across calls to keep working in that session (and the name passed to start_remote_daemon(), if used).",
+                "description": f"Optional friendly name for a task-scoped isolated browser session. Each distinct name gets its own harness daemon (and on provider backends its own browser); reuse a name across calls in the same turn. Omit to reuse the task default. At most {_MAX_DAEMONS_PER_TASK} sessions may be active for one task.",
             },
             "timeout_s": {
                 "type": "integer",
