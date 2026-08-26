@@ -359,6 +359,39 @@ class TestConfig:
         assert p._auto_recall is False
         assert p._auto_retain is False
 
+    def test_initialize_reentry_resets_disabled_routing_state(
+        self, provider_with_config
+    ):
+        p = provider_with_config()
+        p.initialize(
+            session_id="disabled-session",
+            platform="api_server",
+            request_metadata={
+                "source": "dorvis-web",
+                "environment": "production",
+                "traffic_class": "automation_smoke",
+            },
+        )
+        assert p.observation_metadata()["routing_status"] == "disabled"
+
+        p.initialize(
+            session_id="human-session",
+            platform="api_server",
+            request_metadata={
+                "source": "dorvis-web",
+                "environment": "production",
+                "traffic_class": "human",
+            },
+        )
+
+        assert p.observation_metadata() == {
+            "traffic_class": "human",
+            "effective_bank_id": "test-bank",
+            "auto_recall": True,
+            "auto_retain": True,
+            "routing_status": "routed",
+        }
+
     def test_traffic_class_cannot_change_mid_session(self, provider_with_config):
         p = provider_with_config()
         p.initialize(
@@ -383,6 +416,11 @@ class TestConfig:
         assert p.observation_metadata()["routing_error"] == "traffic_class_changed_mid_session"
         assert p._auto_recall is False
         assert p._auto_retain is False
+        assert p.get_tool_schemas() == []
+        result = json.loads(
+            p.handle_tool_call("hindsight_retain", {"content": "must not write"})
+        )
+        assert "error" in result
 
     def test_cloud_client_lazy_installs_dependency_before_import(self, tmp_path, monkeypatch):
         _assert_cloud_client_lazy_installed_before_import(tmp_path, monkeypatch, "cloud")
@@ -1880,6 +1918,20 @@ class TestSystemPrompt:
         assert "Hindsight Memory" in block
         assert "hindsight_recall" in block
         assert "automatically injected" in block
+
+    def test_disabled_routing_has_no_memory_prompt(self, provider_with_config):
+        p = provider_with_config()
+        p.initialize(
+            session_id="disabled-session",
+            platform="api_server",
+            request_metadata={
+                "source": "dorvis-web",
+                "environment": "production",
+                "traffic_class": "automation_smoke",
+            },
+        )
+
+        assert p.system_prompt_block() == ""
 
 
 # ---------------------------------------------------------------------------

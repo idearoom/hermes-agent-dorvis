@@ -1721,6 +1721,10 @@ class HindsightMemoryProvider(MemoryProvider):
         self._session_db = kwargs.get("session_db")
         self._request_source = ""
         self._environment = ""
+        self._requested_traffic_class = ""
+        self._traffic_class = ""
+        self._routing_status = "legacy"
+        self._routing_error = ""
         self._apply_request_metadata(kwargs.get("request_metadata"))
         self._turn_counter = 0
         self._turn_index = 0
@@ -2672,6 +2676,10 @@ class HindsightMemoryProvider(MemoryProvider):
         return [RETAIN_SCHEMA, RECALL_SCHEMA, REFLECT_SCHEMA]
 
     def handle_tool_call(self, tool_name: str, args: dict, **kwargs) -> str:
+        if self._routing_status == "disabled":
+            return tool_error(
+                "Hindsight memory is unavailable because trusted traffic routing failed"
+            )
         if tool_name == "hindsight_retain":
             content = args.get("content", "")
             if not content:
