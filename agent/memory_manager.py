@@ -617,27 +617,9 @@ class MemoryManager:
     def observation_metadata(self) -> Dict[str, Any]:
         """Return the active provider's bounded policy observation metadata."""
         for provider in self._providers:
-            try:
-                metadata = provider.observation_metadata()
-            except Exception as exc:
-                logger.debug(
-                    "Memory provider '%s' observation metadata failed: %s",
-                    getattr(provider, "name", "?"),
-                    exc,
-                )
-                continue
-            if not isinstance(metadata, dict) or not metadata:
-                continue
-            bounded: Dict[str, Any] = {}
-            for key, value in list(metadata.items())[:32]:
-                if not isinstance(key, str):
-                    continue
-                if isinstance(value, str):
-                    bounded[key[:64]] = value[:512]
-                elif isinstance(value, (bool, int, float)) or value is None:
-                    bounded[key[:64]] = value
-            if bounded:
-                return bounded
+            metadata = self._provider_observation_metadata(provider)
+            if metadata:
+                return metadata
         return {}
 
     def _prefetch_provider(
@@ -875,9 +857,24 @@ class MemoryManager:
     def _provider_observation_metadata(provider: MemoryProvider) -> Dict[str, Any]:
         try:
             metadata = provider.observation_metadata()
-        except Exception:
+        except Exception as exc:
+            logger.debug(
+                "Memory provider '%s' observation metadata failed: %s",
+                getattr(provider, "name", "?"),
+                exc,
+            )
             return {}
-        return dict(metadata) if isinstance(metadata, dict) else {}
+        if not isinstance(metadata, dict):
+            return {}
+        bounded: Dict[str, Any] = {}
+        for key, value in list(metadata.items())[:32]:
+            if not isinstance(key, str):
+                continue
+            if isinstance(value, str):
+                bounded[key[:64]] = value[:512]
+            elif isinstance(value, (bool, int, float)) or value is None:
+                bounded[key[:64]] = value
+        return bounded
 
     # -- Background dispatch -------------------------------------------------
 

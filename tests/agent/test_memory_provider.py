@@ -324,6 +324,8 @@ class TestMemoryManager:
                     "effective_bank_id": "dorvis-staging",
                     "auto_retain": False,
                     "routing_status": "disabled",
+                    "nested": {"secret": "not permitted"},
+                    "long": "x" * 600,
                 }
             )
         )
@@ -342,6 +344,7 @@ class TestMemoryManager:
             "effective_bank_id": "dorvis-staging",
             "auto_retain": False,
             "routing_status": "disabled",
+            "long": "x" * 512,
         }
 
     def test_sync_all_passes_messages_to_opted_in_provider(self):
