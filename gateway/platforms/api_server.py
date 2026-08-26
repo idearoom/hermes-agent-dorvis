@@ -3780,7 +3780,10 @@ class APIServerAdapter(BasePlatformAdapter):
     def set_session_store(self, session_store: Any) -> None:
         """Attach the gateway store and emit one exact boot attestation."""
         super().set_session_store(session_store)
-        logger.info(
+        # Upstream configures the gateway logger at WARNING in production.
+        # Keep this non-secret, once-per-boot deployment attestation visible at
+        # that floor so fail-closed readiness can prove the attached stores.
+        logger.warning(
             "DORVIS_STORAGE_ATTESTATION %s",
             json.dumps(
                 self._storage_attestations(),

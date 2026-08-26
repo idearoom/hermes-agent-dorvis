@@ -1305,7 +1305,7 @@ class TestHealthEndpoint:
             )
         )
 
-        caplog.set_level(logging.INFO)
+        caplog.set_level(logging.WARNING)
         adapter.set_session_store(session_store)
 
         assert (
