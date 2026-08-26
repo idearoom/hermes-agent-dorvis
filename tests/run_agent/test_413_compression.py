@@ -450,7 +450,11 @@ class TestPreflightCompression:
         # test asserts, so disable it to suppress the probe.
         agent.compression_enabled = False
         events = []
+        compression_events = []
         agent.status_callback = lambda ev, msg: events.append((ev, msg))
+        agent._compression_event_callback = (
+            lambda name, payload: compression_events.append((name, payload))
+        )
 
         def _fake_compress(
             messages,
@@ -488,6 +492,10 @@ class TestPreflightCompression:
             ("compress", "started"),
             ("compacted", COMPACTION_DONE_STATUS),
         ]
+        assert [name for name, _ in compression_events] == [
+            "context_compression_started",
+            "context_compression_completed",
+        ]
 
     def test_compress_context_emits_one_terminal_status_when_lock_is_unavailable(self, agent):
         """A rejected lock must retire the started desktop compaction phase."""
@@ -498,7 +506,11 @@ class TestPreflightCompression:
             try_acquire_compression_lock=lambda *_args, **_kwargs: False,
         )
         events = []
+        compression_events = []
         agent.status_callback = lambda event, message: events.append((event, message))
+        agent._compression_event_callback = (
+            lambda name, payload: compression_events.append((name, payload))
+        )
         messages = [{"role": "user", "content": "hello"}]
 
         compressed, prompt = agent._compress_context(messages, "system prompt", force=True)
@@ -507,6 +519,13 @@ class TestPreflightCompression:
         assert prompt == "You are helpful."
         assert [event for event, _ in events] == ["lifecycle", "warn", "compacted"]
         assert events[-1] == ("compacted", COMPACTION_DONE_STATUS)
+        assert [name for name, _ in compression_events] == [
+            "context_compression_started",
+            "context_compression_aborted",
+        ]
+        assert compression_events[-1][1]["abort_reason"] == (
+            "attempt_ended_without_committed_compression"
+        )
 
 
     def test_compression_reuses_cached_prompt_when_memory_snapshot_is_unchanged(self, agent):

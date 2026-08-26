@@ -254,6 +254,19 @@ def _base_subprocess_env() -> dict:
     env.pop("PYTHONPATH", None)
     env.pop("PYTHONHOME", None)
     env.setdefault("ANONYMIZED_TELEMETRY", "false")
+    # Browser Harness IPC must be task-local. In AWS, HOME/HERMES_HOME is an
+    # EFS volume shared by outgoing and incoming blue/green tasks; its default
+    # ~/.config runtime directory makes each task misclassify the other task's
+    # PIDs as dead and unlink its live daemon sockets. The OS temp directory is
+    # container-local in ECS and still shared by gateway restarts inside that
+    # one task, so the orphan reaper keeps working without crossing tasks.
+    env["BH_RUNTIME_DIR"] = os.environ.get("BH_RUNTIME_DIR") or str(
+        Path(tempfile.gettempdir()) / "hermes-browser-harness-runtime"
+    )
+    # An explicit runtime directory is otherwise treated as one-daemon-only
+    # and every BU_NAME collapses onto bu.sock. Hermes intentionally hosts
+    # multiple isolated names in this task-local directory.
+    env["BH_RUNTIME_DIR_SHARED"] = "1"
     return env
 
 

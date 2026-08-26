@@ -2825,12 +2825,30 @@ def compress_context(
     if _compaction_status:
         agent._emit_status(_compaction_status)
     _compaction_done_emitted = False
+    _compression_terminal_hook_emitted = False
+
+    def _emit_compression_terminal_hook(hook_name: str, **payload: Any) -> None:
+        """Emit at most one terminal edge for every started compression."""
+        nonlocal _compression_terminal_hook_emitted
+        if _compression_terminal_hook_emitted:
+            return
+        _compression_terminal_hook_emitted = True
+        _emit_compression_hook(agent, hook_name, **payload)
 
     def _complete_compaction_lifecycle() -> None:
         nonlocal _compaction_done_emitted
         if _compaction_done_emitted:
             return
         _compaction_done_emitted = True
+        if not _compression_terminal_hook_emitted:
+            _emit_compression_terminal_hook(
+                "context_compression_aborted",
+                pre_message_count=_pre_msg_count,
+                post_message_count=len(messages),
+                pre_tokens=approx_tokens,
+                abort_reason="attempt_ended_without_committed_compression",
+                **_compression_diagnostics(agent),
+            )
         # A suppressed start (quiet context engine) opened no visible
         # compaction phase — emit no terminal edge either. Failure warnings
         # go through agent._emit_warning and are never suppressed here.
@@ -3201,8 +3219,7 @@ def compress_context(
                                     len(_adopted),
                                     f"{_adopted_est:,}",
                                 )
-                                _emit_compression_hook(
-                                    agent,
+                                _emit_compression_terminal_hook(
                                     "context_compression_adopted",
                                     old_session_id=_lock_sid,
                                     new_session_id=getattr(
@@ -3787,8 +3804,7 @@ def compress_context(
                         "No messages were dropped — conversation continues unchanged. "
                         "Run /compress to retry, or /new to start a fresh session."
                     )
-                _emit_compression_hook(
-                    agent,
+                _emit_compression_terminal_hook(
                     "context_compression_aborted",
                     pre_message_count=_pre_msg_count,
                     post_message_count=len(compressed),
@@ -4598,8 +4614,7 @@ def compress_context(
         except Exception:
             pass
 
-        _emit_compression_hook(
-            agent,
+        _emit_compression_terminal_hook(
             "context_compression_completed",
             old_session_id=_old_sid or None,
             new_session_id=getattr(agent, "session_id", None),

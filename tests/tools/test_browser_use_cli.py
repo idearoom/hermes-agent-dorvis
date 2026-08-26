@@ -112,6 +112,24 @@ class TestSubprocessEnvironment:
         monkeypatch.setitem(sys.modules, "tools.browser_tool", browser_tool)
         env = bu_cli._base_subprocess_env()
         assert env["ANONYMIZED_TELEMETRY"] == "false"
+        assert env["BH_RUNTIME_DIR"] == str(
+            Path(bu_cli.tempfile.gettempdir()) / "hermes-browser-harness-runtime"
+        )
+        assert env["BH_RUNTIME_DIR_SHARED"] == "1"
+
+    def test_browser_harness_runtime_override_remains_multi_daemon(self, monkeypatch):
+        import sys
+        from types import ModuleType
+
+        browser_tool = ModuleType("tools.browser_tool")
+        browser_tool._build_browser_env = lambda: {}
+        monkeypatch.setitem(sys.modules, "tools.browser_tool", browser_tool)
+        monkeypatch.setenv("BH_RUNTIME_DIR", "/tmp/hermes-task-runtime")
+
+        env = bu_cli._base_subprocess_env()
+
+        assert env["BH_RUNTIME_DIR"] == "/tmp/hermes-task-runtime"
+        assert env["BH_RUNTIME_DIR_SHARED"] == "1"
 
     def test_subprocess_env_strips_parent_python_import_paths(self, monkeypatch):
         """#83427/#84841/#86006/#86104: the browser-use CLI runs under its

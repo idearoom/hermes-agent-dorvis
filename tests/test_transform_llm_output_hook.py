@@ -52,6 +52,7 @@ def test_context_compression_hooks_are_valid():
     assert "context_compression_started" in VALID_HOOKS
     assert "context_compression_completed" in VALID_HOOKS
     assert "context_compression_aborted" in VALID_HOOKS
+    assert "context_compression_adopted" in VALID_HOOKS
 
 
 def test_hook_receives_expected_kwargs(tmp_path, monkeypatch):
