@@ -211,6 +211,15 @@ class MemoryProvider(ABC):
         """
         return None
 
+    def observation_metadata(self) -> Dict[str, Any]:
+        """Return bounded, provider-owned policy metadata for observability.
+
+        This is intentionally separate from recalled memory content. Runtime
+        hooks and terminal metadata can report which policy was effective
+        without learning provider-specific routing rules or credentials.
+        """
+        return {}
+
     def sync_turn(
         self,
         user_content: str,

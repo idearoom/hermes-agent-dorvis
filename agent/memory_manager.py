@@ -575,6 +575,14 @@ class MemoryManager:
         """Per-memory structure behind the most recent ``prefetch_all``."""
         return list(self._last_prefetch_memories)
 
+    def observation_metadata(self) -> Dict[str, Any]:
+        """Return the active provider's bounded policy observation metadata."""
+        for provider in self._providers:
+            metadata = self._provider_observation_metadata(provider)
+            if metadata:
+                return metadata
+        return {}
+
     def _prefetch_provider(
         self, provider: MemoryProvider, query: str, *, session_id: str = ""
     ) -> str:
@@ -750,6 +758,7 @@ class MemoryManager:
         def _run() -> None:
             for provider in providers:
                 try:
+                    memory_policy = self._provider_observation_metadata(provider)
                     if messages is not None and self._provider_sync_accepts_messages(provider):
                         provider.sync_turn(
                             user_content,
@@ -774,8 +783,13 @@ class MemoryManager:
                                 "user": user_content,
                                 "assistant": assistant_content,
                             },
-                            status="accepted",
+                            status=(
+                                "skipped_policy"
+                                if memory_policy.get("auto_retain") is False
+                                else "accepted"
+                            ),
                             provider=provider.name,
+                            memory_policy=memory_policy,
                             session_id=str(
                                 observer_context.get("session_id") or session_id or ""
                             ),
@@ -799,6 +813,29 @@ class MemoryManager:
                     )
 
         self._submit_background(_run)
+
+    @staticmethod
+    def _provider_observation_metadata(provider: MemoryProvider) -> Dict[str, Any]:
+        try:
+            metadata = provider.observation_metadata()
+        except Exception as exc:
+            logger.debug(
+                "Memory provider '%s' observation metadata failed: %s",
+                getattr(provider, "name", "?"),
+                exc,
+            )
+            return {}
+        if not isinstance(metadata, dict):
+            return {}
+        bounded: Dict[str, Any] = {}
+        for key, value in list(metadata.items())[:32]:
+            if not isinstance(key, str):
+                continue
+            if isinstance(value, str):
+                bounded[key[:64]] = value[:512]
+            elif isinstance(value, (bool, int, float)) or value is None:
+                bounded[key[:64]] = value
+        return bounded
 
     # -- Background dispatch -------------------------------------------------
 
