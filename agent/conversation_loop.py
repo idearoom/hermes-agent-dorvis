@@ -1964,6 +1964,12 @@ def run_conversation(
             # meaningful when a block actually went in — an empty/error turn
             # reports [] rather than last turn's memories.
             _memories = list(_memory_records) if injected_block else []
+            _memory_policy_candidate = agent._memory_manager.observation_metadata()
+            _memory_policy = (
+                dict(_memory_policy_candidate)
+                if isinstance(_memory_policy_candidate, dict)
+                else {}
+            )
             _payload = {
                 "session_id": agent.session_id or "",
                 "task_id": effective_task_id,
@@ -1978,6 +1984,7 @@ def run_conversation(
                 "estimated_injected_tokens": _estimated_tokens,
                 "reused_for_all_iterations": True,
                 "memories": _memories,
+                "memory_policy": _memory_policy,
                 "request_metadata": getattr(agent, "_request_metadata", None) or {},
             }
             if _memory_prefetch_error:
@@ -1991,6 +1998,7 @@ def run_conversation(
                     "status": status,
                     "count": len(_memories),
                     "memories": _memories,
+                    "memory_policy": _memory_policy,
                     "query_char_count": _payload["query_char_count"],
                     "injected_char_count": _payload["injected_char_count"],
                 }

@@ -3314,6 +3314,11 @@ class TestRunConversation:
         agent._memory_manager.last_prefetch_memories.return_value = [
             {"id": "fact-1", "text": "remembered fact", "score": None, "type": "world"}
         ]
+        agent._memory_manager.observation_metadata.return_value = {
+            "traffic_class": "automation_smoke",
+            "effective_bank_id": "dorvis-staging",
+            "routing_status": "routed",
+        }
         resp = _mock_response(content="Final answer", finish_reason="stop")
         agent.client.chat.completions.create.return_value = resp
 
@@ -3343,6 +3348,8 @@ class TestRunConversation:
         assert payload["memories"] == [
             {"id": "fact-1", "text": "remembered fact", "score": None, "type": "world"}
         ]
+        assert payload["memory_policy"]["traffic_class"] == "automation_smoke"
+        assert payload["memory_policy"]["effective_bank_id"] == "dorvis-staging"
         # ...and the same memories reach the terminal response metadata, which
         # is the only structured channel the web app can read (the injected
         # <memory-context> block stays scrubbed from streamed text).
@@ -3351,6 +3358,7 @@ class TestRunConversation:
         assert recall["status"] == "injected"
         assert recall["count"] == 1
         assert recall["memories"] == payload["memories"]
+        assert recall["memory_policy"] == payload["memory_policy"]
         assert recall["injected_char_count"] == payload["injected_char_count"]
 
     def test_memory_context_hook_survives_alternation_repair_compaction(self, agent):
