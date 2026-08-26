@@ -54,8 +54,10 @@ runtime contract rather than by choosing one side wholesale. Notable results:
 - **Gateway serving contract** — upstream's expanded API/gateway/profile
   lifecycle is retained while Dorvis keeps Postgres routing, exact storage
   attestation, readiness, drain mode, runtime footer/source identity, complete
-  usage, and typed terminal failures. Default-home construction continues to
-  use `open_session_db_for_home` so it cannot bypass DSN dispatch.
+  usage, and typed terminal failures. The non-secret, once-per-boot storage
+  attestation is emitted at WARNING because upstream's production gateway
+  logging floor suppresses INFO. Default-home construction continues to use
+  `open_session_db_for_home` so it cannot bypass DSN dispatch.
 - **Container dependency closure** — the release's Node 26 runtime is retained.
   The Azure extra pairs `azure-identity==1.25.3` with `msal==1.37.0`, whose
   cryptography range is compatible with upstream's security-pinned
