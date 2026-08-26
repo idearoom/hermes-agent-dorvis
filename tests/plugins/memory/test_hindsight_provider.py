@@ -43,6 +43,7 @@ def _clean_env(tmp_path, monkeypatch):
     """Ensure no stale env vars or Windows home state leak between tests."""
     for key in (
         "HINDSIGHT_API_KEY", "HINDSIGHT_API_URL", "HINDSIGHT_BANK_ID",
+        "HINDSIGHT_AUTOMATION_BANK_ID",
         "HINDSIGHT_BUDGET", "HINDSIGHT_MODE", "HINDSIGHT_TIMEOUT",
         "HINDSIGHT_IDLE_TIMEOUT", "HINDSIGHT_LLM_API_KEY",
         "HINDSIGHT_RETAIN_TAGS", "HINDSIGHT_RETAIN_OBSERVATION_SCOPES",
@@ -250,6 +251,139 @@ class TestSchemas:
 
 
 class TestConfig:
+    def test_human_web_traffic_keeps_primary_bank_and_policy(self, provider_with_config):
+        p = provider_with_config()
+        p.initialize(
+            session_id="human-session",
+            platform="api_server",
+            request_metadata={
+                "source": "dorvis-web",
+                "environment": "production",
+                "traffic_class": "human",
+                "chat": {"id": "human-chat", "type": "web"},
+            },
+        )
+
+        assert p._bank_id == "test-bank"
+        assert p._auto_recall is True
+        assert p._auto_retain is True
+        assert p.observation_metadata() == {
+            "traffic_class": "human",
+            "effective_bank_id": "test-bank",
+            "auto_recall": True,
+            "auto_retain": True,
+            "routing_status": "routed",
+        }
+
+    def test_automation_web_traffic_routes_to_configured_canary(self, provider_with_config, monkeypatch):
+        monkeypatch.setenv("HINDSIGHT_AUTOMATION_BANK_ID", "dorvis-production-canary")
+        p = provider_with_config()
+        p.initialize(
+            session_id="smoke-session",
+            platform="api_server",
+            request_metadata={
+                "source": "dorvis-web",
+                "environment": "production",
+                "traffic_class": "automation_smoke",
+                "chat": {"id": "smoke-chat", "type": "web"},
+            },
+        )
+
+        assert p._bank_id == "dorvis-production-canary"
+        assert p._build_metadata(message_count=2, turn_index=1)["traffic_class"] == "automation_smoke"
+        assert p._build_metadata(message_count=2, turn_index=1)["effective_bank_id"] == "dorvis-production-canary"
+        assert "traffic_class:automation_smoke" in p._build_lineage_tags()
+        assert p.observation_metadata()["routing_status"] == "routed"
+
+    @pytest.mark.parametrize("traffic_class", ["automation_smoke", "untrusted"])
+    def test_missing_or_unknown_automation_policy_fails_closed(
+        self, provider_with_config, traffic_class
+    ):
+        p = provider_with_config()
+        p.initialize(
+            session_id="smoke-session",
+            platform="api_server",
+            request_metadata={
+                "source": "dorvis-web",
+                "environment": "production",
+                "traffic_class": traffic_class,
+                "chat": {"id": "smoke-chat", "type": "web"},
+            },
+        )
+        p._client = _make_mock_client()
+
+        assert p._auto_recall is False
+        assert p._auto_retain is False
+        assert p.get_tool_schemas() == []
+        assert p.observation_metadata()["routing_status"] == "disabled"
+        assert p.observation_metadata()["routing_error"]
+        p.sync_turn("must not retain", "must not write")
+        assert p._client.aretain_batch.await_count == 0
+
+    def test_production_automation_bank_cannot_equal_primary(self, provider_with_config, monkeypatch):
+        monkeypatch.setenv("HINDSIGHT_AUTOMATION_BANK_ID", "test-bank")
+        p = provider_with_config()
+        p.initialize(
+            session_id="smoke-session",
+            platform="api_server",
+            request_metadata={
+                "source": "dorvis-web",
+                "environment": "production",
+                "traffic_class": "automation_smoke",
+            },
+        )
+        assert p.observation_metadata()["routing_status"] == "disabled"
+        assert p._auto_retain is False
+
+    def test_missing_web_traffic_class_fails_closed(self, provider_with_config):
+        p = provider_with_config()
+        p.initialize(
+            session_id="old-web-session",
+            platform="api_server",
+            request_metadata={"source": "dorvis-web", "environment": "staging"},
+        )
+
+        assert p.observation_metadata()["routing_error"] == "missing_traffic_class"
+        assert p._auto_recall is False
+        assert p._auto_retain is False
+
+    def test_missing_web_environment_fails_closed(self, provider_with_config):
+        p = provider_with_config()
+        p.initialize(
+            session_id="unscoped-session",
+            platform="api_server",
+            request_metadata={"source": "dorvis-web", "traffic_class": "human"},
+        )
+
+        assert p.observation_metadata()["routing_error"] == "invalid_or_missing_environment"
+        assert p._auto_recall is False
+        assert p._auto_retain is False
+
+    def test_traffic_class_cannot_change_mid_session(self, provider_with_config):
+        p = provider_with_config()
+        p.initialize(
+            session_id="human-session",
+            platform="api_server",
+            request_metadata={
+                "source": "dorvis-web",
+                "environment": "staging",
+                "traffic_class": "human",
+            },
+        )
+
+        p.on_turn_start(
+            2,
+            "next",
+            request_metadata={
+                "source": "dorvis-web",
+                "traffic_class": "automation_smoke",
+            },
+        )
+
+        assert p.observation_metadata()["routing_error"] == "traffic_class_changed_mid_session"
+        assert p._auto_recall is False
+        assert p._auto_retain is False
+
     def test_cloud_client_lazy_installs_dependency_before_import(self, tmp_path, monkeypatch):
         _assert_cloud_client_lazy_installed_before_import(tmp_path, monkeypatch, "cloud")
 
@@ -1092,6 +1226,11 @@ class TestSyncTurn:
             session_id="web-session",
             platform="api_server",
             agent_identity="dorvis-pr-56",
+            request_metadata={
+                "source": "dorvis-web",
+                "environment": "pr-56",
+                "traffic_class": "human",
+            },
         )
         p._client = _make_mock_client()
 
@@ -1101,6 +1240,7 @@ class TestSyncTurn:
             request_metadata={
                 "source": "dorvis-web",
                 "environment": "pr-56",
+                "traffic_class": "human",
                 "caller": {
                     "email": "reviewer@example.com",
                     "name": "Reviewer",
@@ -1285,6 +1425,7 @@ class TestSyncTurn:
                 request_metadata={
                     "source": "dorvis-web",
                     "environment": "staging",
+                    "traffic_class": "human",
                     "caller": {
                         "email": "reviewer@example.com",
                         "name": "Reviewer",
@@ -1355,6 +1496,7 @@ class TestSyncTurn:
                 request_metadata={
                     "source": "dorvis-web",
                     "environment": "staging",
+                    "traffic_class": "human",
                     "caller": {
                         "email": "reviewer@example.com",
                         "name": "Reviewer",

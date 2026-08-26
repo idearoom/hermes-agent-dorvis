@@ -94,6 +94,17 @@ class MessagesMemoryProvider(FakeMemoryProvider):
         self.synced_turns.append((user_content, assistant_content, session_id, messages))
 
 
+class PolicyMemoryProvider(FakeMemoryProvider):
+    """Provider with an explicit, observable routing policy."""
+
+    def __init__(self, name="hindsight", metadata=None):
+        super().__init__(name=name)
+        self._metadata = metadata or {}
+
+    def observation_metadata(self):
+        return self._metadata
+
+
 class BlockingPrefetchProvider(FakeMemoryProvider):
     """External provider whose prefetch call blocks until released."""
 
@@ -250,6 +261,27 @@ class TestMemoryManager:
         assert p1.queued_prefetches == ["next turn"]
         assert p2.queued_prefetches == ["next turn"]
 
+    def test_observation_metadata_is_bounded_and_provider_owned(self):
+        mgr = MemoryManager()
+        mgr.add_provider(
+            PolicyMemoryProvider(
+                metadata={
+                    "traffic_class": "automation_smoke",
+                    "effective_bank_id": "dorvis-staging",
+                    "auto_retain": False,
+                    "nested": {"secret": "not permitted"},
+                    "long": "x" * 600,
+                }
+            )
+        )
+
+        assert mgr.observation_metadata() == {
+            "traffic_class": "automation_smoke",
+            "effective_bank_id": "dorvis-staging",
+            "auto_retain": False,
+            "long": "x" * 512,
+        }
+
 
 
     def test_sync_all_emits_accepted_write_after_each_provider_returns(self):
@@ -282,6 +314,35 @@ class TestMemoryManager:
         assert payload["status"] == "accepted"
         assert payload["session_id"] == "sess-observed"
         assert payload["request_metadata"] == {"source": "dorvis-web"}
+
+    def test_sync_all_reports_policy_disabled_retention_as_skipped(self):
+        mgr = MemoryManager()
+        mgr.add_provider(
+            PolicyMemoryProvider(
+                metadata={
+                    "traffic_class": "automation_smoke",
+                    "effective_bank_id": "dorvis-staging",
+                    "auto_retain": False,
+                    "routing_status": "disabled",
+                }
+            )
+        )
+        captured = []
+
+        with patch(
+            "hermes_cli.plugins.invoke_hook",
+            side_effect=lambda name, **kwargs: captured.append((name, kwargs)),
+        ):
+            mgr.sync_all("user msg", "assistant msg")
+            assert mgr.flush_pending(timeout=5)
+
+        assert captured[0][1]["status"] == "skipped_policy"
+        assert captured[0][1]["memory_policy"] == {
+            "traffic_class": "automation_smoke",
+            "effective_bank_id": "dorvis-staging",
+            "auto_retain": False,
+            "routing_status": "disabled",
+        }
 
     def test_sync_all_passes_messages_to_opted_in_provider(self):
         mgr = MemoryManager()

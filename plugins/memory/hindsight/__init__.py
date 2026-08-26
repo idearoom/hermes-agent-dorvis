@@ -832,6 +832,10 @@ class HindsightMemoryProvider(MemoryProvider):
         self._agent_workspace = ""
         self._request_source = ""
         self._environment = ""
+        self._requested_traffic_class = ""
+        self._traffic_class = ""
+        self._routing_status = "legacy"
+        self._routing_error = ""
         self._turn_index = 0
         self._client = None
         self._timeout = _DEFAULT_TIMEOUT
@@ -1844,6 +1848,8 @@ class HindsightMemoryProvider(MemoryProvider):
             self._config.get("prefetch_retain_drain_timeout", 10.0)
         )
 
+        self._apply_traffic_policy()
+
         _client_version = "unknown"
         try:
             from importlib.metadata import version as pkg_version
@@ -1933,6 +1939,8 @@ class HindsightMemoryProvider(MemoryProvider):
             t.start()
 
     def system_prompt_block(self) -> str:
+        if self._routing_status == "disabled":
+            return ""
         if self._memory_mode == "context":
             return (
                 f"# Hindsight Memory\n"
@@ -2322,6 +2330,10 @@ class HindsightMemoryProvider(MemoryProvider):
             metadata["thread_id"] = self._thread_id
         if self._agent_identity:
             metadata["agent_identity"] = self._agent_identity
+        if self._traffic_class:
+            metadata["traffic_class"] = self._traffic_class
+            metadata["effective_bank_id"] = self._bank_id
+            metadata["retain_policy"] = "enabled" if self._auto_retain else "disabled"
         return metadata
 
     def _merge_retain_tags(self, tags: List[str] | None = None) -> list[str]:
@@ -2360,6 +2372,8 @@ class HindsightMemoryProvider(MemoryProvider):
                 tags.append(f"pr:{m.group(1)}")
         if self._request_source:
             tags.append(f"source:{self._request_source}")
+        if self._traffic_class:
+            tags.append(f"traffic_class:{self._traffic_class}")
         return tags
 
     def _apply_request_metadata(self, request_metadata: Any) -> None:
@@ -2374,6 +2388,10 @@ class HindsightMemoryProvider(MemoryProvider):
         environment = str(request_metadata.get("environment") or "").strip()
         if environment:
             self._environment = environment
+
+        traffic_class = str(request_metadata.get("traffic_class") or "").strip()
+        if traffic_class:
+            self._requested_traffic_class = traffic_class
 
         caller = request_metadata.get("caller")
         if isinstance(caller, dict):
@@ -2399,8 +2417,99 @@ class HindsightMemoryProvider(MemoryProvider):
             if chat_name:
                 self._chat_name = chat_name
 
+    def _disable_traffic_routing(self, reason: str) -> None:
+        self._routing_status = "disabled"
+        self._routing_error = reason
+        self._auto_recall = False
+        self._auto_retain = False
+        # Remove model-callable memory tools as well as automatic paths.
+        self._memory_mode = "context"
+        logger.error(
+            "Hindsight traffic routing disabled: source=%s environment=%s "
+            "traffic_class=%s reason=%s",
+            self._request_source,
+            self._environment,
+            self._requested_traffic_class,
+            reason,
+        )
+
+    @staticmethod
+    def _valid_explicit_bank_id(bank_id: str) -> bool:
+        return bool(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", bank_id))
+
+    def _apply_traffic_policy(self) -> None:
+        """Resolve trusted Web traffic to one explicit Hindsight bank.
+
+        Non-Web callers retain the upstream-compatible legacy behavior. Web
+        calls must carry a trusted class; unknown/missing automation policy is
+        disabled rather than falling back to the human bank.
+        """
+        requested = self._requested_traffic_class
+        if self._request_source == "dorvis-web" and not (
+            self._environment in {"local", "staging", "production"}
+            or re.fullmatch(r"pr-\d+", self._environment)
+        ):
+            self._traffic_class = requested or "unknown"
+            self._disable_traffic_routing("invalid_or_missing_environment")
+            return
+        if not requested:
+            if self._request_source == "dorvis-web":
+                self._traffic_class = "unknown"
+                self._disable_traffic_routing("missing_traffic_class")
+            else:
+                self._routing_status = "legacy"
+            return
+
+        self._traffic_class = requested
+        if requested == "human":
+            self._routing_status = "routed"
+            return
+
+        if requested != "automation_smoke":
+            self._disable_traffic_routing("unknown_traffic_class")
+            return
+
+        automation_bank = str(
+            self._config.get("automation_bank_id")
+            or os.environ.get("HINDSIGHT_AUTOMATION_BANK_ID", "")
+        ).strip()
+        if not automation_bank:
+            self._disable_traffic_routing("missing_automation_bank_id")
+            return
+        if not self._valid_explicit_bank_id(automation_bank):
+            self._disable_traffic_routing("invalid_automation_bank_id")
+            return
+        if self._environment == "production" and automation_bank == self._bank_id:
+            self._disable_traffic_routing("production_automation_bank_matches_primary")
+            return
+
+        self._bank_id = automation_bank
+        self._routing_status = "routed"
+
+    def observation_metadata(self) -> Dict[str, Any]:
+        if not self._traffic_class:
+            return {}
+        metadata: Dict[str, Any] = {
+            "traffic_class": self._traffic_class,
+            "effective_bank_id": self._bank_id,
+            "auto_recall": bool(self._auto_recall),
+            "auto_retain": bool(self._auto_retain),
+            "routing_status": self._routing_status,
+        }
+        if self._routing_error:
+            metadata["routing_error"] = self._routing_error
+        return metadata
+
     def on_turn_start(self, turn_number: int, message: str, **kwargs) -> None:
+        prior = self._requested_traffic_class
         self._apply_request_metadata(kwargs.get("request_metadata"))
+        if (
+            self._traffic_class
+            and self._requested_traffic_class
+            and self._requested_traffic_class != self._traffic_class
+        ):
+            self._disable_traffic_routing("traffic_class_changed_mid_session")
+            self._requested_traffic_class = prior
 
     def _build_retain_kwargs(
         self,
