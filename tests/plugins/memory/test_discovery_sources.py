@@ -13,6 +13,8 @@ from __future__ import annotations
 import importlib.metadata
 import sys
 import textwrap
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -219,3 +221,35 @@ def test_activation_is_not_gated_on_plugins_enabled(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
 
     assert memory_plugins.load_memory_provider("gatedmem") is not None
+
+
+def test_concurrent_first_load_never_observes_a_half_imported_provider(
+    tmp_path, monkeypatch
+):
+    """Parallel gateway requests must both receive a provider instance.
+
+    Python publishes a module shell in ``sys.modules`` before executing its
+    body. A second request used to treat that shell as a loaded provider while
+    the first request was still importing it, then return ``None`` because the
+    class and ``register`` callback did not exist yet.
+    """
+    provider = _write_provider_dir(tmp_path / "plugins", "racemem")
+    provider_source = PROVIDER_SOURCE.format(name="racemem")
+    (provider / "__init__.py").write_text(
+        "import time\ntime.sleep(0.2)\n" + provider_source,
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    module_name = "_hermes_user_memory.racemem"
+    sys.modules.pop(module_name, None)
+    ready = threading.Barrier(2)
+
+    def load():
+        ready.wait(timeout=2)
+        return memory_plugins.load_memory_provider("racemem")
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        loaded = list(pool.map(lambda _index: load(), range(2)))
+
+    assert all(provider is not None for provider in loaded)
+    assert [provider.name for provider in loaded] == ["racemem", "racemem"]

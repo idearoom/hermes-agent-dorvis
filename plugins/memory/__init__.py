@@ -37,6 +37,7 @@ import importlib.metadata
 import importlib.util
 import logging
 import sys
+import threading
 from pathlib import Path
 from typing import List, Optional, Tuple, TYPE_CHECKING
 from hermes_cli.config import cfg_get
@@ -49,6 +50,7 @@ logger = logging.getLogger(__name__)
 _MEMORY_PLUGINS_DIR = Path(__file__).parent
 ENTRY_POINTS_GROUP = "hermes_agent.memory_providers"
 _REGISTERED_MEMORY_PROVIDER_SKILLS: dict[str, Path] = {}
+_PROVIDER_LOAD_LOCK = threading.RLock()
 
 # Synthetic parent package for user-installed providers, so they don't
 # collide with bundled providers in sys.modules.
@@ -349,14 +351,21 @@ def load_memory_provider(
         return None
 
     try:
-        provider = (
-            _load_provider_from_dir(provider_dir, register_skills=register_skills)
-            if provider_dir
-            else _load_provider_from_entry_point(
-                entry_point,
-                register_skills=register_skills,
+        # A fresh directory import publishes its module shell in sys.modules
+        # before exec_module() finishes. Gateway requests can create agents in
+        # parallel, so an unguarded second load may observe that half-imported
+        # shell before register() or the provider class exists and silently
+        # disable memory for one request. Serialize discovery plus registration
+        # while still returning a distinct provider instance to every agent.
+        with _PROVIDER_LOAD_LOCK:
+            provider = (
+                _load_provider_from_dir(provider_dir, register_skills=register_skills)
+                if provider_dir
+                else _load_provider_from_entry_point(
+                    entry_point,
+                    register_skills=register_skills,
+                )
             )
-        )
         if provider:
             return provider
         logger.warning("Memory provider '%s' loaded but no provider instance found", name)
