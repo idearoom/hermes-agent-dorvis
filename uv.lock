@@ -1869,7 +1869,7 @@ requires-dist = [
     { name = "hermes-agent", extras = ["web"], marker = "extra == 'all'" },
     { name = "hermes-agent", extras = ["web"], marker = "extra == 'termux-all'" },
     { name = "hermes-agent", extras = ["youtube"], marker = "extra == 'all'" },
-    { name = "hindsight-client", marker = "extra == 'hindsight'", specifier = "==0.6.1" },
+    { name = "hindsight-client", marker = "extra == 'hindsight'", specifier = "==0.9.1" },
     { name = "honcho-ai", marker = "extra == 'honcho'", specifier = "==2.2.0" },
     { name = "httplib2", marker = "extra == 'google'", specifier = "==0.32.0" },
     { name = "httpx", extras = ["socks"], specifier = "==0.28.1" },
@@ -1968,7 +1968,7 @@ wheels = [
 
 [[package]]
 name = "hindsight-client"
-version = "0.6.1"
+version = "0.9.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "aiohttp" },
@@ -1978,9 +1978,9 @@ dependencies = [
     { name = "typing-extensions" },
     { name = "urllib3" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/33/26/8b8efa4be21fc3ba12ade3b1353d87f9837ec0d3ec2607e8adbf85bc9c63/hindsight_client-0.6.1.tar.gz", hash = "sha256:314d0bb9e13622e15586ba1586a799726d405b27bc20d78872474b5d6d96cd51", size = 99833, upload-time = "2026-05-08T13:01:23.537Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/1e/78/0f341cbf4ddb4ca04c43e255c03620354390f62bb39c425ddeda58d6e1c7/hindsight_client-0.9.1.tar.gz", hash = "sha256:1949a22d2c2493ae6ca69cf90f2ecf936d5ed9e39645b00cab343978864d4738", size = 146220, upload-time = "2026-08-14T08:46:45.441Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/24/4f/a1d0bc33ef933ecc52e76dc1514163594d25836a5d303c256a61bb61445d/hindsight_client-0.6.1-py3-none-any.whl", hash = "sha256:9fdda176ab50f7cec8d7339c6608c148f0cd9ad7e65d9d76192f2db730bc330a", size = 249379, upload-time = "2026-05-08T13:01:22.035Z" },
+    { url = "https://files.pythonhosted.org/packages/c4/a1/1e16036d01c5e7d0e4a4514214af798625f84d7de0ddb61885d73a53fcf7/hindsight_client-0.9.1-py3-none-any.whl", hash = "sha256:95183c7dc8eebdc34ef4d5afdb4927cd2511b7e7fe71805879ce0e0d0f42546a", size = 349681, upload-time = "2026-08-14T08:46:43.895Z" },
 ]
 
 [[package]]

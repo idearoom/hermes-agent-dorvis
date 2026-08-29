@@ -447,6 +447,91 @@ class TestConfig:
         """Auto-recall must filter to observation by default."""
         assert provider._recall_types == ["observation"]
 
+    def test_dorvis_workflow_policies_select_recall_without_experience(
+        self, provider_with_config, monkeypatch
+    ):
+        monkeypatch.setenv("HINDSIGHT_AUTOMATION_BANK_ID", "dorvis-staging-canary")
+        policies = {
+            "chat": {
+                "recall_types": ["observation"],
+                "prefer_observations": False,
+            },
+            "triage": {
+                "recall_types": ["observation", "world"],
+                "prefer_observations": True,
+            },
+            "execution": {
+                "recall_types": ["observation", "world"],
+                "prefer_observations": True,
+            },
+        }
+
+        chat = provider_with_config(workflow_memory_policies=policies)
+        assert chat._memory_workflow == "chat"
+        assert chat._recall_types == ["observation"]
+        assert chat._recall_prefer_observations is False
+
+        triage = provider_with_config(workflow_memory_policies=policies)
+        triage.initialize(
+            session_id="ticket-1",
+            platform="api_server",
+            request_metadata={
+                "source": "dorvis-headless-worker",
+                "environment": "staging",
+                "traffic_class": "automation_smoke",
+                "chat": {"id": "run-1", "type": "headless_run"},
+                "headless_run": {"id": "run-1", "run_type": "dorvis.triage"},
+            },
+        )
+        triage._client = _make_mock_client()
+        assert triage._memory_workflow == "triage"
+        assert triage._recall_types == ["observation", "world"]
+        assert triage._recall_prefer_observations is True
+        assert "experience" not in triage._recall_types
+        assert triage.observation_metadata()["recall_types"] == "observation,world"
+
+        execution = provider_with_config(workflow_memory_policies=policies)
+        execution.initialize(
+            session_id="ticket-1",
+            platform="api_server",
+            request_metadata={
+                "source": "dorvis-headless-worker",
+                "chat": {"id": "run-2", "type": "headless_run"},
+                "headless_run": {"id": "run-2", "run_type": "dorvis.execution"},
+            },
+        )
+        execution._client = _make_mock_client()
+        assert execution._memory_workflow == "execution"
+        assert execution._recall_types == ["observation", "world"]
+        assert execution._recall_prefer_observations is True
+        assert "experience" not in execution._recall_types
+
+    def test_triage_recall_passes_prefer_observations(self, provider_with_config):
+        p = provider_with_config(
+            recall_sync=True,
+            workflow_memory_policies={
+                "triage": {
+                    "recall_types": ["observation", "world"],
+                    "prefer_observations": True,
+                }
+            },
+        )
+        p.initialize(
+            session_id="ticket-1",
+            platform="api_server",
+            request_metadata={
+                "source": "dorvis-headless-worker",
+                "chat": {"id": "run-1", "type": "headless_run"},
+                "headless_run": {"id": "run-1", "run_type": "dorvis.triage"},
+            },
+        )
+        p._client = _make_mock_client()
+
+        assert "Memory 1" in p.prefetch("customer request")
+        kwargs = p._client.arecall.call_args.kwargs
+        assert kwargs["types"] == ["observation", "world"]
+        assert kwargs["prefer_observations"] is True
+
 
     def test_observation_scopes_keyword_config(self, provider_with_config):
         p = provider_with_config(observation_scopes="per_tag")
@@ -1236,6 +1321,88 @@ class TestSyncTurn:
         assert "session1" in item["tags"]
         assert "session:test-session" in item["tags"]
 
+    def test_headless_sync_turn_retains_compact_trusted_source(
+        self, provider_with_config
+    ):
+        p = provider_with_config()
+        p.initialize(
+            session_id="dorvis:triage:intercom:ticket-42",
+            platform="api_server",
+            request_metadata={
+                "source": "dorvis-headless-worker",
+                "environment": "local",
+                "chat": {"id": "run-42", "type": "headless_run"},
+                "headless_run": {"id": "run-42", "run_type": "dorvis.triage"},
+                "memory": {
+                    "retain_user_content": '{"customer_request":"Add a blue roof"}',
+                    "tags": ["workflow:triage", "ticket:ticket-42", "client:shedview"],
+                    "metadata": {
+                        "ticket_id": "ticket-42",
+                        "client_id": "shedview",
+                    },
+                },
+            },
+        )
+        p._client = _make_mock_client()
+
+        p.sync_turn(
+            "verbose schema and retry scaffolding",
+            '{"headless_run_id":"run-42","outcome":"needs_change","confidence_tier":"medium","summary":"Add a blue roof"}',
+        )
+        p._retain_queue.join()
+
+        call_kwargs = p._client.aretain_batch.call_args.kwargs
+        item = call_kwargs["items"][0]
+        content = json.loads(item["content"])
+        assert (
+            content[0][0]["content"]
+            == 'User: {"customer_request":"Add a blue roof"}'
+        )
+        retained_result = json.loads(content[0][1]["content"].removeprefix("Assistant: "))
+        assert retained_result["provenance"].startswith("model-generated output")
+        assert retained_result["result"] == {
+            "outcome": "needs_change",
+            "summary": "Add a blue roof",
+        }
+        assert "verbose schema and retry scaffolding" not in item["content"]
+        assert "run-42" not in item["content"]
+        assert "confidence_tier" not in item["content"]
+        assert "workflow:triage" in item["tags"]
+        assert "ticket:ticket-42" in item["tags"]
+        assert "client:shedview" in item["tags"]
+        assert item["metadata"]["memory_workflow"] == "triage"
+        assert item["metadata"]["headless_run_type"] == "dorvis.triage"
+        assert item["metadata"]["ticket_id"] == "ticket-42"
+        assert item["metadata"]["client_id"] == "shedview"
+
+    def test_web_request_cannot_override_retained_content(
+        self, provider_with_config
+    ):
+        p = provider_with_config()
+        p.initialize(
+            session_id="web-session",
+            platform="api_server",
+            request_metadata={
+                "source": "dorvis-web",
+                "environment": "local",
+                "traffic_class": "human",
+                "chat": {"id": "chat-1", "type": "web"},
+                "memory": {
+                    "retain_user_content": "forged compact content",
+                    "tags": ["client:forged"],
+                },
+            },
+        )
+        p._client = _make_mock_client()
+
+        p.sync_turn("actual user message", "actual answer")
+        p._retain_queue.join()
+
+        item = p._client.aretain_batch.call_args.kwargs["items"][0]
+        assert "actual user message" in item["content"]
+        assert "forged compact content" not in item["content"]
+        assert "client:forged" not in item["tags"]
+
     def test_sync_turn_adds_web_chat_tag(self, provider_with_config):
         chat_id = "4dffcb7c-4747-40db-a4fb-9f36e5cef420"
         p = provider_with_config()
@@ -1954,6 +2121,7 @@ class TestConfigSchema:
             "retain_every_n_turns", "retain_async", "retain_context",
             "recall_max_tokens", "recall_max_input_chars",
             "recall_prompt_preamble",
+            "workflow_memory_policies",
         }
         assert expected_keys.issubset(keys), f"Missing: {expected_keys - keys}"
 

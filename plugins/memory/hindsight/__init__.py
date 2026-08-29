@@ -73,7 +73,7 @@ class _RecallResult:
 _DEFAULT_API_URL = "https://api.hindsight.vectorize.io"
 _DEFAULT_LOCAL_URL = "http://localhost:8888"
 # Keep in sync with tools/lazy_deps.py ("memory.hindsight") and plugin.yaml.
-_MIN_CLIENT_VERSION = "0.6.1"
+_MIN_CLIENT_VERSION = "0.9.1"
 _DEFAULT_TIMEOUT = 120  # seconds — cloud API can take 30-40s per request
 _DEFAULT_IDLE_TIMEOUT = 300  # seconds — Hindsight embedded daemon default
 # ``metadata.source`` stamped on retained memories — OPT-IN, empty by default.
@@ -91,6 +91,22 @@ _HINDSIGHT_GLYPH = "👁️"
 # unique document_id fallback for older APIs.
 _MIN_VERSION_FOR_UPDATE_MODE_APPEND = "0.5.0"
 _VALID_BUDGETS = {"low", "mid", "high"}
+_DORVIS_TRIAGE_RUN_TYPES = {
+    "triage_review",
+    "dorvis.triage",
+    "dorvis.customer_response_classification",
+}
+_DORVIS_EXECUTION_RUN_TYPES = {"dorvis.execution"}
+_MAX_REQUEST_RETAIN_CONTENT_CHARS = 24_000
+_HEADLESS_ASSISTANT_NOISE_KEYS = {
+    "attempt",
+    "confidence_tier",
+    "headless_run_id",
+    "launch_idempotency_key",
+    "runtime_attempt_id",
+    "schema_version",
+    "trace_id",
+}
 # Per-memory traceability (AE-194). Recall results are carried alongside the
 # injected text so observers can name the exact memories a turn saw. The text
 # is truncated for the structured copy only — the injected block keeps the
@@ -105,7 +121,7 @@ _VALID_BUDGETS = {"low", "mid", "high"}
 # sheds only the tail of an all-records-at-the-ceiling worst case.
 _RECALL_SNIPPET_MAX_CHARS = 2000
 _MAX_STRUCTURED_RECALL_RECORDS = 25
-# Candidate per-result score attributes. hindsight-client 0.6.1's
+# Candidate per-result score attributes. hindsight-client 0.9.1's
 # ``RecallResult`` exposes no score field (id/text/type/entities/context/
 # occurred_start/occurred_end/mentioned_at/document_id/metadata/chunk_id/
 # tags/source_fact_ids), so ``score`` stays None today; these names let a
@@ -557,6 +573,78 @@ def _normalize_retain_tags(value: Any) -> List[str]:
     return normalized
 
 
+def _memory_workflow_for_run_type(run_type: str) -> str:
+    """Map trusted Dorvis headless run types onto memory policy names."""
+    if run_type in _DORVIS_TRIAGE_RUN_TYPES:
+        return "triage"
+    if run_type in _DORVIS_EXECUTION_RUN_TYPES:
+        return "execution"
+    return "chat"
+
+
+def _compact_headless_assistant_content(content: str, workflow: str) -> str:
+    """Keep useful structured outcomes without retaining execution noise.
+
+    Headless outputs are model-generated. Labeling that provenance prevents a
+    triage proposal from being remembered as operator approval, while dropping
+    run ids, confidence labels, and retry plumbing that have no durable value.
+    """
+
+    try:
+        parsed = json.loads(content)
+    except (TypeError, ValueError):
+        parsed = None
+
+    if not isinstance(parsed, dict):
+        return json.dumps(
+            {
+                "retention_contract": "dorvis-headless-assistant-v1",
+                "workflow": workflow,
+                "provenance": (
+                    "model-generated output; not operator approval or "
+                    "independent verification"
+                ),
+                "result": "omitted because the output was not structured JSON",
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+
+    def sanitize(value: Any, depth: int = 0) -> Any:
+        if depth >= 12:
+            return "[nested value omitted]"
+        if isinstance(value, dict):
+            return {
+                str(key): sanitize(item, depth + 1)
+                for key, item in list(value.items())[:100]
+                if str(key) not in _HEADLESS_ASSISTANT_NOISE_KEYS
+                and not str(key).endswith("_run_id")
+            }
+        if isinstance(value, list):
+            return [sanitize(item, depth + 1) for item in value[:100]]
+        if isinstance(value, str):
+            return value[:4_000]
+        if isinstance(value, (bool, int, float)) or value is None:
+            return value
+        return str(value)[:4_000]
+
+    compact = {
+        "retention_contract": "dorvis-headless-assistant-v1",
+        "workflow": workflow,
+        "provenance": (
+            "model-generated output; not operator approval or independent verification"
+        ),
+        "result": sanitize(parsed),
+    }
+    encoded = json.dumps(compact, ensure_ascii=False, separators=(",", ":"))
+    if len(encoded) <= _MAX_REQUEST_RETAIN_CONTENT_CHARS:
+        return encoded
+    compact["result"] = (
+        "omitted because the structured result exceeded the retention bound"
+    )
+    return json.dumps(compact, ensure_ascii=False, separators=(",", ":"))
+
+
 _OBSERVATION_SCOPE_KEYWORDS = {"per_tag", "combined", "all_combinations"}
 
 
@@ -836,6 +924,11 @@ class HindsightMemoryProvider(MemoryProvider):
         self._traffic_class = ""
         self._routing_status = "legacy"
         self._routing_error = ""
+        self._headless_run_type = ""
+        self._memory_workflow = "chat"
+        self._request_retain_user_content = ""
+        self._request_retain_tags: list[str] = []
+        self._request_retain_metadata: Dict[str, str] = {}
         self._turn_index = 0
         self._client = None
         self._timeout = _DEFAULT_TIMEOUT
@@ -936,6 +1029,7 @@ class HindsightMemoryProvider(MemoryProvider):
         # `recall_max_tokens` budget. Users can restore the broader
         # recall via the `recall_types` config key.
         self._recall_types: list[str] = ["observation"]
+        self._recall_prefer_observations = False
         self._recall_prompt_preamble = ""
         self._recall_max_input_chars = 800
         self._same_turn_recall_when_prefetch_empty = False
@@ -1274,6 +1368,7 @@ class HindsightMemoryProvider(MemoryProvider):
             {"key": "recall_tags", "description": "Tags to filter when searching memories (comma-separated)", "default": ""},
             {"key": "recall_tags_match", "description": "Tag matching mode for recall", "default": "any", "choices": ["any", "all", "any_strict", "all_strict"]},
             {"key": "recall_types", "description": "Fact types to surface on recall — applies to both auto-recall and the hindsight_recall tool (comma-separated or list). Defaults to observation-only — observations are Hindsight's consolidated, deduplicated, evidence-grounded knowledge layer; raw world/experience facts are the supporting evidence observations already summarize. Set to e.g. 'observation,world,experience' to also include raw facts.", "default": "observation"},
+            {"key": "workflow_memory_policies", "description": "Optional per-workflow recall policy map. Dorvis selects chat, triage, or execution from trusted request metadata; each policy may set recall_types and prefer_observations."},
             {"key": "auto_recall", "description": "Automatically recall memories before each turn", "default": True},
             {"key": "same_turn_recall_when_prefetch_empty", "description": "Synchronously recall before the LLM when no warmed prefetch result is available", "default": False},
             {"key": "same_turn_recall_platforms", "description": "Platforms allowed to use same-turn recall fallback (comma-separated or JSON array; empty = all)", "default": ""},
@@ -1725,6 +1820,11 @@ class HindsightMemoryProvider(MemoryProvider):
         self._traffic_class = ""
         self._routing_status = "legacy"
         self._routing_error = ""
+        self._headless_run_type = ""
+        self._memory_workflow = "chat"
+        self._request_retain_user_content = ""
+        self._request_retain_tags = []
+        self._request_retain_metadata = {}
         self._apply_request_metadata(kwargs.get("request_metadata"))
         self._turn_counter = 0
         self._turn_index = 0
@@ -1829,6 +1929,8 @@ class HindsightMemoryProvider(MemoryProvider):
             self._recall_types = [t.strip() for t in configured_types.split(",") if t.strip()]
         else:
             self._recall_types = list(configured_types) or ["observation"]
+        self._recall_prefer_observations = False
+        self._apply_workflow_memory_policy()
         self._recall_prompt_preamble = self._config.get("recall_prompt_preamble", "")
         # On-by-default deterministic indicator: when auto-recall injects memory,
         # Hermes emits a "👁️ Hindsight — recalled N memories" status line so the
@@ -2028,6 +2130,8 @@ class HindsightMemoryProvider(MemoryProvider):
                 recall_kwargs["tags_match"] = self._recall_tags_match
             if self._recall_types:
                 recall_kwargs["types"] = self._recall_types
+            if self._recall_prefer_observations:
+                recall_kwargs["prefer_observations"] = True
             logger.debug("Recall: calling recall (bank=%s, query_len=%d, budget=%s)",
                          self._bank_id, len(query), self._budget)
             resp = self._run_hindsight_operation(lambda client: client.arecall(**recall_kwargs))
@@ -2334,6 +2438,10 @@ class HindsightMemoryProvider(MemoryProvider):
             metadata["thread_id"] = self._thread_id
         if self._agent_identity:
             metadata["agent_identity"] = self._agent_identity
+        if self._headless_run_type:
+            metadata["headless_run_type"] = self._headless_run_type
+            metadata["memory_workflow"] = self._memory_workflow
+        metadata.update(self._request_retain_metadata)
         if self._traffic_class:
             metadata["traffic_class"] = self._traffic_class
             metadata["effective_bank_id"] = self._bank_id
@@ -2378,6 +2486,9 @@ class HindsightMemoryProvider(MemoryProvider):
             tags.append(f"source:{self._request_source}")
         if self._traffic_class:
             tags.append(f"traffic_class:{self._traffic_class}")
+        for tag in self._request_retain_tags:
+            if tag not in tags:
+                tags.append(tag)
         return tags
 
     def _apply_request_metadata(self, request_metadata: Any) -> None:
@@ -2420,6 +2531,66 @@ class HindsightMemoryProvider(MemoryProvider):
                 self._chat_type = chat_type
             if chat_name:
                 self._chat_name = chat_name
+
+        # Only the internal headless worker may replace the verbose runtime
+        # prompt with a compact, deterministic source record for retention.
+        # Browser/web callers cannot opt into this path by supplying a nested
+        # object because both the trusted source and headless chat type must
+        # match the gateway-authored metadata contract.
+        if (
+            self._request_source != "dorvis-headless-worker"
+            or self._chat_type != "headless_run"
+        ):
+            return
+
+        headless_run = request_metadata.get("headless_run")
+        if isinstance(headless_run, dict):
+            run_type = str(headless_run.get("run_type") or "").strip()
+            if run_type:
+                self._headless_run_type = run_type
+                self._memory_workflow = _memory_workflow_for_run_type(run_type)
+
+        memory = request_metadata.get("memory")
+        if not isinstance(memory, dict):
+            return
+        retain_user_content = memory.get("retain_user_content")
+        if isinstance(retain_user_content, str) and retain_user_content.strip():
+            self._request_retain_user_content = retain_user_content[
+                :_MAX_REQUEST_RETAIN_CONTENT_CHARS
+            ]
+        self._request_retain_tags = _normalize_retain_tags(memory.get("tags"))
+        raw_metadata = memory.get("metadata")
+        if isinstance(raw_metadata, dict):
+            self._request_retain_metadata = {
+                str(key): str(value)
+                for key, value in raw_metadata.items()
+                if str(key).strip() and isinstance(value, (str, int, float, bool))
+            }
+
+    def _apply_workflow_memory_policy(self) -> None:
+        policies = self._config.get("workflow_memory_policies")
+        if not isinstance(policies, dict):
+            return
+        policy = policies.get(self._memory_workflow)
+        if not isinstance(policy, dict):
+            return
+        configured_types = policy.get("recall_types")
+        if isinstance(configured_types, str):
+            self._recall_types = [
+                value.strip() for value in configured_types.split(",") if value.strip()
+            ] or self._recall_types
+        elif isinstance(configured_types, list):
+            normalized = [
+                str(value).strip()
+                for value in configured_types
+                if str(value).strip()
+            ]
+            if normalized:
+                self._recall_types = normalized
+        self._recall_prefer_observations = _parse_bool_setting(
+            policy.get("prefer_observations"),
+            False,
+        )
 
     def _disable_traffic_routing(self, reason: str) -> None:
         self._routing_status = "disabled"
@@ -2502,11 +2673,18 @@ class HindsightMemoryProvider(MemoryProvider):
         }
         if self._routing_error:
             metadata["routing_error"] = self._routing_error
+        if self._headless_run_type:
+            metadata["memory_workflow"] = self._memory_workflow
+            # MemoryManager deliberately keeps only scalar observation values,
+            # so serialize the selected types for durable trace evidence.
+            metadata["recall_types"] = ",".join(self._recall_types)
+            metadata["prefer_observations"] = self._recall_prefer_observations
         return metadata
 
     def on_turn_start(self, turn_number: int, message: str, **kwargs) -> None:
         prior = self._requested_traffic_class
         self._apply_request_metadata(kwargs.get("request_metadata"))
+        self._apply_workflow_memory_policy()
         if (
             self._traffic_class
             and self._requested_traffic_class
@@ -2561,7 +2739,21 @@ class HindsightMemoryProvider(MemoryProvider):
         if session_id:
             self._session_id = str(session_id).strip()
 
-        turn = json.dumps(self._build_turn_messages(user_content, assistant_content), ensure_ascii=False)
+        retained_user_content = self._request_retain_user_content or user_content
+        retained_assistant_content = assistant_content
+        if (
+            self._request_retain_user_content
+            and self._request_source == "dorvis-headless-worker"
+            and self._chat_type == "headless_run"
+        ):
+            retained_assistant_content = _compact_headless_assistant_content(
+                assistant_content,
+                self._memory_workflow,
+            )
+        turn = json.dumps(
+            self._build_turn_messages(retained_user_content, retained_assistant_content),
+            ensure_ascii=False,
+        )
         self._session_turns.append(turn)
         self._turn_counter += 1
         self._turn_index = self._turn_counter
@@ -2719,6 +2911,8 @@ class HindsightMemoryProvider(MemoryProvider):
                     recall_kwargs["tags_match"] = self._recall_tags_match
                 if self._recall_types:
                     recall_kwargs["types"] = self._recall_types
+                if self._recall_prefer_observations:
+                    recall_kwargs["prefer_observations"] = True
                 logger.debug("Tool hindsight_recall: bank=%s, query_len=%d, budget=%s",
                              self._bank_id, len(query), self._budget)
                 resp = self._run_hindsight_operation(lambda client: client.arecall(**recall_kwargs))
