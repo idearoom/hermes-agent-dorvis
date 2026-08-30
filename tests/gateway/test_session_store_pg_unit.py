@@ -1145,7 +1145,10 @@ def test_v26_surface_migration_script_never_prints_dsn(
         "migrate_v26_surface" if apply else "inspect_v26_surface_migration_precondition",
         _evidence,
     )
-    secret_dsn = "postgresql://operator:do-not-print@example.invalid/db"
+    secret_dsn = (
+        "postgresql://operator:do-not-print@example.invalid:6543/db"
+        "?application_name=also-do-not-print"
+    )
     argv = ["--dsn", secret_dsn]
     if apply:
         argv.append("--apply")
@@ -1154,8 +1157,12 @@ def test_v26_surface_migration_script_never_prints_dsn(
 
     output = capsys.readouterr()
     assert observed == [secret_dsn]
+    assert 'dsn_identity={"database":"db","host":"example.invalid","port":"6543"}' in output.out
     assert secret_dsn not in output.out
     assert secret_dsn not in output.err
+    assert "operator" not in output.out
+    assert "do-not-print" not in output.out
+    assert "application_name" not in output.out
 
 
 @pytest.mark.parametrize("apply", [False, True])
