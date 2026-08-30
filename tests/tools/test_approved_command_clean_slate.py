@@ -240,5 +240,5 @@ def test_execute_code_non_approved_still_interrupts_on_stale_bit(monkeypatch):
     ))
 
     assert result["status"] == "interrupted", result
-    assert "execution interrupted" in result["output"], result
-
+    assert result["output"] == "[execution interrupted]"
+    assert "user sent a new message" not in result["output"]
