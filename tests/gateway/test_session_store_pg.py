@@ -538,6 +538,148 @@ def test_v26_surface_bridge_preserves_live_rows_and_is_idempotent():
     assert "already current" in replay.stdout
 
 
+def test_v26_surface_migration_lock_timeout_rolls_back(monkeypatch):
+    _drop_schema()
+    bridge = PgSessionDB(dsn=_DSN)
+    try:
+        bridge.create_session("surface-lock", source="webui")
+        bridge.append_message("surface-lock", "user", "preserve me")
+    finally:
+        bridge.close()
+
+    monkeypatch.setattr(
+        hermes_state_pg, "_V26_MIGRATION_ADVISORY_TIMEOUT", "1000ms"
+    )
+    monkeypatch.setattr(
+        hermes_state_pg, "_V26_MIGRATION_LOCK_TIMEOUT", "200ms"
+    )
+    monkeypatch.setattr(
+        hermes_state_pg, "_V26_MIGRATION_STATEMENT_TIMEOUT", "1000ms"
+    )
+
+    blocker = psycopg.connect(_DSN, autocommit=False)
+    try:
+        blocker.execute(
+            f"SELECT id FROM {_SCHEMA}.messages WHERE session_id = %s",
+            ("surface-lock",),
+        ).fetchall()
+        started = time.monotonic()
+        with pytest.raises(psycopg.errors.LockNotAvailable):
+            hermes_state_pg.migrate_v26_surface(_DSN)
+        assert time.monotonic() - started < 2.0
+    finally:
+        blocker.rollback()
+        blocker.close()
+
+    with psycopg.connect(_DSN, autocommit=True) as conn:
+        marker = conn.execute(
+            f"SELECT value FROM {_SCHEMA}.state_meta WHERE key = %s",
+            (hermes_state_pg._META_SURFACE_KEY,),
+        ).fetchone()[0]
+        assert marker == hermes_state_pg.EXPECTED_SCHEMA_SURFACE_SHA256
+        assert conn.execute(
+            "SELECT 1 FROM information_schema.columns "
+            "WHERE table_schema = %s AND table_name = 'messages' "
+            "AND column_name = '_compressed_summary'",
+            (_SCHEMA,),
+        ).fetchone() is None
+
+    result = hermes_state_pg.migrate_v26_surface(_DSN)
+    assert result["migration_applied"] is True
+
+
+def test_v26_surface_migration_advisory_lock_is_bounded(monkeypatch):
+    _drop_schema()
+    bridge = PgSessionDB(dsn=_DSN)
+    bridge.close()
+    monkeypatch.setattr(
+        hermes_state_pg, "_V26_MIGRATION_ADVISORY_TIMEOUT", "200ms"
+    )
+
+    blocker = psycopg.connect(_DSN, autocommit=True)
+    try:
+        blocker.execute(
+            "SELECT pg_advisory_lock(%s)",
+            (PgSessionDB._BOOTSTRAP_LOCK_KEY,),
+        )
+        started = time.monotonic()
+        with pytest.raises(psycopg.errors.LockNotAvailable):
+            hermes_state_pg.migrate_v26_surface(_DSN)
+        assert time.monotonic() - started < 2.0
+    finally:
+        blocker.execute(
+            "SELECT pg_advisory_unlock(%s)",
+            (PgSessionDB._BOOTSTRAP_LOCK_KEY,),
+        )
+        blocker.close()
+
+    with psycopg.connect(_DSN, autocommit=True) as conn:
+        assert conn.execute(
+            f"SELECT value FROM {_SCHEMA}.state_meta WHERE key = %s",
+            (hermes_state_pg._META_SURFACE_KEY,),
+        ).fetchone()[0] == hermes_state_pg.EXPECTED_SCHEMA_SURFACE_SHA256
+        assert conn.execute(
+            "SELECT 1 FROM information_schema.columns "
+            "WHERE table_schema = %s AND table_name = 'messages' "
+            "AND column_name = '_compressed_summary'",
+            (_SCHEMA,),
+        ).fetchone() is None
+
+
+def test_v26_surface_migration_statement_timeout_rolls_back_ddl(monkeypatch):
+    _drop_schema()
+    bridge = PgSessionDB(dsn=_DSN)
+    try:
+        bridge.create_session("surface-rollback", source="webui")
+        bridge.append_message("surface-rollback", "user", "preserve me")
+    finally:
+        bridge.close()
+
+    monkeypatch.setattr(
+        hermes_state_pg, "_V26_MIGRATION_ADVISORY_TIMEOUT", "1000ms"
+    )
+    monkeypatch.setattr(
+        hermes_state_pg, "_V26_MIGRATION_LOCK_TIMEOUT", "1000ms"
+    )
+    monkeypatch.setattr(
+        hermes_state_pg, "_V26_MIGRATION_STATEMENT_TIMEOUT", "200ms"
+    )
+
+    blocker = psycopg.connect(_DSN, autocommit=False)
+    try:
+        blocker.execute(
+            f"SELECT value FROM {_SCHEMA}.state_meta WHERE key = %s FOR UPDATE",
+            (hermes_state_pg._META_SURFACE_KEY,),
+        ).fetchone()
+        started = time.monotonic()
+        with pytest.raises(psycopg.errors.QueryCanceled):
+            hermes_state_pg.migrate_v26_surface(_DSN)
+        assert time.monotonic() - started < 2.0
+    finally:
+        blocker.rollback()
+        blocker.close()
+
+    with psycopg.connect(_DSN, autocommit=True) as conn:
+        assert conn.execute(
+            f"SELECT value FROM {_SCHEMA}.state_meta WHERE key = %s",
+            (hermes_state_pg._META_SURFACE_KEY,),
+        ).fetchone()[0] == hermes_state_pg.EXPECTED_SCHEMA_SURFACE_SHA256
+        assert conn.execute(
+            "SELECT 1 FROM information_schema.columns "
+            "WHERE table_schema = %s AND table_name = 'messages' "
+            "AND column_name = '_compressed_summary'",
+            (_SCHEMA,),
+        ).fetchone() is None
+
+    rollback_target = PgSessionDB(dsn=_DSN)
+    try:
+        assert rollback_target.get_messages("surface-rollback")[0]["content"] == (
+            "preserve me"
+        )
+    finally:
+        rollback_target.close()
+
+
 def test_migration_mode_refuses_absent_schema_without_initializing_it():
     _drop_schema()
     with pytest.raises(RuntimeError, match="requires an existing hermes_state"):
