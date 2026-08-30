@@ -130,6 +130,23 @@ def test_second_current_schema_boot_is_catalog_neutral(pg_db):
         assert _catalog_signature(conn) == before
 
 
+def test_fresh_schema_uses_current_surface_and_summary_column(pg_db):
+    assert pg_db.storage_attestation() == {
+        "backend": "postgres",
+        "schema_version": EXPECTED_SCHEMA_VERSION,
+        "surface_marker": hermes_state_pg.EXPECTED_SCHEMA_SURFACE_SHA256,
+    }
+    with psycopg.connect(_DSN, autocommit=True) as conn:
+        column = conn.execute(
+            "SELECT data_type, is_nullable, column_default "
+            "FROM information_schema.columns "
+            "WHERE table_schema = %s AND table_name = 'messages' "
+            "AND column_name = '_compressed_summary'",
+            (_SCHEMA,),
+        ).fetchone()
+        assert column == ("bigint", "NO", "0")
+
+
 def test_replace_messages_and_counters(pg_db):
     sid = pg_db.create_session("sess-r", "webui")
     for i in range(4):
@@ -468,6 +485,94 @@ def _run_v26_migration(*extra_args):
     )
 
 
+def _run_v26_surface_migration(*extra_args):
+    return subprocess.run(
+        [
+            sys.executable,
+            str(_REPO_ROOT / "scripts" / "migrate_pg_schema_v26_surface.py"),
+            "--dsn",
+            _DSN,
+            *extra_args,
+        ],
+        cwd=_REPO_ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
+def test_v26_surface_migration_preserves_rows_and_is_idempotent():
+    _drop_schema()
+    current = PgSessionDB(dsn=_DSN)
+    try:
+        current.create_session("surface-bridge", source="webui")
+        current.append_message("surface-bridge", "user", "before expansion")
+    finally:
+        current.close()
+
+    with psycopg.connect(_DSN, autocommit=True) as conn:
+        conn.execute(
+            f"ALTER TABLE {_SCHEMA}.messages DROP COLUMN _compressed_summary"
+        )
+        conn.execute(
+            f"UPDATE {_SCHEMA}.state_meta SET value = %s WHERE key = %s",
+            (
+                hermes_state_pg._V26_PRE_SUMMARY_SCHEMA_SURFACE_SHA256,
+                hermes_state_pg._META_SURFACE_KEY,
+            ),
+        )
+        before = _catalog_signature(conn)
+
+    with pytest.raises(RuntimeError, match="surface migration required"):
+        PgSessionDB(dsn=_DSN)
+    with psycopg.connect(_DSN, autocommit=True) as conn:
+        assert _catalog_signature(conn) == before
+
+    dry_run = _run_v26_surface_migration()
+    assert dry_run.returncode == 0, dry_run.stderr
+    assert "migration_required=true" in dry_run.stdout
+    with psycopg.connect(_DSN, autocommit=True) as conn:
+        assert _catalog_signature(conn) == before
+
+    applied = _run_v26_surface_migration("--apply")
+    assert applied.returncode == 0, applied.stderr
+    assert "Migration applied" in applied.stdout
+
+    target = PgSessionDB(dsn=_DSN)
+    try:
+        assert target.storage_attestation()["surface_marker"] == (
+            hermes_state_pg.EXPECTED_SCHEMA_SURFACE_SHA256
+        )
+        assert target.get_messages("surface-bridge")[0]["content"] == (
+            "before expansion"
+        )
+        target.append_message(
+            "surface-bridge",
+            "assistant",
+            "after expansion",
+            _compressed_summary=True,
+        )
+    finally:
+        target.close()
+
+    with psycopg.connect(_DSN, autocommit=True) as conn:
+        marker = conn.execute(
+            f"SELECT value FROM {_SCHEMA}.state_meta WHERE key = %s",
+            (hermes_state_pg._META_SURFACE_KEY,),
+        ).fetchone()[0]
+        assert marker == hermes_state_pg.EXPECTED_SCHEMA_SURFACE_SHA256
+        summary_markers = conn.execute(
+            f"SELECT _compressed_summary FROM {_SCHEMA}.messages "
+            "WHERE session_id = %s ORDER BY id",
+            ("surface-bridge",),
+        ).fetchall()
+        assert summary_markers == [(0,), (1,)]
+
+    replay = _run_v26_surface_migration("--apply")
+    assert replay.returncode == 0, replay.stderr
+    assert "already current" in replay.stdout
+
+
 def test_migration_mode_refuses_absent_schema_without_initializing_it():
     _drop_schema()
     with pytest.raises(RuntimeError, match="requires an existing hermes_state"):
@@ -552,6 +657,7 @@ def test_v22_requires_explicit_migration_and_preserves_rows():
             old,
             "assistant",
             "written after the migration",
+            _compressed_summary=True,
             display_kind="internal_notification",
             display_metadata={"source": "migration-test"},
         )
@@ -570,6 +676,10 @@ def test_v22_requires_explicit_migration_and_preserves_rows():
         assert conn.execute(
             f"SELECT version FROM {_SCHEMA}.schema_version"
         ).fetchone()[0] == EXPECTED_SCHEMA_VERSION
+        assert conn.execute(
+            f"SELECT value FROM {_SCHEMA}.state_meta WHERE key = %s",
+            (hermes_state_pg._META_SURFACE_KEY,),
+        ).fetchone()[0] == hermes_state_pg.EXPECTED_SCHEMA_SURFACE_SHA256
         prompt_rows = conn.execute(
             f"SELECT prompt FROM {_SCHEMA}.system_prompts ORDER BY hash"
         ).fetchall()
@@ -586,13 +696,15 @@ def test_v22_requires_explicit_migration_and_preserves_rows():
         assert by_id[old][2] is None
         assert by_id[new][2] == "duplicate"
         display = conn.execute(
-            f"SELECT display_kind, display_metadata FROM {_SCHEMA}.messages "
+            f"SELECT display_kind, display_metadata, _compressed_summary "
+            f"FROM {_SCHEMA}.messages "
             "WHERE session_id = %s ORDER BY id DESC LIMIT 1",
             (old,),
         ).fetchone()
         assert display == (
             "internal_notification",
             '{"source": "migration-test"}',
+            1,
         )
 
     # Migration mode is deliberately one-shot, not an idempotent ensure-current

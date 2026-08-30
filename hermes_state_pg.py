@@ -75,6 +75,13 @@ _SCHEMA = "hermes_state"
 # migration/cutover when needed), then updates these constants.
 EXPECTED_SCHEMA_VERSION = 26
 EXPECTED_SCHEMA_SURFACE_SHA256 = (
+    "4fcc7bb46a26f9d3ad47322dcdd24ae972fb349b66ca715fcdcb2ae16ba39ca6"
+)
+# v2026.8.19 and v2026.8.27 both report schema version 26, but v2026.8.27 adds
+# one durable compressed-summary marker. Keep the predecessor hash solely as
+# the source accepted by the explicit AE-240 migration. Ordinary v2026.8.27
+# runtime boot requires EXPECTED_SCHEMA_SURFACE_SHA256 exactly.
+_V26_PRE_SUMMARY_SCHEMA_SURFACE_SHA256 = (
     "cd2cb9ee351693e62e9dc8e425885a4a08148551d9577d506f4a11be4a715d5f"
 )
 _V22_SCHEMA_SURFACE_SHA256 = (
@@ -82,9 +89,9 @@ _V22_SCHEMA_SURFACE_SHA256 = (
 )
 
 # ── Audited predecessor markers (AE-182) ───────────────────────────────────
-# v22 is the only audited migration predecessor. This release adds a durable
-# cross-task turn lease, so the transition is deliberately drain-only: runtime
-# boot observes and refuses v22; the explicit migration command owns all DDL.
+# v22 is the only audited cross-version migration predecessor. That transition
+# is deliberately drain-only because it adds a durable cross-task turn lease.
+# The separate pre-summary v26 predecessor above has a bounded online expansion.
 # state_meta keys used by the Pg backend's persisted markers.
 _META_SURFACE_KEY = "pg_backend_schema_surface_sha256"
 
@@ -236,6 +243,7 @@ PG_SCHEMA_SQL: List[str] = [
         codex_message_items TEXT,
         platform_message_id TEXT,
         observed BIGINT DEFAULT 0,
+        _compressed_summary BIGINT NOT NULL DEFAULT 0,
         active BIGINT NOT NULL DEFAULT 1,
         compacted BIGINT NOT NULL DEFAULT 0,
         api_content TEXT,
@@ -414,6 +422,13 @@ PG_SCHEMA_SQL: List[str] = [
 ]
 
 # ── Explicit drain-only column expansion ──────────────────────────────────
+# Online-safe v26 surface expansion used by the explicit AE-240 migration and
+# by the older drained v22→v26 migration. Runtime boot never executes it.
+PG_V26_SUMMARY_SURFACE_SQL = (
+    f"ALTER TABLE {_SCHEMA}.messages ADD COLUMN IF NOT EXISTS "
+    "_compressed_summary BIGINT NOT NULL DEFAULT 0"
+)
+
 # ``CREATE TABLE IF NOT EXISTS`` never adds columns to a table that already
 # exists, so the drain-only v22→v26 migration applies these idempotent ALTERs
 # explicitly. Runtime boot never executes them: v22 tasks cannot honor v26
@@ -444,6 +459,7 @@ PG_EXPAND_SQL: List[str] = [
     "owner_instance TEXT",
     f"ALTER TABLE {_SCHEMA}.async_delegations ADD COLUMN IF NOT EXISTS "
     "origin_session_id TEXT NOT NULL DEFAULT ''",
+    PG_V26_SUMMARY_SURFACE_SQL,
 ]
 
 # v25 adds a content-addressed system-prompt reference. Postgres lacks
@@ -519,8 +535,9 @@ _REQUIRED_COLUMNS: Dict[str, frozenset[str]] = {
             "token_count", "finish_reason", "reasoning",
             "reasoning_content", "reasoning_details",
             "codex_reasoning_items", "codex_message_items",
-            "platform_message_id", "observed", "active", "compacted",
-            "api_content", "display_kind", "display_metadata",
+            "platform_message_id", "observed", "_compressed_summary",
+            "active", "compacted", "api_content", "display_kind",
+            "display_metadata",
         }
     ),
     "session_model_usage": frozenset(
@@ -566,6 +583,11 @@ _REQUIRED_COLUMNS: Dict[str, frozenset[str]] = {
             "managed_mode", "linked_at", "updated_at",
         }
     ),
+}
+
+_V26_PRE_SUMMARY_REQUIRED_COLUMNS: Dict[str, frozenset[str]] = {
+    **_REQUIRED_COLUMNS,
+    "messages": _REQUIRED_COLUMNS["messages"] - {"_compressed_summary"},
 }
 
 # Exact catalog accepted by the one-shot migration preflight. These sets
@@ -766,7 +788,14 @@ _BIGINT_COLUMNS = frozenset(
         ),
         *(
             ("messages", column)
-            for column in ("id", "token_count", "observed", "active", "compacted")
+            for column in (
+                "id",
+                "token_count",
+                "observed",
+                "_compressed_summary",
+                "active",
+                "compacted",
+            )
         ),
         *(
             ("session_model_usage", column)
@@ -858,7 +887,15 @@ _NOT_NULL_COLUMNS = frozenset(
         ),
         *(
             ("messages", column)
-            for column in ("id", "session_id", "role", "timestamp", "active", "compacted")
+            for column in (
+                "id",
+                "session_id",
+                "role",
+                "timestamp",
+                "_compressed_summary",
+                "active",
+                "compacted",
+            )
         ),
         *(
             ("session_model_usage", column)
@@ -951,6 +988,7 @@ _COLUMN_DEFAULTS: Dict[tuple[str, str], str] = {
         )
     },
     ("messages", "observed"): "0",
+    ("messages", "_compressed_summary"): "0",
     ("messages", "active"): "1",
     ("messages", "compacted"): "0",
     **{
@@ -1006,6 +1044,9 @@ def _column_specs(
 
 
 _REQUIRED_COLUMN_SPECS = _column_specs(_REQUIRED_COLUMNS)
+_V26_PRE_SUMMARY_REQUIRED_COLUMN_SPECS = _column_specs(
+    _V26_PRE_SUMMARY_REQUIRED_COLUMNS
+)
 _V22_REQUIRED_COLUMN_SPECS = _column_specs(_V22_REQUIRED_COLUMNS)
 
 
@@ -1941,6 +1982,7 @@ class PgSessionDB(SessionDB):
                 "SELECT pg_advisory_lock(%s)", (self._BOOTSTRAP_LOCK_KEY,)
             )
             try:
+                surface_marker = EXPECTED_SCHEMA_SURFACE_SHA256
                 namespace = conn.execute(
                     "SELECT to_regnamespace(%s)", (_SCHEMA,)
                 ).fetchone()
@@ -1979,7 +2021,9 @@ class PgSessionDB(SessionDB):
                             # wrong DSN pointing at v26 must fail too.
                             self._migrate_v22_to_v26(conn)
                         elif db_version == EXPECTED_SCHEMA_VERSION:
-                            self._assert_persisted_schema_markers(conn)
+                            surface_marker = self._assert_persisted_schema_markers(
+                                conn
+                            )
                             self._verify_catalog(conn)
                         else:
                             # Stable fail-closed errors (including the explicit
@@ -1989,7 +2033,7 @@ class PgSessionDB(SessionDB):
                 self._storage_attestation = {
                     "backend": "postgres",
                     "schema_version": EXPECTED_SCHEMA_VERSION,
-                    "surface_marker": EXPECTED_SCHEMA_SURFACE_SHA256,
+                    "surface_marker": surface_marker,
                 }
 
                 if install_search_acceleration:
@@ -2150,13 +2194,13 @@ class PgSessionDB(SessionDB):
 
     @staticmethod
     def _verify_catalog(conn) -> None:
-        """Prove the live store has the exact audited v26 semantics."""
+        """Prove the live store matches the exact v2026.8.27 v26 surface."""
         PgSessionDB._verify_catalog_shape(
             conn,
             required_column_specs=_REQUIRED_COLUMN_SPECS,
             required_index_specs=_REQUIRED_INDEX_SPECS,
             required_constraint_specs=_REQUIRED_CONSTRAINT_SPECS,
-            label="v26",
+            label="v26 + compressed-summary marker",
             exact_relations=True,
         )
 
@@ -2466,7 +2510,7 @@ class PgSessionDB(SessionDB):
                 + "; ".join(problems)
             )
 
-    def _assert_persisted_schema_markers(self, conn) -> None:
+    def _assert_persisted_schema_markers(self, conn) -> str:
         """Verify persisted markers without mutating them.
 
         Fresh-store marker creation and the explicit v22→v26 transition live
@@ -2496,13 +2540,22 @@ class PgSessionDB(SessionDB):
                 "Postgres session store is missing its schema surface marker; "
                 "refusing to infer or repair it during runtime boot."
             )
-        if row[0] != EXPECTED_SCHEMA_SURFACE_SHA256:
+        surface_marker = str(row[0])
+        if surface_marker == _V26_PRE_SUMMARY_SCHEMA_SURFACE_SHA256:
+            raise RuntimeError(
+                "Postgres session store v26 surface migration required "
+                "(messages._compressed_summary). Deploy the AE-240 "
+                "compatibility bridge and run the explicit v26 surface "
+                "migration before starting this image."
+            )
+        if surface_marker != EXPECTED_SCHEMA_SURFACE_SHA256:
             raise RuntimeError(
                 "Postgres session store was initialized against a different "
-                f"upstream schema surface (db={row[0]}, "
-                f"build={EXPECTED_SCHEMA_SURFACE_SHA256}). Rebase drift — "
+                f"upstream schema surface (db={surface_marker}, expected="
+                f"{EXPECTED_SCHEMA_SURFACE_SHA256}). Rebase drift — "
                 "re-audit hermes_state_pg.py and migrate deliberately."
             )
+        return surface_marker
 
     def _init_schema(self) -> None:  # pragma: no cover - safety net
         self._init_pg_schema()
@@ -2882,3 +2935,136 @@ def inspect_v22_migration_precondition(dsn: str) -> Dict[str, Any]:
         "schema_version": 22,
         "surface_marker": _V22_SCHEMA_SURFACE_SHA256,
     }
+
+
+def _inspect_v26_surface(conn) -> Dict[str, Any]:
+    """Verify and classify the exact migration source or destination."""
+    version = PgSessionDB._read_schema_version(conn)
+    if version != EXPECTED_SCHEMA_VERSION:
+        raise RuntimeError(
+            "Postgres v26 surface migration requires schema_version 26 "
+            f"exactly (found {version}); refusing to mutate this store."
+        )
+    surface = PgSessionDB._read_surface_marker(conn)
+    if surface == _V26_PRE_SUMMARY_SCHEMA_SURFACE_SHA256:
+        PgSessionDB._verify_catalog_shape(
+            conn,
+            required_column_specs=_V26_PRE_SUMMARY_REQUIRED_COLUMN_SPECS,
+            required_index_specs=_REQUIRED_INDEX_SPECS,
+            required_constraint_specs=_REQUIRED_CONSTRAINT_SPECS,
+            label="v26 migration source",
+            exact_relations=True,
+        )
+        migration_required = True
+    elif surface == EXPECTED_SCHEMA_SURFACE_SHA256:
+        PgSessionDB._verify_catalog(conn)
+        migration_required = False
+    else:
+        raise RuntimeError(
+            "Postgres v26 surface migration requires the exact current or "
+            f"destination marker (found {surface!r}); refusing unknown drift."
+        )
+    return {
+        "backend": "postgres",
+        "schema_version": EXPECTED_SCHEMA_VERSION,
+        "surface_marker": surface,
+        "target_surface_marker": EXPECTED_SCHEMA_SURFACE_SHA256,
+        "migration_required": migration_required,
+    }
+
+
+def inspect_v26_surface_migration_precondition(dsn: str) -> Dict[str, Any]:
+    """Read-only proof of the exact AE-240 migration source or destination."""
+    dsn = (dsn or "").strip()
+    if not dsn:
+        raise ValueError("Postgres migration preflight requires a DSN")
+    assert_schema_compat()
+
+    import psycopg
+    from psycopg import ClientCursor
+
+    with psycopg.connect(_normalize_dsn(dsn), autocommit=True) as conn:
+        conn.cursor_factory = ClientCursor
+        with conn.transaction():
+            conn.execute(
+                "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"
+            )
+            namespace = conn.execute(
+                "SELECT to_regnamespace(%s)", (_SCHEMA,)
+            ).fetchone()
+            if not namespace or namespace[0] is None:
+                raise RuntimeError(
+                    "Postgres v26 surface migration requires an existing "
+                    "hermes_state schema; the selected database has none."
+                )
+            version_table = conn.execute(
+                "SELECT to_regclass(%s)", (f"{_SCHEMA}.schema_version",)
+            ).fetchone()
+            if not version_table or version_table[0] is None:
+                raise RuntimeError(
+                    "Postgres v26 surface migration requires an existing "
+                    "hermes_state.schema_version table."
+                )
+            return _inspect_v26_surface(conn)
+
+
+def _migrate_v26_surface_on_connection(conn) -> Dict[str, Any]:
+    """Apply or verify the AE-240 expansion in the caller's transaction."""
+    current = _inspect_v26_surface(conn)
+    if not current["migration_required"]:
+        return current
+
+    conn.execute(PG_V26_SUMMARY_SURFACE_SQL)
+    PgSessionDB._verify_catalog(conn)
+    updated = conn.execute(
+        f"UPDATE {_SCHEMA}.state_meta SET value = %s "
+        "WHERE key = %s AND value = %s RETURNING value",
+        (
+            EXPECTED_SCHEMA_SURFACE_SHA256,
+            _META_SURFACE_KEY,
+            _V26_PRE_SUMMARY_SCHEMA_SURFACE_SHA256,
+        ),
+    ).fetchone()
+    if updated is None:
+        raise RuntimeError(
+            "Postgres v26 surface marker changed during migration; "
+            "rolling back instead of inferring ownership."
+        )
+    destination = _inspect_v26_surface(conn)
+    destination["migration_applied"] = True
+    return destination
+
+
+def migrate_v26_surface(dsn: str) -> Dict[str, Any]:
+    """Apply the one-column AE-240 expansion under the bootstrap lock.
+
+    The transaction is idempotent only at the exact audited destination.
+    Runtime boot never calls this function.
+    """
+    dsn = (dsn or "").strip()
+    if not dsn:
+        raise ValueError("Postgres migration requires a DSN")
+    assert_schema_compat()
+
+    import psycopg
+    from psycopg import ClientCursor
+
+    with psycopg.connect(_normalize_dsn(dsn), autocommit=True) as conn:
+        conn.cursor_factory = ClientCursor
+        conn.execute(
+            "SELECT pg_advisory_lock(%s)", (PgSessionDB._BOOTSTRAP_LOCK_KEY,)
+        )
+        try:
+            with conn.transaction():
+                return _migrate_v26_surface_on_connection(conn)
+        finally:
+            try:
+                conn.execute(
+                    "SELECT pg_advisory_unlock(%s)",
+                    (PgSessionDB._BOOTSTRAP_LOCK_KEY,),
+                )
+            except Exception:
+                logger.warning(
+                    "failed to release session-store migration advisory lock",
+                    exc_info=True,
+                )

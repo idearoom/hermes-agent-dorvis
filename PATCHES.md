@@ -4,9 +4,31 @@ This fork carries IdeaRoom-specific runtime patches on top of NousResearch
 `hermes-agent` upstream. Keep this file current whenever a patch is added,
 removed, rebased, or promoted.
 
-Current upstream base for the carried branch: `fcbd1076a93841fa88855acce810e342a5b78101`
-(official annotated release tag `v2026.8.19`, Hermes v0.20.5; previous base
-`64702f8f91661149128ca1a721f7a0fd4c22113b`).
+Current upstream base for the carried branch: `5fc308a70719a83cccdbba4c0e39c23f5a8239d5`
+(official annotated release tag `v2026.8.27`, Hermes v0.20.6; previous base
+`fcbd1076a93841fa88855acce810e342a5b78101`).
+
+### 2026-08-30 rebase notes (fcbd1076a → 5fc308a70)
+
+- **Parity-first behavior** — the upstream implementation is carried without
+  enabling optional behavior in the Dorvis release. Native Responses
+  compaction and deterministic proactive tool-result pruning remain disabled;
+  legacy tail compression, current routing, and existing observability remain
+  the parent configuration contract.
+- **Postgres v26 surface transition** — upstream keeps schema version 26 while
+  adding durable `messages._compressed_summary` state. The published v2026.8.19
+  bridge at `cfe34ac0157dfcb0d2381592531f80f989b13ba7` accepts the exact old and
+  widened catalogs so it remains a rollback target around the online expansion.
+  The rebased runtime requires only the widened surface
+  (`4fcc7bb46a26f9d3ad47322dcdd24ae972fb349b66ca715fcdcb2ae16ba39ca6`),
+  creates it for fresh stores and drained v22 migrations, and keeps the
+  advisory-lock-protected old-v26→new-v26 migration explicit and
+  observation-only by default.
+- **Conflict reconciliation** — Dorvis compression quality gates,
+  exactly-once lifecycle telemetry, drain accounting, process ownership,
+  Browserless tenancy, and fail-closed configured-Postgres behavior compose
+  with upstream's cache recovery, browser-control state, compaction status,
+  and gateway health work.
 
 ### 2026-08-24 rebase notes (64702f8f9 → fcbd1076a)
 
@@ -196,6 +218,7 @@ notable resolutions:
 
 | Patch | Status | Purpose | Main files | Conflict surface | Owner |
 |---|---|---|---|---|---|
+| Postgres v26 surface transition (AE-240) | Bridge published; target pending promotion | The v2026.8.19 bridge artifact at `cfe34ac0157dfcb0d2381592531f80f989b13ba7` accepts only the exact pre-summary v26 catalog or that catalog plus `messages._compressed_summary BIGINT NOT NULL DEFAULT 0`, making it a valid rollout and rollback artifact around the additive migration. The v2026.8.27 runtime accepts only the widened catalog and writes the durable marker. Runtime boot remains observation-only in both artifacts. A separate advisory-lock-protected command preflights the exact old source, adds the one constant-default column transactionally, verifies the destination catalog before advancing its marker, and is idempotent only at the exact destination. Every missing, extra, malformed, or marker/catalog-disagreeing surface fails closed. | `hermes_state_pg.py`, `scripts/migrate_pg_schema_v26_surface.py`, `tests/gateway/test_session_store_pg.py`, `tests/gateway/test_session_store_pg_unit.py` | Medium: exact Postgres catalog admission, state-surface attestation, and the one-way additive migration boundary | IdeaRoom Agentic Systems |
 | Request metadata and tool-dispatch observability | Promoted in fork history | Preserve request/session/turn metadata through hooks and tool execution so gateway, traces, and downstream plugins can correlate turns reliably. | `run_agent.py`, `model_tools.py`, `hermes_cli/hooks.py`, `hermes_cli/plugins.py`, `tools/delegate_tool.py` | Medium: agent loop and hook dispatch | IdeaRoom Agentic Systems |
 | Native and AnyDoc document-reading hardening | Pending promotion | Expose upstream's native DOCX, XLSX, and IPYNB-to-text extraction through the existing bounded `read_file` contract while keeping blocked-path checks ahead of byte transport. Enforce fail-fast process concurrency, per-format byte and output budgets, bounded base64 transport that rejects a zero-byte result after a nonempty stat, strict OOXML ZIP/XML/relationship/cell limits, and safe notebook rendering that omits active HTML/widgets and sanitizes retained traceback text. Notebook JSON syntax/decode failures and parsed notebooks with no renderable cell structure fall back to the same already-bounded raw snapshot after their parser traceback graph is detached; oversize/I/O failures, malformed binary documents, and a future Python runtime without the private ZIP end-record helper fail cleanly. Valid dense OOXML content returns an explicitly truncated safe prefix when only a content/parser-view budget is exhausted, while ZIP, relationship, metadata, shared-string, and malformed-XML contracts remain fail closed. Preserve upstream's optional AnyDoc path for generic deployments, add a final 2,000,000-character conversion cap before `read_file` pagination/serialization, and retain `HERMES_DISABLE_ANYDOC` as a pre-import/pre-install managed-runtime kill switch whose truthy operator seal cannot be weakened by config. Managed overlays can bake and enable the exact converter version without relying on runtime downloads, while config-read failures still fail closed for only that converter. | `tools/read_extract.py`, `tools/file_operations.py`, `tools/file_tools.py`, `tests/tools/test_read_extract.py`, `tests/tools/test_file_operations.py`, `tests/tools/test_structured_read_file.py` | Medium: file-read dispatch, untrusted archive/XML parsing, memory and output bounds | IdeaRoom Agentic Systems |
 | Hermetic Playwright container dependency | Pending promotion | Pin the root Playwright package and invoke its installed binary directly so the Chromium layer used by the runtime image cannot drift through `npx` package resolution between the tested and published build. | `package.json`, `package-lock.json`, `Dockerfile`, `tests-js/docker-playwright-pin.test.ts` | Low: container-only browser dependency installation | IdeaRoom Agentic Systems |
