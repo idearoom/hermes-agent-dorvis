@@ -468,6 +468,76 @@ def _run_v26_migration(*extra_args):
     )
 
 
+def _run_v26_surface_migration(*extra_args):
+    return subprocess.run(
+        [
+            sys.executable,
+            str(_REPO_ROOT / "scripts" / "migrate_pg_schema_v26_surface.py"),
+            "--dsn",
+            _DSN,
+            *extra_args,
+        ],
+        cwd=_REPO_ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
+def test_v26_surface_bridge_preserves_live_rows_and_is_idempotent():
+    _drop_schema()
+    bridge = PgSessionDB(dsn=_DSN)
+    try:
+        bridge.create_session("surface-bridge", source="webui")
+        bridge.append_message("surface-bridge", "user", "before expansion")
+    finally:
+        bridge.close()
+
+    with psycopg.connect(_DSN, autocommit=True) as conn:
+        before = _catalog_signature(conn)
+
+    dry_run = _run_v26_surface_migration()
+    assert dry_run.returncode == 0, dry_run.stderr
+    assert "migration_required=true" in dry_run.stdout
+    with psycopg.connect(_DSN, autocommit=True) as conn:
+        assert _catalog_signature(conn) == before
+
+    applied = _run_v26_surface_migration("--apply")
+    assert applied.returncode == 0, applied.stderr
+    assert "Migration applied" in applied.stdout
+
+    rollback_target = PgSessionDB(dsn=_DSN)
+    try:
+        assert rollback_target.storage_attestation()["surface_marker"] == (
+            hermes_state_pg.FORWARD_SCHEMA_SURFACE_SHA256
+        )
+        assert rollback_target.get_messages("surface-bridge")[0]["content"] == (
+            "before expansion"
+        )
+        rollback_target.append_message(
+            "surface-bridge", "assistant", "after expansion"
+        )
+    finally:
+        rollback_target.close()
+
+    with psycopg.connect(_DSN, autocommit=True) as conn:
+        marker = conn.execute(
+            f"SELECT value FROM {_SCHEMA}.state_meta WHERE key = %s",
+            (hermes_state_pg._META_SURFACE_KEY,),
+        ).fetchone()[0]
+        assert marker == hermes_state_pg.FORWARD_SCHEMA_SURFACE_SHA256
+        summary_default = conn.execute(
+            f"SELECT _compressed_summary FROM {_SCHEMA}.messages "
+            "WHERE session_id = %s ORDER BY id",
+            ("surface-bridge",),
+        ).fetchall()
+        assert summary_default == [(0,), (0,)]
+
+    replay = _run_v26_surface_migration("--apply")
+    assert replay.returncode == 0, replay.stderr
+    assert "already current" in replay.stdout
+
+
 def test_migration_mode_refuses_absent_schema_without_initializing_it():
     _drop_schema()
     with pytest.raises(RuntimeError, match="requires an existing hermes_state"):

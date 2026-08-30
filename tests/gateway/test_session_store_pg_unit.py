@@ -17,6 +17,7 @@ import pytest
 import hermes_state
 import hermes_state_pg
 from scripts import migrate_pg_schema_v22_to_v26 as migration_script
+from scripts import migrate_pg_schema_v26_surface as surface_migration_script
 from hermes_state import SessionDB
 from hermes_state_pg import (
     EXPECTED_SCHEMA_SURFACE_SHA256,
@@ -423,6 +424,19 @@ def test_unknown_persisted_schema_surface_fails_closed():
         )
 
 
+def test_bridge_accepts_only_the_audited_forward_surface_marker():
+    conn = _MarkerConn(
+        version=EXPECTED_SCHEMA_VERSION,
+        surface=hermes_state_pg.FORWARD_SCHEMA_SURFACE_SHA256,
+    )
+
+    marker = PgSessionDB._assert_persisted_schema_markers(
+        PgSessionDB.__new__(PgSessionDB), conn
+    )
+
+    assert marker == hermes_state_pg.FORWARD_SCHEMA_SURFACE_SHA256
+
+
 class _RowsResult:
     def __init__(self, rows=()):
         self._rows = list(rows)
@@ -527,6 +541,7 @@ class _CatalogConn:
         include_optional_index=False,
         extra_index=None,
         pg18_not_null_constraints=False,
+        forward_surface=False,
     ):
         self.executed = []
         self.version = version
@@ -541,6 +556,7 @@ class _CatalogConn:
         self.include_optional_index = include_optional_index
         self.extra_index = extra_index
         self.pg18_not_null_constraints = pg18_not_null_constraints
+        self.forward_surface = forward_surface
 
     def execute(self, sql, params=None):
         self.executed.append((sql, params))
@@ -552,7 +568,11 @@ class _CatalogConn:
             columns = (
                 hermes_state_pg._V22_REQUIRED_COLUMN_SPECS
                 if self.catalog_version == 22
-                else hermes_state_pg._REQUIRED_COLUMN_SPECS
+                else (
+                    hermes_state_pg._FORWARD_REQUIRED_COLUMN_SPECS
+                    if self.forward_surface
+                    else hermes_state_pg._REQUIRED_COLUMN_SPECS
+                )
             )
             rows = []
             for (table, column), expected in columns.items():
@@ -689,6 +709,9 @@ class _CatalogConn:
             self.version = int(params[0])
         if sql.strip().startswith("UPDATE hermes_state.state_meta"):
             self.surface = str(params[0])
+            return _RowsResult([(self.surface,)])
+        if sql == hermes_state_pg.PG_V26_FORWARD_SURFACE_SQL:
+            self.forward_surface = True
         if sql.lstrip().startswith(("CREATE", "ALTER")):
             self.catalog_version = EXPECTED_SCHEMA_VERSION
         return _RowsResult()
@@ -704,6 +727,39 @@ def test_catalog_verification_fails_when_a_v26_column_is_missing():
 
     with pytest.raises(RuntimeError, match="display_metadata"):
         PgSessionDB._verify_catalog(conn)
+
+
+def test_bridge_accepts_exact_forward_catalog_and_rejects_marker_mismatch():
+    conn = _CatalogConn(
+        version=EXPECTED_SCHEMA_VERSION,
+        surface=hermes_state_pg.FORWARD_SCHEMA_SURFACE_SHA256,
+        catalog_version=EXPECTED_SCHEMA_VERSION,
+        forward_surface=True,
+    )
+
+    PgSessionDB._verify_catalog(
+        conn,
+        surface_marker=hermes_state_pg.FORWARD_SCHEMA_SURFACE_SHA256,
+    )
+    with pytest.raises(RuntimeError, match="unexpected columns"):
+        PgSessionDB._verify_catalog(
+            conn,
+            surface_marker=EXPECTED_SCHEMA_SURFACE_SHA256,
+        )
+
+
+def test_forward_marker_without_forward_column_fails_closed():
+    conn = _CatalogConn(
+        version=EXPECTED_SCHEMA_VERSION,
+        surface=hermes_state_pg.FORWARD_SCHEMA_SURFACE_SHA256,
+        catalog_version=EXPECTED_SCHEMA_VERSION,
+    )
+
+    with pytest.raises(RuntimeError, match="_compressed_summary"):
+        PgSessionDB._verify_catalog(
+            conn,
+            surface_marker=hermes_state_pg.FORWARD_SCHEMA_SURFACE_SHA256,
+        )
 
 
 def test_catalog_verification_rejects_same_named_wrong_unique_index():
@@ -877,6 +933,32 @@ def test_ordinary_v26_boot_is_observation_only():
     }
 
 
+def test_bridge_boots_observation_only_on_forward_surface():
+    conn = _CatalogConn(
+        version=EXPECTED_SCHEMA_VERSION,
+        surface=hermes_state_pg.FORWARD_SCHEMA_SURFACE_SHA256,
+        catalog_version=EXPECTED_SCHEMA_VERSION,
+        include_optional_index=True,
+        forward_surface=True,
+    )
+    db = PgSessionDB.__new__(PgSessionDB)
+    db._pool = _Pool(conn)
+    db._allow_schema_migration = False
+    db._storage_attestation = None
+
+    db._init_pg_schema()
+
+    assert not any(
+        sql.lstrip().startswith(("CREATE", "ALTER", "INSERT", "UPDATE", "DELETE"))
+        for sql, _ in conn.executed
+    )
+    assert db._storage_attestation == {
+        "backend": "postgres",
+        "schema_version": EXPECTED_SCHEMA_VERSION,
+        "surface_marker": hermes_state_pg.FORWARD_SCHEMA_SURFACE_SHA256,
+    }
+
+
 def test_explicit_v22_preflight_accepts_only_the_exact_catalog():
     conn = _CatalogConn()
 
@@ -983,6 +1065,85 @@ def test_migration_script_dry_run_observes_v22_without_exposing_dsn(
     assert observed == [secret_dsn]
     assert "schema_version=22" in output.out
     assert hermes_state_pg._V22_SCHEMA_SURFACE_SHA256 in output.out
+    assert secret_dsn not in output.out
+    assert secret_dsn not in output.err
+
+
+def test_v26_surface_migration_is_exact_and_idempotent_at_destination():
+    conn = _CatalogConn(
+        version=EXPECTED_SCHEMA_VERSION,
+        surface=EXPECTED_SCHEMA_SURFACE_SHA256,
+        catalog_version=EXPECTED_SCHEMA_VERSION,
+    )
+
+    result = hermes_state_pg._migrate_v26_surface_on_connection(conn)
+
+    assert result["migration_applied"] is True
+    assert result["surface_marker"] == hermes_state_pg.FORWARD_SCHEMA_SURFACE_SHA256
+    statements = [sql for sql, _ in conn.executed]
+    alter_at = statements.index(hermes_state_pg.PG_V26_FORWARD_SURFACE_SQL)
+    marker_at = next(
+        i
+        for i, sql in enumerate(statements)
+        if sql.startswith("UPDATE hermes_state.state_meta")
+    )
+    assert alter_at < marker_at
+
+    conn.executed.clear()
+    second = hermes_state_pg._migrate_v26_surface_on_connection(conn)
+    assert second["migration_required"] is False
+    assert not any(
+        sql.lstrip().startswith(("ALTER", "UPDATE"))
+        for sql, _ in conn.executed
+    )
+
+
+def test_v26_surface_migration_refuses_marker_catalog_disagreement():
+    conn = _CatalogConn(
+        version=EXPECTED_SCHEMA_VERSION,
+        surface=hermes_state_pg.FORWARD_SCHEMA_SURFACE_SHA256,
+        catalog_version=EXPECTED_SCHEMA_VERSION,
+    )
+
+    with pytest.raises(RuntimeError, match="_compressed_summary"):
+        hermes_state_pg._migrate_v26_surface_on_connection(conn)
+
+    assert not any(
+        sql.lstrip().startswith(("ALTER", "UPDATE"))
+        for sql, _ in conn.executed
+    )
+
+
+@pytest.mark.parametrize("apply", [False, True])
+def test_v26_surface_migration_script_never_prints_dsn(
+    monkeypatch, capsys, apply
+):
+    observed = []
+
+    def _evidence(dsn):
+        observed.append(dsn)
+        return {
+            "backend": "postgres",
+            "schema_version": EXPECTED_SCHEMA_VERSION,
+            "surface_marker": hermes_state_pg.FORWARD_SCHEMA_SURFACE_SHA256,
+            "target_surface_marker": hermes_state_pg.FORWARD_SCHEMA_SURFACE_SHA256,
+            "migration_required": False,
+        }
+
+    monkeypatch.setattr(
+        surface_migration_script,
+        "migrate_v26_surface" if apply else "inspect_v26_surface_migration_precondition",
+        _evidence,
+    )
+    secret_dsn = "postgresql://operator:do-not-print@example.invalid/db"
+    argv = ["--dsn", secret_dsn]
+    if apply:
+        argv.append("--apply")
+
+    assert surface_migration_script.main(argv) == 0
+
+    output = capsys.readouterr()
+    assert observed == [secret_dsn]
     assert secret_dsn not in output.out
     assert secret_dsn not in output.err
 
