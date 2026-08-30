@@ -1069,6 +1069,16 @@ def test_v26_surface_migration_is_exact_and_idempotent_at_destination():
 
     assert result["migration_applied"] is True
     assert result["surface_marker"] == EXPECTED_SCHEMA_SURFACE_SHA256
+    assert conn.executed[:2] == [
+        (
+            "SELECT set_config('lock_timeout', %s, true)",
+            (hermes_state_pg._V26_MIGRATION_LOCK_TIMEOUT,),
+        ),
+        (
+            "SELECT set_config('statement_timeout', %s, true)",
+            (hermes_state_pg._V26_MIGRATION_STATEMENT_TIMEOUT,),
+        ),
+    ]
     statements = [sql for sql, _ in conn.executed]
     alter_at = statements.index(hermes_state_pg.PG_V26_SUMMARY_SURFACE_SQL)
     marker_at = next(
@@ -1157,6 +1167,37 @@ def test_v26_surface_migration_script_never_prints_dsn(
     assert observed == [secret_dsn]
     assert secret_dsn not in output.out
     assert secret_dsn not in output.err
+
+
+@pytest.mark.parametrize("apply", [False, True])
+def test_v26_surface_migration_script_redacts_dsn_on_failure(
+    monkeypatch, capsys, apply
+):
+    def _fail(dsn):
+        raise RuntimeError(
+            f"Postgres v26 surface migration could not connect to {dsn}"
+        )
+
+    monkeypatch.setattr(
+        surface_migration_script,
+        "migrate_v26_surface"
+        if apply
+        else "inspect_v26_surface_migration_precondition",
+        _fail,
+    )
+    secret_dsn = "postgresql://operator:do-not-print@example.invalid/db"
+    argv = ["--dsn", secret_dsn]
+    if apply:
+        argv.append("--apply")
+
+    assert surface_migration_script.main(argv) == 1
+
+    output = capsys.readouterr()
+    assert secret_dsn not in output.out
+    assert secret_dsn not in output.err
+    assert "do-not-print" not in output.err
+    assert "RuntimeError" in output.err
+    assert "connection details suppressed" in output.err
 
 
 def test_explicit_v22_migration_repairs_titles_before_unique_index():

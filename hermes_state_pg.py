@@ -84,6 +84,9 @@ EXPECTED_SCHEMA_SURFACE_SHA256 = (
 _V26_PRE_SUMMARY_SCHEMA_SURFACE_SHA256 = (
     "cd2cb9ee351693e62e9dc8e425885a4a08148551d9577d506f4a11be4a715d5f"
 )
+_V26_MIGRATION_ADVISORY_TIMEOUT = "30000ms"
+_V26_MIGRATION_LOCK_TIMEOUT = "5000ms"
+_V26_MIGRATION_STATEMENT_TIMEOUT = "30000ms"
 _V22_SCHEMA_SURFACE_SHA256 = (
     "ffb802aede5aab2e95d1eb46188864c11b4b8e290c538ada64c06b9a14747654"
 )
@@ -3010,6 +3013,14 @@ def inspect_v26_surface_migration_precondition(dsn: str) -> Dict[str, Any]:
 
 def _migrate_v26_surface_on_connection(conn) -> Dict[str, Any]:
     """Apply or verify the AE-240 expansion in the caller's transaction."""
+    conn.execute(
+        "SELECT set_config('lock_timeout', %s, true)",
+        (_V26_MIGRATION_LOCK_TIMEOUT,),
+    )
+    conn.execute(
+        "SELECT set_config('statement_timeout', %s, true)",
+        (_V26_MIGRATION_STATEMENT_TIMEOUT,),
+    )
     current = _inspect_v26_surface(conn)
     if not current["migration_required"]:
         return current
@@ -3052,6 +3063,10 @@ def migrate_v26_surface(dsn: str) -> Dict[str, Any]:
     with psycopg.connect(_normalize_dsn(dsn), autocommit=True) as conn:
         conn.cursor_factory = ClientCursor
         conn.execute(
+            "SELECT set_config('lock_timeout', %s, false)",
+            (_V26_MIGRATION_ADVISORY_TIMEOUT,),
+        )
+        conn.execute(
             "SELECT pg_advisory_lock(%s)", (PgSessionDB._BOOTSTRAP_LOCK_KEY,)
         )
         try:
@@ -3063,8 +3078,10 @@ def migrate_v26_surface(dsn: str) -> Dict[str, Any]:
                     "SELECT pg_advisory_unlock(%s)",
                     (PgSessionDB._BOOTSTRAP_LOCK_KEY,),
                 )
-            except Exception:
+            except Exception as exc:
                 logger.warning(
-                    "failed to release session-store migration advisory lock",
-                    exc_info=True,
+                    "failed to release session-store migration advisory lock "
+                    "(%s, sqlstate=%s)",
+                    type(exc).__name__,
+                    getattr(exc, "sqlstate", None) or "unknown",
                 )

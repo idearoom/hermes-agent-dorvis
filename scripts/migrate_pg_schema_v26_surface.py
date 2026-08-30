@@ -25,6 +25,23 @@ from hermes_state_pg import (  # noqa: E402
 )
 
 
+def _safe_failure_detail(exc: Exception) -> str:
+    """Describe a failure without rendering untrusted driver error text."""
+    name = type(exc).__name__
+    sqlstate = getattr(exc, "sqlstate", None)
+    state = (
+        f", SQLSTATE {sqlstate}"
+        if isinstance(sqlstate, str)
+        and len(sqlstate) == 5
+        and sqlstate.isalnum()
+        else ""
+    )
+    return (
+        f"database operation failed ({name}{state}); "
+        "connection details suppressed"
+    )
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -54,7 +71,10 @@ def main(argv: list[str] | None = None) -> int:
         )
     except Exception as exc:
         phase = "apply" if args.apply else "preflight"
-        print(f"Migration {phase} failed: {exc}", file=sys.stderr)
+        print(
+            f"Migration {phase} failed: {_safe_failure_detail(exc)}",
+            file=sys.stderr,
+        )
         return 1
 
     if args.apply:
