@@ -10,9 +10,12 @@ expanded catalog, so this migration does not require a zero-writer window.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 from pathlib import Path
+
+from psycopg.conninfo import conninfo_to_dict
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
@@ -42,6 +45,17 @@ def _safe_failure_detail(exc: Exception) -> str:
     )
 
 
+def _safe_dsn_identity(dsn: str) -> str:
+    """Return only the non-secret fields needed to identify the target DB."""
+    fields = conninfo_to_dict(dsn)
+    identity = {
+        "database": fields.get("dbname") or "<default>",
+        "host": fields.get("host") or fields.get("hostaddr") or "<local>",
+        "port": fields.get("port") or "5432",
+    }
+    return json.dumps(identity, ensure_ascii=True, separators=(",", ":"))
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -64,6 +78,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     try:
+        dsn_identity = _safe_dsn_identity(dsn)
         evidence = (
             migrate_v26_surface(dsn)
             if args.apply
@@ -84,7 +99,8 @@ def main(argv: list[str] | None = None) -> int:
         print(
             f"Migration {action}: backend={evidence['backend']} "
             f"schema_version={evidence['schema_version']} "
-            f"surface_marker={evidence['surface_marker']}"
+            f"surface_marker={evidence['surface_marker']} "
+            f"dsn_identity={dsn_identity}"
         )
     else:
         print(
@@ -92,7 +108,8 @@ def main(argv: list[str] | None = None) -> int:
             f"backend={evidence['backend']} "
             f"schema_version={evidence['schema_version']} "
             f"surface_marker={evidence['surface_marker']} "
-            f"migration_required={str(evidence['migration_required']).lower()}"
+            f"migration_required={str(evidence['migration_required']).lower()} "
+            f"dsn_identity={dsn_identity}"
         )
         print(f"Target surface: {EXPECTED_SCHEMA_SURFACE_SHA256}")
     return 0
