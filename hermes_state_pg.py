@@ -84,6 +84,12 @@ EXPECTED_SCHEMA_SURFACE_SHA256 = (
 FORWARD_SCHEMA_SURFACE_SHA256 = (
     "4fcc7bb46a26f9d3ad47322dcdd24ae972fb349b66ca715fcdcb2ae16ba39ca6"
 )
+RUNTIME_ACCEPTED_SCHEMA_SURFACE_SHA256S = frozenset(
+    {
+        EXPECTED_SCHEMA_SURFACE_SHA256,
+        FORWARD_SCHEMA_SURFACE_SHA256,
+    }
+)
 _V26_MIGRATION_ADVISORY_TIMEOUT = "30000ms"
 _V26_MIGRATION_LOCK_TIMEOUT = "5000ms"
 _V26_MIGRATION_STATEMENT_TIMEOUT = "30000ms"
@@ -2558,10 +2564,7 @@ class PgSessionDB(SessionDB):
                 "refusing to infer or repair it during runtime boot."
             )
         surface_marker = str(row[0])
-        if surface_marker not in {
-            EXPECTED_SCHEMA_SURFACE_SHA256,
-            FORWARD_SCHEMA_SURFACE_SHA256,
-        }:
+        if surface_marker not in RUNTIME_ACCEPTED_SCHEMA_SURFACE_SHA256S:
             raise RuntimeError(
                 "Postgres session store was initialized against a different "
                 f"upstream schema surface (db={surface_marker}, accepted="
