@@ -84,6 +84,9 @@ EXPECTED_SCHEMA_SURFACE_SHA256 = (
 _V26_PRE_SUMMARY_SCHEMA_SURFACE_SHA256 = (
     "cd2cb9ee351693e62e9dc8e425885a4a08148551d9577d506f4a11be4a715d5f"
 )
+RUNTIME_ACCEPTED_SCHEMA_SURFACE_SHA256S = frozenset(
+    {EXPECTED_SCHEMA_SURFACE_SHA256}
+)
 _V26_MIGRATION_ADVISORY_TIMEOUT = "30000ms"
 _V26_MIGRATION_LOCK_TIMEOUT = "5000ms"
 _V26_MIGRATION_STATEMENT_TIMEOUT = "30000ms"
@@ -2551,7 +2554,7 @@ class PgSessionDB(SessionDB):
                 "compatibility bridge and run the explicit v26 surface "
                 "migration before starting this image."
             )
-        if surface_marker != EXPECTED_SCHEMA_SURFACE_SHA256:
+        if surface_marker not in RUNTIME_ACCEPTED_SCHEMA_SURFACE_SHA256S:
             raise RuntimeError(
                 "Postgres session store was initialized against a different "
                 f"upstream schema surface (db={surface_marker}, expected="

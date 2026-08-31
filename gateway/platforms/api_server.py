@@ -1750,16 +1750,6 @@ def make_response_store():
     return ResponseStore()
 
 
-# Dorvis deploy readiness is deliberately stricter than generic Hermes
-# liveness: a task running an older state-store surface must not join the ALB
-# target group just because it can answer HTTP. Keep these values paired with
-# ``hermes_state_pg`` and the parent release contract.
-_DORVIS_SESSION_STORE_SCHEMA_VERSION = 26
-_DORVIS_SESSION_STORE_SURFACE_MARKER = (
-    "cd2cb9ee351693e62e9dc8e425885a4a08148551d9577d506f4a11be4a715d5f"
-)
-
-
 def _storage_attestation(store: Any) -> Dict[str, Any]:
     """Read a non-secret typed backend attestation without trusting class names."""
     if store is None:
@@ -1775,6 +1765,26 @@ def _storage_attestation(store: Any) -> Dict[str, Any]:
     if not isinstance(payload, dict) or not isinstance(payload.get("backend"), str):
         return {"backend": "invalid"}
     return dict(payload)
+
+
+def _dorvis_session_store_attestation_ready(attestation: Dict[str, Any]) -> bool:
+    """Match readiness to the Postgres adapter's runtime admission contract."""
+    try:
+        from hermes_state_pg import (
+            EXPECTED_SCHEMA_VERSION,
+            RUNTIME_ACCEPTED_SCHEMA_SURFACE_SHA256S,
+        )
+    except Exception:
+        logger.exception("Could not load the Postgres session-store contract")
+        return False
+    return (
+        set(attestation)
+        == {"backend", "schema_version", "surface_marker"}
+        and attestation.get("backend") == "postgres"
+        and attestation.get("schema_version") == EXPECTED_SCHEMA_VERSION
+        and attestation.get("surface_marker")
+        in RUNTIME_ACCEPTED_SCHEMA_SURFACE_SHA256S
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -4074,12 +4084,9 @@ class APIServerAdapter(BasePlatformAdapter):
         if os.getenv("HERMES_STATE_STORE_DSN", "").strip():
             add_check(
                 "session_store_postgres",
-                session_store_attestation
-                == {
-                    "backend": "postgres",
-                    "schema_version": _DORVIS_SESSION_STORE_SCHEMA_VERSION,
-                    "surface_marker": _DORVIS_SESSION_STORE_SURFACE_MARKER,
-                },
+                _dorvis_session_store_attestation_ready(
+                    session_store_attestation
+                ),
                 "configured Postgres session store did not attest the expected "
                 "schema/backend surface",
             )

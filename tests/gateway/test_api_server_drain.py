@@ -533,6 +533,56 @@ class TestDrainReadiness:
         assert payload["session_store"]["backend"] != "postgres"
         assert payload["response_store"]["backend"] != "postgres"
 
+    def test_postgres_readiness_accepts_every_runtime_admitted_surface(
+        self, adapter, monkeypatch
+    ):
+        from hermes_state_pg import (
+            EXPECTED_SCHEMA_VERSION,
+            RUNTIME_ACCEPTED_SCHEMA_SURFACE_SHA256S,
+        )
+
+        monkeypatch.setenv("HERMES_STATE_STORE_DSN", "postgresql://configured")
+        for surface_marker in RUNTIME_ACCEPTED_SCHEMA_SURFACE_SHA256S:
+            monkeypatch.setattr(
+                adapter,
+                "_storage_attestations",
+                lambda marker=surface_marker: {
+                    "session_store": {
+                        "backend": "postgres",
+                        "schema_version": EXPECTED_SCHEMA_VERSION,
+                        "surface_marker": marker,
+                    },
+                    "response_store": {"backend": "unavailable"},
+                },
+            )
+
+            payload, _status = adapter._readiness_payload()
+
+            assert payload["checks"]["session_store_postgres"] is True
+
+    def test_postgres_readiness_rejects_surface_runtime_would_refuse(
+        self, adapter, monkeypatch
+    ):
+        from hermes_state_pg import EXPECTED_SCHEMA_VERSION
+
+        monkeypatch.setenv("HERMES_STATE_STORE_DSN", "postgresql://configured")
+        monkeypatch.setattr(
+            adapter,
+            "_storage_attestations",
+            lambda: {
+                "session_store": {
+                    "backend": "postgres",
+                    "schema_version": EXPECTED_SCHEMA_VERSION,
+                    "surface_marker": "0" * 64,
+                },
+                "response_store": {"backend": "unavailable"},
+            },
+        )
+
+        payload, _status = adapter._readiness_payload()
+
+        assert payload["checks"]["session_store_postgres"] is False
+
     def test_payload_flips_when_draining(self, adapter):
         adapter._drain_mode.begin("test")
         payload, status = adapter._readiness_payload()
