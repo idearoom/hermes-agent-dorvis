@@ -3928,6 +3928,7 @@ def compress_context(
         _compression_feasibility_skip = bool(
             getattr(agent.context_compressor, "_last_feasibility_skip", False)
         )
+        _compression_terminal_diagnostics = _compression_diagnostics(agent)
 
         # If compression aborted (aux LLM failed to produce a usable summary)
         # the compressor returns the input messages unchanged.  Surface the
@@ -4790,7 +4791,7 @@ def compress_context(
             post_tokens=_compressed_est,
             model=getattr(agent, "model", None),
             focus_topic=focus_topic,
-            **_compression_diagnostics(agent),
+            **_compression_terminal_diagnostics,
         )
 
         logger.info(

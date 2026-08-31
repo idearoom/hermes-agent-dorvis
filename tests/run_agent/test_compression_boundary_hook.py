@@ -252,6 +252,64 @@ class TestCompressionBoundaryHook:
             assert compressed
             assert agent.session_id != original_sid
 
+    def test_completed_telemetry_preserves_quality_verdict_across_rotation(self):
+        """Session-boundary resets must not erase the committed quality verdict."""
+        from hermes_state import SessionDB
+
+        events = []
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = SessionDB(db_path=Path(tmpdir) / "test.db")
+            agent = self._make_agent(db)
+            agent._compression_event_callback = (
+                lambda name, payload: events.append((name, payload))
+            )
+
+            compressor = MagicMock()
+            compressor.compress.return_value = [
+                {"role": "user", "content": "[CONTEXT COMPACTION] summary"},
+                {"role": "user", "content": "tail"},
+            ]
+            compressor.compression_count = 1
+            compressor.last_prompt_tokens = 0
+            compressor.last_completion_tokens = 0
+            compressor._last_summary_error = None
+            compressor._last_compress_aborted = False
+            compressor._last_compression_made_progress = True
+            compressor._last_quality_gate_passed = True
+            compressor._last_quality_gate_reasons = []
+            compressor._last_ledger_fields_present = {
+                "active_task": True,
+                "latest_user_ask": True,
+            }
+            compressor.quality_gate_enabled = True
+
+            def _reset_boundary_state(*_args, **_kwargs):
+                compressor._last_quality_gate_passed = None
+                compressor._last_quality_gate_reasons = []
+                compressor._last_ledger_fields_present = {}
+
+            compressor.on_session_start.side_effect = _reset_boundary_state
+            agent.context_compressor = compressor
+
+            agent._compress_context(
+                [{"role": "user", "content": "m" * 400}],
+                "sys",
+                approx_tokens=10_000,
+            )
+
+        completed = [
+            payload
+            for name, payload in events
+            if name == "context_compression_completed"
+        ]
+        assert len(completed) == 1
+        assert completed[0]["quality_gate_passed"] is True
+        assert completed[0]["quality_gate_reasons"] == []
+        assert completed[0]["ledger_fields_present"] == {
+            "active_task": True,
+            "latest_user_ask": True,
+        }
+
 
 class TestSessionCompressEvent:
     """The session:compress event_callback fires after a compression split."""
@@ -324,4 +382,3 @@ class TestSessionCompressEvent:
                 [{"role": "user", "content": "m"}], "sys", approx_tokens=100
             )
             assert compressed
-
