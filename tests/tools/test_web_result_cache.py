@@ -106,6 +106,66 @@ def test_search_memo_disabled_by_config(monkeypatch):
     assert memo.lookup("firecrawl", "q", 5) is None
 
 
+def test_web_search_cache_disabled_bypasses_cache_and_limit_bucket(monkeypatch):
+    """Disabled means the pre-cache provider call, not a cache miss path."""
+    from tools import web_tools
+    from agent import web_search_registry
+    from tools import interrupt
+
+    calls = []
+
+    class FakeProvider:
+        name = "fake"
+
+        @staticmethod
+        def supports_search():
+            return True
+
+        @staticmethod
+        def search(query, limit):
+            calls.append((query, limit))
+            return {
+                "success": True,
+                "data": {
+                    "web": [
+                        {
+                            "title": f"result {index}",
+                            "url": f"https://example.com/{index}",
+                            "description": "public",
+                        }
+                        for index in range(limit)
+                    ]
+                },
+            }
+
+    def cache_path_used(*_args, **_kwargs):
+        raise AssertionError("disabled web search must bypass cache machinery")
+
+    class ForbiddenMemo:
+        lookup = cache_path_used
+        store = cache_path_used
+        flight_lock = cache_path_used
+
+    monkeypatch.setattr(wrc, "_web_config", lambda: {"cache_enabled": False})
+    monkeypatch.setattr(wrc, "bucket_limit", cache_path_used)
+    monkeypatch.setattr(wrc, "search_memo", ForbiddenMemo())
+    monkeypatch.setattr(wrc, "slice_search_response", cache_path_used)
+    monkeypatch.setattr(web_tools, "_ensure_web_plugins_loaded", lambda: None)
+    monkeypatch.setattr(web_tools, "_get_search_backend", lambda: "fake")
+    monkeypatch.setattr(
+        web_search_registry, "get_provider", lambda _name: FakeProvider()
+    )
+    monkeypatch.setattr(interrupt, "is_interrupted", lambda: False)
+    monkeypatch.setattr(web_tools._debug, "log_call", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(web_tools._debug, "save", lambda: None)
+
+    result = json.loads(web_tools.web_search_tool("exact limit", limit=3))
+
+    assert result["success"] is True
+    assert calls == [("exact limit", 3)]
+    assert len(result["data"]["web"]) == 3
+
+
 def test_search_memo_hit_returns_copy():
     memo = SearchMemo()
     memo.store("firecrawl", "q", 5, _ok_response())
@@ -314,6 +374,21 @@ def test_extract_cache_disabled_by_config(monkeypatch, _isolated_cache):
     extract_cache_put("https://e.com", "x")
     monkeypatch.setattr(wrc, "_web_config", lambda: {"cache_enabled": False})
     assert extract_cache_get("https://e.com") is None
+
+
+def test_extract_cache_disabled_writes_no_index_or_backing_file(
+    monkeypatch, _isolated_cache
+):
+    monkeypatch.setattr(wrc, "_web_config", lambda: {"cache_enabled": False})
+
+    extract_cache_put(
+        "https://example.com/no-cache",
+        "fresh provider response",
+        title="No cache",
+        provider="fake",
+    )
+
+    assert list(_isolated_cache.iterdir()) == []
 
 
 def test_index_eviction_keeps_newest(monkeypatch, _isolated_cache):

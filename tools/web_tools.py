@@ -695,14 +695,20 @@ def _store_full_text(url: str, content: str) -> Optional[str]:
 
     The file is mounted read-only into remote backends (Docker/Modal/SSH) via
     credential_files._CACHE_DIRS, so the agent's terminal/read_file tools can
-    page through the complete text on any backend. Returns None on failure
-    (storage is best-effort; truncated content is still returned to the model).
+    page through the complete text on any backend. The stored copy is always
+    secret-redacted, even when the global redaction preference is disabled.
+    Returns None on failure (storage is best-effort; truncated content is still
+    returned to the model).
     """
     try:
         import hashlib
         from urllib.parse import urlparse
+        from agent.redact import redact_sensitive_text
         from hermes_constants import get_hermes_dir
 
+        # cache/web is a persistence boundary. Match browser snapshot storage:
+        # fail closed instead of writing raw page-rendered credentials.
+        content = redact_sensitive_text(content, force=True)
         cache_dir = get_hermes_dir("cache/web", "web_cache")
         cache_dir.mkdir(parents=True, exist_ok=True)
 
@@ -793,7 +799,12 @@ def _truncate_with_footer(
 
     model_text = head + "\n\n[... middle omitted — see footer ...]\n\n" + tail
     model_text += "\n" + "\n".join(footer_lines)
-    return model_text, True
+    # Long page text is also a mandatory model boundary. Keep URL credential
+    # redaction at its default (off) so public links, OAuth callbacks, and
+    # pre-signed navigation URLs retain their exact actionable identity.
+    from agent.redact import redact_sensitive_text
+
+    return redact_sensitive_text(model_text, force=True), True
 
 
 
@@ -975,12 +986,13 @@ def web_search_tool(query: str, limit: int = 5) -> str:
             # count is sliced out below. Only successful responses cache.
             from tools.web_result_cache import (
                 bucket_limit as _bucket_limit,
+                cache_enabled as _cache_enabled,
                 search_memo as _search_memo,
                 slice_search_response as _slice_search_response,
             )
+            _cache_is_enabled = _cache_enabled()
 
-            def _paid_search() -> tuple[dict, bool]:
-                _fetch_limit = _bucket_limit(limit)
+            def _paid_search(_fetch_limit: int) -> tuple[dict, bool]:
                 _rescued = False
                 try:
                     _resp = provider.search(query, _fetch_limit)
@@ -1006,26 +1018,34 @@ def web_search_tool(query: str, limit: int = 5) -> str:
                         )
                 return _resp, _rescued
 
-            response_data = _search_memo.lookup(provider.name, query, limit)
-            if response_data is None:
-                with _search_memo.flight_lock(provider.name, query, limit):
-                    # Re-check inside the lock: a concurrent identical call
-                    # may have stored while this one waited.
-                    response_data = _search_memo.lookup(
-                        provider.name, query, limit
-                    )
-                    if response_data is None:
-                        response_data, _was_rescued = _paid_search()
-                        # Never cache a rescue-served response: it came from
-                        # a ring vendor, not the chosen backend (wrong key),
-                        # and caching it would make the one-shot rescue
-                        # sticky for this query for a whole TTL — the next
-                        # call must attempt the chosen backend again.
-                        if not _was_rescued:
-                            _search_memo.store(
-                                provider.name, query, limit, response_data
+            if not _cache_is_enabled:
+                # Disabled means the pre-cache behavior exactly: no bucketed
+                # vendor request, memo lookup, flight lock, cache serialization,
+                # or defensive-copy slice.
+                response_data, _ = _paid_search(limit)
+            else:
+                response_data = _search_memo.lookup(provider.name, query, limit)
+                if response_data is None:
+                    with _search_memo.flight_lock(provider.name, query, limit):
+                        # Re-check inside the lock: a concurrent identical call
+                        # may have stored while this one waited.
+                        response_data = _search_memo.lookup(
+                            provider.name, query, limit
+                        )
+                        if response_data is None:
+                            response_data, _was_rescued = _paid_search(
+                                _bucket_limit(limit)
                             )
-            response_data = _slice_search_response(response_data, limit)
+                            # Never cache a rescue-served response: it came from
+                            # a ring vendor, not the chosen backend (wrong key),
+                            # and caching it would make the one-shot rescue
+                            # sticky for this query for a whole TTL — the next
+                            # call must attempt the chosen backend again.
+                            if not _was_rescued:
+                                _search_memo.store(
+                                    provider.name, query, limit, response_data
+                                )
+                response_data = _slice_search_response(response_data, limit)
 
         debug_call_data["results_count"] = len(response_data.get("data", {}).get("web", []))
         result_json = json.dumps(response_data, indent=2, ensure_ascii=False)

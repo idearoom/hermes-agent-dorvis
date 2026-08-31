@@ -1641,6 +1641,10 @@ DEFAULT_CONFIG = {
         # override for backward compatibility. 0 disables the reap
         # (park forever).
         "ws_orphan_reap_grace_s": 20.0,
+        # Whether an orphaned websocket session may interrupt a turn that is
+        # still running after the reconnect grace. Disable to retain the
+        # pre-v2026.8.27 behavior: idle orphans are reaped, active turns park.
+        "ws_orphan_interrupt_running": True,
         # Startup sweep of session rows orphaned by a dead gateway process
         # (#65194).  The ws-orphan grace timer above is in-process, so a
         # gateway restart (update, crash, systemd) leaves disconnected

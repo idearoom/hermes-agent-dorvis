@@ -1090,6 +1090,49 @@ class TestForceReloadSymmetry:
 
         assert plugins_mod._resolve_hook_callback_timeout() == 0.12
 
+    def test_zero_hook_callback_timeout_keeps_callbacks_on_caller_thread(
+        self, tmp_path, monkeypatch
+    ):
+        """AE-239 parity: disabled timeouts keep Dorvis hooks synchronous."""
+        hermes_home = tmp_path / "hermes_test"
+        hermes_home.mkdir(parents=True, exist_ok=True)
+        (hermes_home / "config.yaml").write_text(
+            yaml.safe_dump({"plugins": {"hook_callback_timeout": 0}})
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        import hermes_cli.config as config_mod
+        import hermes_cli.plugins as plugins_mod
+
+        config_mod._LOAD_CONFIG_CACHE.clear()
+        config_mod._RAW_CONFIG_CACHE.clear()
+
+        hook_names = (
+            "pre_tool_call",
+            "post_tool_call",
+            "pre_api_request",
+            "post_api_request",
+            "api_request_error",
+            "subagent_stop",
+        )
+        caller = threading.current_thread()
+        seen = {}
+        mgr = PluginManager()
+
+        def capture_for(hook_name):
+            def capture(**_kwargs):
+                seen[hook_name] = threading.current_thread()
+                return hook_name
+
+            return capture
+
+        assert plugins_mod._resolve_hook_callback_timeout() == 0
+        for hook_name in hook_names:
+            mgr._hooks[hook_name] = [capture_for(hook_name)]
+            assert mgr.invoke_hook(hook_name) == [hook_name]
+
+        assert seen == {hook_name: caller for hook_name in hook_names}
+
     def test_subagent_stop_stays_on_caller_thread(self, monkeypatch):
         """Caller-thread hooks must not move the body onto a timeout worker."""
         monkeypatch.setattr(

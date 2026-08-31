@@ -205,6 +205,27 @@ def _resolve_ws_orphan_reap_grace() -> float:
 
 
 _WS_ORPHAN_REAP_GRACE_S = _resolve_ws_orphan_reap_grace()
+
+
+def _resolve_ws_orphan_interrupt_running() -> bool:
+    """Whether a detached websocket may interrupt an in-flight turn.
+
+    v2026.8.27 defaults this behavior on. Deployments that need the prior
+    active-turn contract can disable only the interrupt path while retaining
+    the existing idle-orphan grace reap.
+    """
+    try:
+        from hermes_cli.config import load_config
+
+        raw = (load_config().get("dashboard") or {}).get(
+            "ws_orphan_interrupt_running"
+        )
+    except Exception:
+        raw = None
+    return is_truthy_value(raw, default=True)
+
+
+_WS_ORPHAN_INTERRUPT_RUNNING = _resolve_ws_orphan_interrupt_running()
 _WS_ORPHAN_INTERRUPT_REAP_POLL_S = 1.0
 # Total budget for the interrupt-then-reap poll chain. If an interrupted turn
 # never settles (agent thread hung in a syscall, supervisor lost), each 1s poll
@@ -1298,6 +1319,12 @@ def _schedule_ws_orphan_reap(sid: str, *, delay_s: float | None = None) -> None:
             if _session_has_active_delegations(sid, current):
                 reschedule_delay = _WS_ORPHAN_REAP_GRACE_S
             elif current.get("running"):
+                if not _WS_ORPHAN_INTERRUPT_RUNNING:
+                    # Parity mode: v2026.8.19 reaped an orphan only when the
+                    # grace timer found it idle. A still-running detached turn
+                    # remained resumable and was never interrupted merely
+                    # because its websocket disappeared.
+                    return
                 # Mid-turn detached sessions must never drop the single
                 # Timer (#85578): after the reconnect grace the turn is
                 # interrupted once, then the reap keeps polling until the

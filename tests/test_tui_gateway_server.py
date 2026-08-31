@@ -4690,6 +4690,52 @@ def test_ws_orphan_reap_interrupts_isolated_turn_then_reaps(monkeypatch):
         server._sessions.pop("isolated-sid", None)
 
 
+def test_ws_orphan_reap_parity_mode_parks_running_turn(monkeypatch):
+    callbacks = []
+    interrupted = []
+    torn_down = []
+
+    class _Timer:
+        def __init__(self, _delay, callback):
+            callbacks.append(callback)
+
+        def start(self):
+            return None
+
+    session = _session(
+        agent=types.SimpleNamespace(
+            interrupt=lambda: interrupted.append("interrupted")
+        ),
+        transport=server._detached_ws_transport,
+        running=True,
+    )
+    server._sessions["parity-sid"] = session
+    monkeypatch.setattr(server, "_WS_ORPHAN_REAP_GRACE_S", 0.01)
+    monkeypatch.setattr(server, "_WS_ORPHAN_INTERRUPT_RUNNING", False)
+    monkeypatch.setattr(server.threading, "Timer", _Timer)
+    monkeypatch.setattr(
+        server, "_session_has_active_delegations", lambda *_args, **_kwargs: False
+    )
+    monkeypatch.setattr(
+        server,
+        "_teardown_popped_session",
+        lambda claimed, *, end_reason: torn_down.append((claimed, end_reason)) or True,
+    )
+
+    try:
+        server._schedule_ws_orphan_reap("parity-sid")
+        callbacks.pop(0)()
+
+        assert interrupted == []
+        assert torn_down == []
+        assert "parity-sid" in server._sessions
+        assert callbacks == []
+        assert "_client_gone_interrupt_requested" not in session
+        assert "_client_gone_interrupt_polls" not in session
+    finally:
+        server._sessions.pop("parity-sid", None)
+
+
 def test_ws_orphan_reap_spares_turn_reattached_within_grace(monkeypatch):
     callbacks = []
     interrupted = []
@@ -15162,6 +15208,10 @@ def test_model_options_preserves_canonical_custom_row_after_agent_init(monkeypat
     monkeypatch.setattr(
         "hermes_cli.auth.is_provider_explicitly_configured",
         lambda _slug: False,
+    )
+    monkeypatch.setattr(
+        "hermes_cli.inventory._anthropic_oauth_credentials_present",
+        lambda: False,
     )
     monkeypatch.setattr("hermes_cli.inventory._apply_pricing", lambda *_args, **_kwargs: None)
     monkeypatch.setattr("hermes_cli.inventory._apply_capabilities", lambda *_args, **_kwargs: None)

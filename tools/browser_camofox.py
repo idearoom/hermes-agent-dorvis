@@ -569,12 +569,13 @@ def camofox_navigate(url: str, task_id: Optional[str] = None) -> str:
             snapshot_text = snap_data.get("snapshot", "")
             from tools.browser_tool import (
                 get_browser_snapshot_threshold,
+                _redact_browser_output,
                 _truncate_snapshot,
             )
             threshold = get_browser_snapshot_threshold()
             if len(snapshot_text) > threshold:
                 snapshot_text = _truncate_snapshot(snapshot_text, max_chars=threshold)
-            result["snapshot"] = snapshot_text
+            result["snapshot"] = _redact_browser_output(snapshot_text)
             result["element_count"] = snap_data.get("refsCount", 0)
         except Exception:
             pass  # Navigation succeeded; snapshot is a bonus
@@ -656,6 +657,7 @@ def camofox_snapshot(full: bool = False, task_id: Optional[str] = None,
         # read_file pointer.
         from tools.browser_tool import (
             get_browser_snapshot_threshold,
+            _redact_browser_output,
             _truncate_snapshot,
         )
 
@@ -665,7 +667,7 @@ def camofox_snapshot(full: bool = False, task_id: Optional[str] = None,
 
         return json.dumps({
             "success": True,
-            "snapshot": snapshot,
+            "snapshot": _redact_browser_output(snapshot),
             "element_count": refs_count,
         })
     except Exception as e:
@@ -970,5 +972,4 @@ def camofox_console(clear: bool = False, task_id: Optional[str] = None) -> str:
         "note": "Console log capture is not available with the Camofox backend. "
                 "Use browser_snapshot or browser_vision to inspect page state.",
     })
-
 
