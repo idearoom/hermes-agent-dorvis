@@ -40,6 +40,7 @@ from gateway.platforms.api_server import (
     _hermes_version,
     _redact_api_error_text,
     _request_agent_overrides,
+    _requests_automation_policy,
     _responses_usage_payload,
     _session_usage_snapshot,
     check_api_server_requirements,
@@ -6222,6 +6223,111 @@ def _patch_create_agent_runtime(monkeypatch, captured: dict, fake_agent_cls):
     )
     monkeypatch.setattr("gateway.run._current_max_iterations", lambda: 90)
     monkeypatch.setattr("hermes_cli.tools_config._get_platform_tools", lambda *_: set())
+
+
+def _requests_automation_metadata(run_type: str, model: str) -> dict:
+    return {
+        "source": "dorvis-headless-worker",
+        "chat": {"id": "run-requests-1", "type": "headless_run"},
+        "headless_run": {
+            "id": "run-requests-1",
+            "run_type": run_type,
+            "runtime_policy": {
+                "model": model,
+                "provider": "openai-codex",
+                "reasoningEffort": "medium",
+                "memory": "disabled",
+                "tools": "disabled",
+            },
+        },
+    }
+
+
+class TestRequestsAutomationRuntimeBoundary:
+    @pytest.mark.parametrize(
+        ("run_type", "model"),
+        [
+            ("dorvis.request_duplicate_check", "gpt-5.6-luna"),
+            ("dorvis.request_linear_authoring", "gpt-5.6-terra"),
+        ],
+    )
+    def test_create_agent_removes_tools_memory_and_fallbacks(
+        self, monkeypatch, run_type, model
+    ):
+        captured = {}
+
+        class FakeAgent:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+                self.model = kwargs["model"]
+                self.provider = kwargs["provider"]
+
+        _patch_create_agent_runtime(monkeypatch, captured, FakeAgent)
+        monkeypatch.setattr(
+            "gateway.platforms.api_server._resolve_request_runtime_agent_kwargs",
+            lambda provider, target_model=None: {
+                "provider": provider,
+                "api_mode": "codex_responses",
+            },
+        )
+        adapter = APIServerAdapter(PlatformConfig(enabled=True))
+        monkeypatch.setattr(adapter, "_ensure_session_db", lambda: None)
+        monkeypatch.setattr(adapter, "_session_model_override_for", lambda *_: None)
+
+        agent = adapter._create_agent(
+            session_id="run-requests-1",
+            gateway_session_key="run-requests-1",
+            request_metadata=_requests_automation_metadata(run_type, model),
+            requested_model=model,
+            requested_provider="openai-codex",
+            model_options={"reasoning_effort": "medium"},
+        )
+
+        assert captured["model"] == model
+        assert captured["provider"] == "openai-codex"
+        assert captured["reasoning_config"] == {
+            "enabled": True,
+            "effort": "medium",
+        }
+        assert captured["enabled_toolsets"] == []
+        assert captured["disabled_toolsets"] == ["memory"]
+        assert captured["skip_memory"] is True
+        assert captured["skip_background_review"] is True
+        assert captured["skip_context_files"] is True
+        assert captured["max_iterations"] == 1
+        assert captured["fallback_model"] is None
+        assert agent._hermes_api_runtime["requests_automation_policy"]["model"] == model
+
+    def test_policy_rejects_a_request_run_that_only_claims_isolation(self):
+        metadata = _requests_automation_metadata(
+            "dorvis.request_duplicate_check", "gpt-5.6-luna"
+        )
+        metadata["headless_run"]["runtime_policy"]["tools"] = "enabled"
+
+        with pytest.raises(ValueError, match="trusted runtime policy"):
+            _requests_automation_policy(metadata)
+
+    @pytest.mark.asyncio
+    async def test_responses_rejects_model_drift_before_launch(self):
+        adapter = APIServerAdapter(PlatformConfig(enabled=True))
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as run:
+                response = await cli.post(
+                    "/v1/responses",
+                    json={
+                        "model": "gpt-5.6-terra",
+                        "provider": "openai-codex",
+                        "model_options": {"reasoning_effort": "medium"},
+                        "input": "Check this Product Request for duplicates.",
+                        "metadata": _requests_automation_metadata(
+                            "dorvis.request_duplicate_check", "gpt-5.6-luna"
+                        ),
+                    },
+                )
+
+                assert response.status == 400
+                run.assert_not_awaited()
 
 
 class TestModelRoutesParsing:

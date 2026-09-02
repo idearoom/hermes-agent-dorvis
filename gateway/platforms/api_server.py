@@ -664,6 +664,84 @@ def _append_request_identity_prompt(
             return cleaned
         return f"{cleaned}\n\n{identity_prompt}"
     return identity_prompt
+
+
+_REQUESTS_AUTOMATION_POLICIES = {
+    "dorvis.request_duplicate_check": {
+        "model": "gpt-5.6-luna",
+        "provider": "openai-codex",
+        "reasoningEffort": "medium",
+        "memory": "disabled",
+        "tools": "disabled",
+    },
+    "dorvis.request_linear_authoring": {
+        "model": "gpt-5.6-terra",
+        "provider": "openai-codex",
+        "reasoningEffort": "medium",
+        "memory": "disabled",
+        "tools": "disabled",
+    },
+}
+
+
+class _RequestsAutomationPolicyError(ValueError):
+    """A Product Requests run attempted to escape its fixed runtime boundary."""
+
+
+def _requests_automation_policy(metadata: Any) -> Optional[Dict[str, str]]:
+    """Resolve and validate the trusted Product Requests runtime contract.
+
+    The run type is the admission marker: once a request declares either
+    Product Requests automation type, every trusted-source, identity, model,
+    memory, and tool invariant becomes mandatory. A malformed declaration is
+    rejected rather than silently falling back to the ordinary API surface.
+    """
+    if not isinstance(metadata, dict):
+        return None
+    headless_run = metadata.get("headless_run")
+    if not isinstance(headless_run, dict):
+        return None
+    run_type = _clean_request_string(headless_run.get("run_type"))
+    expected = _REQUESTS_AUTOMATION_POLICIES.get(run_type or "")
+    if expected is None:
+        return None
+
+    chat = metadata.get("chat")
+    runtime_policy = headless_run.get("runtime_policy")
+    run_id = _clean_request_string(headless_run.get("id"))
+    chat_id = _clean_request_string(chat.get("id")) if isinstance(chat, dict) else None
+    if (
+        metadata.get("source") != "dorvis-headless-worker"
+        or not isinstance(chat, dict)
+        or chat.get("type") != "headless_run"
+        or not run_id
+        or chat_id != run_id
+        or runtime_policy != expected
+    ):
+        raise _RequestsAutomationPolicyError(
+            "Product Requests automation metadata does not satisfy the trusted runtime policy."
+        )
+    return dict(expected)
+
+
+def _validate_requests_automation_selection(
+    policy: Optional[Dict[str, str]],
+    *,
+    requested_model: Optional[str],
+    requested_provider: Optional[str],
+    model_options: Any,
+) -> None:
+    if policy is None:
+        return
+    reasoning = _request_reasoning_config(model_options)
+    if (
+        _clean_request_string(requested_model) != policy["model"]
+        or _clean_request_string(requested_provider) != policy["provider"]
+        or reasoning != {"enabled": True, "effort": policy["reasoningEffort"]}
+    ):
+        raise _RequestsAutomationPolicyError(
+            "Product Requests automation model, provider, and reasoning must match its fixed runtime policy."
+        )
 _REQUEST_OPTION_MISSING = object()
 # Full internal ladder + "none": the API server accepts what /reasoning and
 # config.yaml accept (hermes_constants.VALID_REASONING_EFFORTS); wire-level
@@ -3657,6 +3735,14 @@ class APIServerAdapter(BasePlatformAdapter):
 
         request_model = _clean_request_string(requested_model)
         request_provider = _clean_request_string(requested_provider)
+        metadata = request_metadata or {}
+        requests_automation_policy = _requests_automation_policy(metadata)
+        _validate_requests_automation_selection(
+            requests_automation_policy,
+            requested_model=request_model,
+            requested_provider=request_provider,
+            model_options=model_options,
+        )
         route_model = _clean_request_string(route.get("model")) if isinstance(route, dict) else None
         route_provider = _clean_request_string(route.get("provider")) if isinstance(route, dict) else None
         route_api_key = _clean_request_string(route.get("api_key")) if isinstance(route, dict) else None
@@ -3845,20 +3931,37 @@ class APIServerAdapter(BasePlatformAdapter):
                     self._last_resolved_model[_resolved_key] = model
                 self._last_resolved_model["*"] = model
 
-        user_config = _load_gateway_config()
-        enabled_toolsets = sorted(_get_platform_tools(user_config, "api_server"))
+        if requests_automation_policy is not None:
+            actual_provider = _clean_request_string(runtime_kwargs.get("provider"))
+            if (
+                model != requests_automation_policy["model"]
+                or actual_provider != requests_automation_policy["provider"]
+            ):
+                raise _RequestsAutomationPolicyError(
+                    "Product Requests automation runtime resolution drifted from its fixed model route."
+                )
 
-        max_iterations = _current_max_iterations()
+        user_config = _load_gateway_config()
+        enabled_toolsets = (
+            []
+            if requests_automation_policy is not None
+            else sorted(_get_platform_tools(user_config, "api_server"))
+        )
+
+        max_iterations = (
+            1
+            if requests_automation_policy is not None
+            else _current_max_iterations()
+        )
 
         # Load fallback provider chain so the API server platform has the
         # same fallback behaviour as Telegram/Discord/Slack (fixes #4954).
         fallback_model = (
             None
-            if confirmed_runtime_lock
+            if confirmed_runtime_lock or requests_automation_policy is not None
             else GatewayRunner._load_fallback_model()
         )
 
-        metadata = request_metadata or {}
         caller = metadata.get("caller") if isinstance(metadata.get("caller"), dict) else {}
         chat = metadata.get("chat") if isinstance(metadata.get("chat"), dict) else {}
 
@@ -3885,6 +3988,12 @@ class APIServerAdapter(BasePlatformAdapter):
             "verbose_logging": False,
             "ephemeral_system_prompt": ephemeral_system_prompt or None,
             "enabled_toolsets": enabled_toolsets,
+            "disabled_toolsets": (
+                ["memory"] if requests_automation_policy is not None else None
+            ),
+            "skip_memory": requests_automation_policy is not None,
+            "skip_background_review": requests_automation_policy is not None,
+            "skip_context_files": requests_automation_policy is not None,
             "session_id": session_id,
             "platform": "api_server",
             "stream_delta_callback": stream_delta_callback,
@@ -3921,6 +4030,11 @@ class APIServerAdapter(BasePlatformAdapter):
                 else "raw_request"
                 if route or request_model or request_provider
                 else "global"
+            ),
+            **(
+                {"requests_automation_policy": dict(requests_automation_policy)}
+                if requests_automation_policy is not None
+                else {}
             ),
         }
         return agent
@@ -7622,6 +7736,21 @@ class APIServerAdapter(BasePlatformAdapter):
             virtual_model=self._model_name,
             allow_bare_model=self._direct_model_requests,
         )
+        try:
+            requests_automation_policy = _requests_automation_policy(
+                request_metadata
+            )
+            _validate_requests_automation_selection(
+                requests_automation_policy,
+                requested_model=agent_overrides.get("requested_model"),
+                requested_provider=agent_overrides.get("requested_provider"),
+                model_options=agent_overrides.get("model_options"),
+            )
+        except _RequestsAutomationPolicyError as exc:
+            return web.json_response(
+                _openai_error(str(exc), err_type="invalid_request_error"),
+                status=400,
+            )
         selection_error = self._request_route_conflict_error(
             session_id=session_id,
             gateway_session_key=gateway_session_key,
