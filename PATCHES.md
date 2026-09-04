@@ -8,6 +8,44 @@ Current upstream base for the carried branch: `5fc308a70719a83cccdbba4c0e39c23f5
 (official annotated release tag `v2026.8.27`, Hermes v0.20.6; previous base
 `fcbd1076a93841fa88855acce810e342a5b78101`).
 
+### 2026-09-03 contract hardening (AE-250)
+
+- The August rebase's exactly-once lifecycle claim was incomplete for the
+  alternate Codex app-server compaction path. Restore the carried terminal
+  activity edge after transport exceptions, error results, and interruption;
+  retain usage uncertainty and warnings. The ordinary Responses route and
+  Hermes transcript-splitting success gates are unchanged. Two same-named
+  tests had also hidden one of the original checks; both now collect.
+- `scripts/ci/dorvis-contracts.json` is the bounded offline execution inventory.
+  `scripts/ci/dorvis_contracts.py` runs it through `scripts/run_tests.sh` with
+  four workers, no retries, and independent per-file execution reports. Every
+  test path named here must belong to that lane or the four-file Postgres
+  lane, except `tests/conftest.py` (fixtures). Missing files, missing critical
+  tests, under-collection, failures, and unexpected skips fail closed.
+- `idearoom-dorvis-contract-ci.yml` runs on every runtime/main push and PR,
+  plus manual dispatch. Only genuinely off-host Windows marker skips are
+  allowed; provider SDK absence is a failure. The parent requires successful
+  Postgres and carried-contract jobs at the exact published pin. Repository
+  ruleset activation is separate operator work, not implied by this workflow.
+
+### Requests automation isolation (AE-242, hardened in AE-250)
+
+The API admission policy pins duplicate checking to Luna/medium and Linear
+authoring to Terra/medium. Both require trusted headless identity, disable
+tools, builtin and Hindsight memory, context-file loading, background memory
+review, fallback models, and multi-turn execution. Ordinary chat/triage policy
+is unchanged. `gateway/platforms/requests_automation_policy.json` is runtime
+package data read by the gateway and compared to the parent worker's producer
+policy; it must ship in wheels as well as source images.
+
+Contract tests: `tests/gateway/test_api_server.py` (including real AIAgent
+construction and negative admission cases),
+`tests/agent/test_skip_memory_store_65429.py`,
+`tests/run_agent/test_codex_app_server_compaction.py`, and
+`tests/test_dorvis_contract_gate.py` (the evidence checker itself).
+Rebase risk: gateway metadata admission, agent constructor defaults, toolset
+selection, memory-provider initialization, and background-review suppression.
+
 ### 2026-08-30 rebase notes (fcbd1076a → 5fc308a70)
 
 - **Parity-first behavior** — the upstream implementation is carried without
@@ -218,6 +256,9 @@ notable resolutions:
 
 | Patch | Status | Purpose | Main files | Conflict surface | Owner |
 |---|---|---|---|---|---|
+| Requests automation isolation (AE-242 / AE-250) | Carried; hardening pending promotion | Enforce trusted identity, model and reasoning selection, no tools/memory/background review, and one iteration. Runtime JSON policy is compared to the parent producer at its exact pin. | `gateway/platforms/api_server.py`, `gateway/platforms/requests_automation_policy.json`, `tests/gateway/test_api_server.py`, `tests/agent/test_skip_memory_store_65429.py` | Medium: admission, agent constructor, real tool selection, memory loading and finalization | IdeaRoom Agentic Systems |
+| Codex app-server terminal lifecycle (AE-250) | Pending promotion | Close the started activity exactly once on success, failed result, interruption, or dispatch exception; keep warning and usage uncertainty semantics. | `agent/conversation_compression.py`, `tests/run_agent/test_codex_app_server_compaction.py` | Low: alternate app-server compaction path; preserve this deliberate upstream divergence | IdeaRoom Agentic Systems |
+| Bounded carried-contract gate (AE-250) | Pending CI activation | Run the explicit inventory on every release-ref revision and reject missing execution evidence, silent skips, or lost critical tests. | `scripts/ci/dorvis-contracts.json`, `scripts/ci/dorvis_contracts.py`, `.github/workflows/idearoom-dorvis-contract-ci.yml`, `tests/test_dorvis_contract_gate.py` | Medium: upstream runner/plugin changes; repository required-check settings are separate | IdeaRoom Agentic Systems |
 | Postgres v26 surface transition (AE-240) | Bridge published; target pending promotion | The hardened v2026.8.19 bridge accepts only the exact pre-summary v26 catalog or that catalog plus `messages._compressed_summary BIGINT NOT NULL DEFAULT 0`, making it a valid rollout and rollback artifact around the additive migration. The v2026.8.27 target runtime accepts only the widened catalog and writes the durable marker. Runtime boot remains observation-only in both artifacts. Readiness imports the adapter's runtime-accepted marker set instead of duplicating a release marker, so every catalog admitted at boot can join the ALB while every refused catalog remains not-ready. A separate advisory-lock-protected command preflights the exact old source, adds the one constant-default column transactionally, verifies the destination catalog before advancing its marker, and is idempotent only at the exact destination. Advisory-lock acquisition, DDL lock wait, and total statement time are bounded; timeout rolls the transaction back. Successful output identifies only the target host, port, and database, while failures suppress arbitrary driver text and every credential-bearing DSN field. Every missing, extra, malformed, or marker/catalog-disagreeing surface fails closed. | `hermes_state_pg.py`, `gateway/platforms/api_server.py`, `scripts/migrate_pg_schema_v26_surface.py`, `tests/gateway/test_api_server_drain.py`, `tests/gateway/test_session_store_pg.py`, `tests/gateway/test_session_store_pg_unit.py` | Medium: exact Postgres catalog admission, bounded online DDL, credential-safe operator output, state-surface attestation, readiness admission, and the one-way additive migration boundary | IdeaRoom Agentic Systems |
 | Websocket orphan active-turn parity (AE-239) | Pending promotion | Retain v2026.8.19's disconnect contract while carrying v2026.8.27's safer idle-orphan lifecycle: `dashboard.ws_orphan_interrupt_running: false` prevents an elapsed reconnect grace from interrupting a still-running detached turn, while the existing 20-second timer continues to reap sessions it finds idle. The upstream behavior remains the fork default for generic installs; Dorvis disables it explicitly in every managed profile. | `hermes_cli/config_defaults.py`, `tui_gateway/server.py`, `tests/test_tui_gateway_server.py` | Medium: websocket disconnect handling for in-flight turns; a rebase touching `_schedule_ws_orphan_reap` must preserve the independent idle-reap and active-interrupt controls | IdeaRoom Agentic Systems |
 | Web cache-off parity and long-result redaction (AE-239) | Pending promotion | Make `web.cache_enabled: false` a complete behavior-preserving bypass: searches use the caller's exact validated limit and never enter TTL bucketing, memo lookup/store, result slicing, or single-flight serialization. Independently force-redact oversized extracted content at the model-visible truncate boundary and again before its capped full copy is written to `cache/web`; the opaque public URL and deterministic URL-derived file identity remain unchanged. Camofox now applies the same mandatory returned-snapshot redaction as the main browser path for both navigation and explicit snapshots. This carries deterministic long-result storage without adopting the new TTL cache or writing page-rendered credentials to shared EFS. | `tools/web_tools.py`, `tools/browser_camofox.py`, `tests/tools/test_web_result_cache.py`, `tests/tools/test_web_tools_truncate.py`, `tests/tools/test_browser_long_result_storage.py` | Low: web search dispatch only when caching is explicitly disabled, plus the oversized web-extract and browser return/storage boundaries | IdeaRoom Agentic Systems |

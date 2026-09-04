@@ -1,0 +1,16 @@
+{
+  "dorvis.request_duplicate_check": {
+    "model": "gpt-5.6-luna",
+    "provider": "openai-codex",
+    "reasoningEffort": "medium",
+    "memory": "disabled",
+    "tools": "disabled"
+  },
+  "dorvis.request_linear_authoring": {
+    "model": "gpt-5.6-terra",
+    "provider": "openai-codex",
+    "reasoningEffort": "medium",
+    "memory": "disabled",
+    "tools": "disabled"
+  }
+}

@@ -196,8 +196,9 @@ def test_codex_app_server_dispatch_failure_closes_lifecycle_and_marks_usage():
 
 
 
-def test_codex_app_server_compression_failure_preserves_bookkeeping():
-    agent = DummyAgent(TurnResult(error="compact failed"))
+@pytest.mark.parametrize("result", [TurnResult(error="compact failed"), TurnResult(interrupted=True)])
+def test_codex_app_server_failed_or_interrupted_attempt_closes_once(result):
+    agent = DummyAgent(result)
     messages = [{"role": "user", "content": "hi"}]
 
     returned, prompt = compress_context(
@@ -214,6 +215,8 @@ def test_codex_app_server_compression_failure_preserves_bookkeeping():
     assert agent.context_compressor.compression_count == 0
     assert agent.context_compressor.last_prompt_tokens == 123
     assert agent.warnings
+    assert agent.status_events.count(("compacted", COMPACTION_DONE_STATUS)) == 1
+    assert agent.touch_calls[-1] == "context compression failed"
     from agent.runtime_usage import snapshot_agent_usage
 
     usage = snapshot_agent_usage(agent)
@@ -238,6 +241,8 @@ def test_codex_app_server_success_without_compaction_usage_is_partial():
     from agent.runtime_usage import snapshot_agent_usage
 
     usage = snapshot_agent_usage(agent)
+    assert agent.status_events.count(("compacted", COMPACTION_DONE_STATUS)) == 1
+    assert agent.touch_calls[-1] == "context compression completed"
     assert usage["completeness"] == "partial"
     assert usage["warnings"] == ["primary:codex_turn_missing_usage"]
 
@@ -310,6 +315,7 @@ def test_codex_app_server_compression_failure_preserves_bookkeeping():
     assert agent.status_events == [
         ("lifecycle", COMPACTION_STATUS),
         ("warn", "⚠ Codex app-server compaction failed: compact failed"),
+        ("compacted", COMPACTION_DONE_STATUS),
     ]
 
 

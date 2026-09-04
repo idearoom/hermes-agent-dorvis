@@ -666,22 +666,11 @@ def _append_request_identity_prompt(
     return identity_prompt
 
 
-_REQUESTS_AUTOMATION_POLICIES = {
-    "dorvis.request_duplicate_check": {
-        "model": "gpt-5.6-luna",
-        "provider": "openai-codex",
-        "reasoningEffort": "medium",
-        "memory": "disabled",
-        "tools": "disabled",
-    },
-    "dorvis.request_linear_authoring": {
-        "model": "gpt-5.6-terra",
-        "provider": "openai-codex",
-        "reasoningEffort": "medium",
-        "memory": "disabled",
-        "tools": "disabled",
-    },
-}
+# Also consumed by the parent worker's compatibility test against its exact
+# fork pin. Missing/invalid package data must fail import, never disable policy.
+_REQUESTS_AUTOMATION_POLICIES = json.loads(
+    Path(__file__).with_name("requests_automation_policy.json").read_text(encoding="utf-8")
+)
 
 
 class _RequestsAutomationPolicyError(ValueError):

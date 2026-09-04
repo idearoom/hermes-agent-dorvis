@@ -1,0 +1,45 @@
+name: IdeaRoom Dorvis Contract CI
+
+# No path filter: upstream merges can break a carried seam anywhere.
+on:
+  push:
+    branches: [dorvis/runtime, main]
+  pull_request:
+    branches: [dorvis/runtime, main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: idearoom-dorvis-contract-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  contracts:
+    name: Dorvis carried contracts
+    if: github.repository == 'idearoom/hermes-agent-dorvis'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # 8.2.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: |
+            pyproject.toml
+            uv.lock
+      - run: uv python install 3.11
+      - name: Install locked contracts dependencies
+        run: |
+          uv sync --locked --python 3.11 --extra dev --extra anthropic --extra hindsight --extra bedrock
+          uv pip install firecrawl-anydoc==0.1.6
+      - name: Run and verify carried contracts
+        run: .venv/bin/python scripts/ci/dorvis_contracts.py --summary dorvis-contract-summary.json
+      - name: Report execution time (dependency setup excluded)
+        if: success()
+        run: |
+          echo '### Dorvis carried contracts' >> "$GITHUB_STEP_SUMMARY"
+          echo '```json' >> "$GITHUB_STEP_SUMMARY"
+          cat dorvis-contract-summary.json >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"

@@ -4886,6 +4886,17 @@ def _compress_context_via_codex_app_server(
         pass
 
     _activity_heartbeat: Optional[_CompressionActivityHeartbeat] = None
+    # Dorvis consumers use this edge to close the activity, not to infer
+    # success. Warnings and usage completeness carry the attempt's outcome.
+    # Keep the Codex-owned lifecycle separate from Hermes transcript splitting.
+    _compaction_done_emitted = False
+
+    def _complete_compaction_lifecycle():
+        nonlocal _compaction_done_emitted
+        if not _compaction_done_emitted:
+            _compaction_done_emitted = True
+            _emit_compaction_done(agent)
+
     try:
         _activity_heartbeat = _CompressionActivityHeartbeat(agent).start()
         result = codex_session.compact_thread()
@@ -4898,6 +4909,7 @@ def _compress_context_via_codex_app_server(
         )
         if _activity_heartbeat is not None:
             _activity_heartbeat.stop("context compression failed")
+        _complete_compaction_lifecycle()
         raise
 
     if getattr(result, "interrupted", False) or getattr(result, "error", None):
@@ -4943,6 +4955,7 @@ def _compress_context_via_codex_app_server(
             )
         except Exception:
             pass
+        _complete_compaction_lifecycle()
         existing_prompt = getattr(agent, "_cached_system_prompt", None)
         if not existing_prompt:
             existing_prompt = agent._build_system_prompt(system_message)
@@ -4990,9 +5003,7 @@ def _compress_context_via_codex_app_server(
     existing_prompt = getattr(agent, "_cached_system_prompt", None)
     if not existing_prompt:
         existing_prompt = agent._build_system_prompt(system_message)
-    # Terminal edge only on success — failure/interrupt paths above return
-    # without it, matching the main compress_context() gating.
-    _emit_compaction_done(agent)
+    _complete_compaction_lifecycle()
     return messages, existing_prompt
 
 

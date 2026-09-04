@@ -6244,6 +6244,100 @@ def _requests_automation_metadata(run_type: str, model: str) -> dict:
 
 
 class TestRequestsAutomationRuntimeBoundary:
+    @pytest.mark.parametrize("run_type", [
+        "dorvis.request_duplicate_check", "dorvis.request_linear_authoring",
+    ])
+    def test_real_agent_isolated_despite_profile_defaults(self, monkeypatch, tmp_path, run_type):
+        from run_agent import AIAgent
+        from gateway.platforms.api_server import _REQUESTS_AUTOMATION_POLICIES
+        from agent.system_prompt import build_system_prompt_parts
+
+        home = tmp_path / "isolated"
+        home.mkdir()
+        (home / "config.yaml").write_text("memory:\n  provider: hindsight\n")
+        (home / "memories").mkdir()
+        (home / "memories" / "MEMORY.md").write_text("private-memory-sentinel")
+        (home / "memories" / "USER.md").write_text("private-profile-sentinel")
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        # Keep the real constructor and real tool selection. Only provider I/O
+        # and gateway configuration discovery are substituted.
+        _patch_create_agent_runtime(monkeypatch, {}, AIAgent)
+        monkeypatch.setattr("gateway.platforms.api_server._resolve_request_runtime_agent_kwargs",
+                            lambda provider, target_model=None: {
+                                "provider": provider, "api_key": "test", "api_mode": "codex_responses",
+                                "base_url": "https://example.invalid",
+                            })
+        monkeypatch.setattr("run_agent.OpenAI", MagicMock())
+        with patch("plugins.memory.load_memory_provider") as load_provider:
+            adapter = APIServerAdapter(PlatformConfig(enabled=True))
+            monkeypatch.setattr(adapter, "_ensure_session_db", lambda: None)
+            monkeypatch.setattr(adapter, "_session_model_override_for", lambda *_: None)
+            model = _REQUESTS_AUTOMATION_POLICIES[run_type]["model"]
+            agent = adapter._create_agent(
+                session_id="run-requests-1", gateway_session_key="run-requests-1",
+                request_metadata=_requests_automation_metadata(run_type, model),
+                requested_model=model, requested_provider="openai-codex",
+                model_options={"reasoning_effort": "medium"},
+            )
+            try:
+                assert agent.tools == []
+                assert agent._memory_manager is None
+                assert agent._memory_store is None
+                assert agent.skip_background_review is True
+                assert agent.skip_context_files is True
+                prompt = str(build_system_prompt_parts(agent))
+                assert "private-memory-sentinel" not in prompt
+                assert "private-profile-sentinel" not in prompt
+                load_provider.assert_not_called()
+                from agent.turn_finalizer import finalize_turn
+
+                # Exercise the real turn-end consumer too. Request a review
+                # deliberately; suppression must win over the review trigger.
+                review = MagicMock()
+                monkeypatch.setattr(agent, "_spawn_background_review", review)
+                turn = dict(
+                    final_response="{}", api_call_count=1, interrupted=False, failed=False,
+                    messages=[{"role": "user", "content": "check"},
+                              {"role": "assistant", "content": "{}"}],
+                    conversation_history=[], effective_task_id="run-requests-1", turn_id="turn-1",
+                    user_message="check", original_user_message="check",
+                    _should_review_memory=True, _turn_exit_reason="completed",
+                )
+                finalize_turn(agent, **turn)
+                review.assert_not_called()
+                load_provider.assert_not_called()
+                # Positive control: prove the same path reaches review when
+                # suppression is removed, rather than testing a dead trigger.
+                agent.skip_background_review = False
+                finalize_turn(agent, **turn)
+                review.assert_called_once()
+                # An ordinary agent against this same profile must reach the
+                # provider boundary. The fixture is not merely memory-free by
+                # accident. Stop at that boundary, without any Hindsight I/O.
+                load_provider.side_effect = RuntimeError("test provider boundary")
+                control = AIAgent(
+                    api_key="test", base_url="https://example.invalid", provider="openrouter",
+                    api_mode="chat_completions", enabled_toolsets=[], disabled_toolsets=["memory"],
+                    skip_context_files=True, quiet_mode=True,
+                )
+                try:
+                    load_provider.assert_called_once_with("hindsight")
+                    assert control._memory_store is not None
+                finally:
+                    control.close()
+            finally:
+                agent.close()
+
+    @pytest.mark.parametrize("field,value", [
+        ("source", "browser"), ("chat", {"id": "different", "type": "headless_run"}),
+        ("chat", {"id": "run-requests-1", "type": "chat"}),
+    ])
+    def test_untrusted_identity_rejected(self, field, value):
+        metadata = _requests_automation_metadata("dorvis.request_duplicate_check", "gpt-5.6-luna")
+        metadata[field] = value
+        with pytest.raises(ValueError, match="trusted runtime policy"):
+            _requests_automation_policy(metadata)
+
     @pytest.mark.parametrize(
         ("run_type", "model"),
         [
@@ -6298,17 +6392,25 @@ class TestRequestsAutomationRuntimeBoundary:
         assert captured["fallback_model"] is None
         assert agent._hermes_api_runtime["requests_automation_policy"]["model"] == model
 
-    def test_policy_rejects_a_request_run_that_only_claims_isolation(self):
+    @pytest.mark.parametrize("field,value", [
+        ("tools", "enabled"), ("memory", "enabled"), ("model", "other"),
+        ("reasoningEffort", "high"), ("unexpected", True),
+    ])
+    def test_policy_rejects_a_request_run_that_only_claims_isolation(self, field, value):
         metadata = _requests_automation_metadata(
             "dorvis.request_duplicate_check", "gpt-5.6-luna"
         )
-        metadata["headless_run"]["runtime_policy"]["tools"] = "enabled"
+        metadata["headless_run"]["runtime_policy"][field] = value
 
         with pytest.raises(ValueError, match="trusted runtime policy"):
             _requests_automation_policy(metadata)
 
     @pytest.mark.asyncio
-    async def test_responses_rejects_model_drift_before_launch(self):
+    @pytest.mark.parametrize("override", [
+        {"model": "gpt-5.6-terra"}, {"provider": "openrouter"},
+        {"model_options": {"reasoning_effort": "high"}}, {"model_options": {}},
+    ])
+    async def test_responses_rejects_model_drift_before_launch(self, override):
         adapter = APIServerAdapter(PlatformConfig(enabled=True))
         app = _create_app(adapter)
         async with TestClient(TestServer(app)) as cli:
@@ -6316,13 +6418,14 @@ class TestRequestsAutomationRuntimeBoundary:
                 response = await cli.post(
                     "/v1/responses",
                     json={
-                        "model": "gpt-5.6-terra",
+                        "model": "gpt-5.6-luna",
                         "provider": "openai-codex",
                         "model_options": {"reasoning_effort": "medium"},
                         "input": "Check this Product Request for duplicates.",
                         "metadata": _requests_automation_metadata(
                             "dorvis.request_duplicate_check", "gpt-5.6-luna"
                         ),
+                        **override,
                     },
                 )
 
