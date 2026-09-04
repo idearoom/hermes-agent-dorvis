@@ -12,5 +12,12 @@
     "reasoningEffort": "medium",
     "memory": "disabled",
     "tools": "disabled"
+  },
+  "dorvis.triage_intake_summary": {
+    "model": "gpt-5.6-luna",
+    "provider": "openai-codex",
+    "reasoningEffort": "medium",
+    "memory": "disabled",
+    "tools": "disabled"
   }
 }
