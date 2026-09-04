@@ -674,16 +674,16 @@ _REQUESTS_AUTOMATION_POLICIES = json.loads(
 
 
 class _RequestsAutomationPolicyError(ValueError):
-    """A Product Requests run attempted to escape its fixed runtime boundary."""
+    """A memory-isolated Dorvis run attempted to escape its fixed boundary."""
 
 
 def _requests_automation_policy(metadata: Any) -> Optional[Dict[str, str]]:
-    """Resolve and validate the trusted Product Requests runtime contract.
+    """Resolve and validate a trusted memory-isolated Dorvis runtime contract.
 
-    The run type is the admission marker: once a request declares either
-    Product Requests automation type, every trusted-source, identity, model,
-    memory, and tool invariant becomes mandatory. A malformed declaration is
-    rejected rather than silently falling back to the ordinary API surface.
+    The run type is the admission marker: once a request declares a listed
+    automation type, every trusted-source, identity, model, memory, and tool
+    invariant becomes mandatory. A malformed declaration is rejected rather
+    than silently falling back to the ordinary API surface.
     """
     if not isinstance(metadata, dict):
         return None
@@ -708,7 +708,7 @@ def _requests_automation_policy(metadata: Any) -> Optional[Dict[str, str]]:
         or runtime_policy != expected
     ):
         raise _RequestsAutomationPolicyError(
-            "Product Requests automation metadata does not satisfy the trusted runtime policy."
+            "Memory-isolated automation metadata does not satisfy the trusted runtime policy."
         )
     return dict(expected)
 
@@ -729,7 +729,7 @@ def _validate_requests_automation_selection(
         or reasoning != {"enabled": True, "effort": policy["reasoningEffort"]}
     ):
         raise _RequestsAutomationPolicyError(
-            "Product Requests automation model, provider, and reasoning must match its fixed runtime policy."
+            "Memory-isolated automation model, provider, and reasoning must match its fixed runtime policy."
         )
 _REQUEST_OPTION_MISSING = object()
 # Full internal ladder + "none": the API server accepts what /reasoning and
@@ -3927,7 +3927,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 or actual_provider != requests_automation_policy["provider"]
             ):
                 raise _RequestsAutomationPolicyError(
-                    "Product Requests automation runtime resolution drifted from its fixed model route."
+                    "Memory-isolated automation runtime resolution drifted from its fixed model route."
                 )
 
         user_config = _load_gateway_config()

@@ -38,7 +38,10 @@ def validate_manifest(manifest, root=ROOT):
         ):
             raise ValueError(f"Missing or invalid contract file: {file}")
     inventory = set(
-        re.findall(r"tests/[A-Za-z0-9_./-]+\.py", (root / "PATCHES.md").read_text())
+        re.findall(
+            r"tests/[A-Za-z0-9_./-]+\.py",
+            (root / "PATCHES.md").read_text(encoding="utf-8"),
+        )
     )
     missing = inventory - set(files) - PG_FILES - {"tests/conftest.py"}
     if missing:
@@ -60,7 +63,7 @@ def verify_reports(manifest, directory):
     passed = skipped = 0
     passing_nodes = set()
     for file in manifest["files"]:
-        report = json.loads((directory / report_name(file)).read_text())
+        report = json.loads((directory / report_name(file)).read_text(encoding="utf-8"))
         if (
             report["file"] != file
             or report["exitstatus"] != 0
@@ -159,7 +162,8 @@ def pytest_sessionfinish(session, exitstatus):
             "outcomes": _outcomes,
             "collection_errors": _collection_errors,
             "collected": _collected,
-        })
+        }),
+        encoding="utf-8",
     )
 
 
@@ -168,7 +172,7 @@ def main():
     parser.add_argument("--check-manifest", action="store_true")
     parser.add_argument("--summary", type=Path)
     args = parser.parse_args()
-    manifest = json.loads(MANIFEST.read_text())
+    manifest = json.loads(MANIFEST.read_text(encoding="utf-8"))
     validate_manifest(manifest)
     if args.check_manifest:
         print(f"Validated {len(manifest['files'])} contract files against PATCHES.md")
@@ -201,7 +205,10 @@ def main():
     summary["elapsed_seconds"] = round(time.monotonic() - started, 2)
     print(json.dumps(summary, indent=2))
     if args.summary:
-        args.summary.write_text(json.dumps(summary, indent=2) + "\n")
+        args.summary.write_text(
+            json.dumps(summary, indent=2) + "\n",
+            encoding="utf-8",
+        )
 
 
 if __name__ == "__main__":

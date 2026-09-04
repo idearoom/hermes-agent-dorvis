@@ -6246,6 +6246,7 @@ def _requests_automation_metadata(run_type: str, model: str) -> dict:
 class TestRequestsAutomationRuntimeBoundary:
     @pytest.mark.parametrize("run_type", [
         "dorvis.request_duplicate_check", "dorvis.request_linear_authoring",
+        "dorvis.triage_intake_summary",
     ])
     def test_real_agent_isolated_despite_profile_defaults(self, monkeypatch, tmp_path, run_type):
         from run_agent import AIAgent
@@ -6343,6 +6344,7 @@ class TestRequestsAutomationRuntimeBoundary:
         [
             ("dorvis.request_duplicate_check", "gpt-5.6-luna"),
             ("dorvis.request_linear_authoring", "gpt-5.6-terra"),
+            ("dorvis.triage_intake_summary", "gpt-5.6-luna"),
         ],
     )
     def test_create_agent_removes_tools_memory_and_fallbacks(
