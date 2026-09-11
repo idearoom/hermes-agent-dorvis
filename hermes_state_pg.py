@@ -1861,6 +1861,41 @@ class _PoolConn:
         pass
 
 
+class _PgSessionDBLease:
+    """Independently closable reference to one PgSessionDB bounded pool."""
+
+    def __init__(self, owner: "PgSessionDB") -> None:
+        self._owner = owner
+        self._closed = False
+        self._state_lock = threading.Lock()
+
+    def __getattr__(self, name: str):
+        if self._closed:
+            raise RuntimeError("Postgres session store lease is closed")
+        return getattr(self._owner, name)
+
+    def close(self) -> None:
+        with self._state_lock:
+            if self._closed:
+                return
+            self._closed = True
+        self._owner._release_sibling()
+
+    def open_owned_sibling(self):
+        """Let a still-live child spawn after the root owner began closing."""
+        with self._state_lock:
+            if self._closed:
+                raise RuntimeError("Postgres session store lease is closed")
+            return self._owner._acquire_sibling(allow_parent_closing=True)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        self.close()
+        return False
+
+
 class PgSessionDB(SessionDB):
     """Postgres-backed SessionDB (see module docstring).
 
@@ -1913,6 +1948,10 @@ class PgSessionDB(SessionDB):
         self._fts_unavailable_warned = False
         self._trigram_unavailable_warned = False
         self._closed = False
+        self._lease_lock = threading.Lock()
+        self._lease_count = 0
+        self._close_requested = False
+        self._pool_close_started = False
         self._allow_schema_migration = bool(allow_schema_migration)
         self._message_columns_cache: Optional[List[str]] = None
         self._storage_attestation: Optional[Dict[str, Any]] = None
@@ -2631,19 +2670,69 @@ class PgSessionDB(SessionDB):
 
     # ── Lifecycle / SQLite maintenance obsoleted by Postgres ────────────
 
-    def close(self) -> None:
-        if self._closed:
-            return
+    def open_owned_sibling(self):
+        """Lease this bounded pool for a child with independent ownership."""
+        return self._acquire_sibling(allow_parent_closing=False)
+
+    def _acquire_sibling(self, *, allow_parent_closing: bool):
+        with self._lease_lock:
+            if (
+                self._closed
+                or self._pool_close_started
+                or (self._close_requested and not allow_parent_closing)
+            ):
+                raise RuntimeError("Postgres session store is closing")
+            self._lease_count += 1
+        return _PgSessionDBLease(self)
+
+    def _release_sibling(self) -> None:
+        close_now = False
+        with self._lease_lock:
+            if self._lease_count <= 0:
+                return
+            self._lease_count -= 1
+            close_now = self._close_requested and self._lease_count == 0
+        if close_now:
+            logger.info(
+                "Postgres session store closing bounded pool after final "
+                "delegated lease"
+            )
+            self._close_pool()
+
+    def _close_pool(self) -> None:
+        with self._lease_lock:
+            if self._closed or self._pool_close_started:
+                return
+            self._pool_close_started = True
+        # Preserve the original close order: the token writer may perform a
+        # final database flush, so keep both the pool and _conn live for it.
         self._stop_token_writer()
         hook, self._token_atexit_hook = self._token_atexit_hook, None
         if hook is not None:
             hermes_state.atexit.unregister(hook)
-        self._closed = True
+        with self._lease_lock:
+            self._closed = True
         self._conn = None
         try:
             self._pool.close()
         except Exception:
             pass
+
+    def close(self) -> None:
+        deferred_leases = 0
+        with self._lease_lock:
+            if self._closed or self._close_requested:
+                return
+            self._close_requested = True
+            close_now = self._lease_count == 0
+            deferred_leases = self._lease_count
+        if deferred_leases:
+            logger.info(
+                "Postgres session store close deferred for %d delegated lease(s)",
+                deferred_leases,
+            )
+        if close_now:
+            self._close_pool()
 
     @staticmethod
     def _lock_holder_process_is_dead(holder: str) -> bool:

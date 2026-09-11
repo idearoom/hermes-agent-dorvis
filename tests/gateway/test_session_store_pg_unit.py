@@ -1367,6 +1367,10 @@ def test_pg_close_drains_token_writer_before_closing_pool(monkeypatch):
     hook = object()
     db = PgSessionDB.__new__(PgSessionDB)
     db._closed = False
+    db._lease_lock = threading.Lock()
+    db._lease_count = 0
+    db._close_requested = False
+    db._pool_close_started = False
     db._conn = object()
     db._pool = _ClosePool()
     db._token_atexit_hook = hook
