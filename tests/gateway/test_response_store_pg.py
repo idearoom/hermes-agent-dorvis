@@ -59,6 +59,38 @@ def test_put_get_roundtrip(store):
     assert store.get("r1") == data
 
 
+def test_get_coalesces_access_watermark_writes(store):
+    store.put("coalesced-access", {"response": {"id": "coalesced-access"}})
+    with psycopg.connect(_DSN, autocommit=True) as conn:
+        conn.execute(
+            """UPDATE hermes_gw.responses
+               SET accessed_at = 1
+               WHERE response_id = %s""",
+            ("coalesced-access",),
+        )
+
+    assert store.get("coalesced-access") == {
+        "response": {"id": "coalesced-access"}
+    }
+    with psycopg.connect(_DSN) as conn:
+        first_touch = conn.execute(
+            "SELECT accessed_at FROM hermes_gw.responses WHERE response_id = %s",
+            ("coalesced-access",),
+        ).fetchone()[0]
+
+    assert first_touch > 1
+    assert store.get("coalesced-access") == {
+        "response": {"id": "coalesced-access"}
+    }
+    with psycopg.connect(_DSN) as conn:
+        second_touch = conn.execute(
+            "SELECT accessed_at FROM hermes_gw.responses WHERE response_id = %s",
+            ("coalesced-access",),
+        ).fetchone()[0]
+
+    assert second_touch == first_touch
+
+
 def test_get_missing_returns_none(store):
     assert store.get("nope") is None
 

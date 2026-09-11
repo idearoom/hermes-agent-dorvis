@@ -1972,6 +1972,18 @@ def _openai_error(message: str, err_type: str = "invalid_request_error", param: 
     }
 
 
+def _compacted_response_history_error(stored: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Return an explicit chain error for a retention-compacted response."""
+    marker = stored.get("_dorvis_retention")
+    if not isinstance(marker, dict) or marker.get("conversation_history_compacted") is not True:
+        return None
+    return _openai_error(
+        "Previous response history is no longer available",
+        param="previous_response_id",
+        code="response_history_compacted",
+    )
+
+
 _api_agent_request_reservation: ContextVar[Optional[dict[str, bool]]] = ContextVar(
     "api_agent_request_reservation", default=None
 )
@@ -7694,6 +7706,9 @@ class APIServerAdapter(BasePlatformAdapter):
             stored = self._get_response_record(previous_response_id)
             if stored is None:
                 return web.json_response(_openai_error(f"Previous response not found: {previous_response_id}"), status=404)
+            compacted_error = _compacted_response_history_error(stored)
+            if compacted_error is not None:
+                return web.json_response(compacted_error, status=409)
             conversation_history = list(stored.get("conversation_history", []))
             stored_session_id = stored.get("session_id")
             # If no instructions provided, carry forward from previous
@@ -9687,6 +9702,9 @@ class APIServerAdapter(BasePlatformAdapter):
         if not conversation_history and previous_response_id:
             stored = self._get_response_record(previous_response_id)
             if stored:
+                compacted_error = _compacted_response_history_error(stored)
+                if compacted_error is not None:
+                    return web.json_response(compacted_error, status=409)
                 conversation_history = list(stored.get("conversation_history", []))
                 stored_session_id = stored.get("session_id")
                 if instructions is None:
