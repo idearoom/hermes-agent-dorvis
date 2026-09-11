@@ -3551,6 +3551,35 @@ class TestResponsesEndpoint:
             )
             assert resp.status == 404
 
+    @pytest.mark.asyncio
+    async def test_compacted_previous_response_history_returns_conflict(self, adapter):
+        adapter._response_store.put(
+            "resp_compacted",
+            {
+                "response": {"id": "resp_compacted", "status": "completed"},
+                "_dorvis_retention": {
+                    "conversation_history_compacted": True,
+                    "policy": "response_history_90d",
+                },
+            },
+        )
+        app = _create_app(adapter)
+        app.router.add_post("/v1/runs", adapter._handle_runs)
+        async with TestClient(TestServer(app)) as cli:
+            for path in ("/v1/responses", "/v1/runs"):
+                resp = await cli.post(
+                    path,
+                    json={
+                        "model": "hermes-agent",
+                        "input": "follow up",
+                        "previous_response_id": "resp_compacted",
+                    },
+                )
+                assert resp.status == 409
+                body = await resp.json()
+                assert body["error"]["code"] == "response_history_compacted"
+                assert body["error"]["param"] == "previous_response_id"
+
 
     @pytest.mark.asyncio
     async def test_store_string_false_does_not_store(self, adapter):

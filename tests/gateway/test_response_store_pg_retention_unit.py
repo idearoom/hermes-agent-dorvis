@@ -89,6 +89,7 @@ class _FakeConnection:
         self.conversation_fence_trigger_definition_valid = True
         self.response_write_owner_id = None
         self.response_write_owner_epoch = None
+        self.access_update_count = 0
 
     def execute(self, sql, params=None):
         normalized = " ".join(sql.split()).lower()
@@ -458,10 +459,19 @@ class _FakeConnection:
                 row["owner_heartbeat_at"] = heartbeat_at
             return _FakeCursor(rowcount=int(matches))
         if normalized.startswith("update hermes_gw.responses set accessed_at"):
-            accessed_at, response_id = params
-            if response_id in self.responses:
+            if len(params) == 2:
+                accessed_at, response_id = params
+                stale_before = float("inf")
+            else:
+                accessed_at, response_id, stale_before = params
+            if (
+                response_id in self.responses
+                and self.responses[response_id]["accessed_at"] < stale_before
+            ):
                 self.responses[response_id]["accessed_at"] = accessed_at
-            return _FakeCursor(rowcount=int(response_id in self.responses))
+                self.access_update_count += 1
+                return _FakeCursor(rowcount=1)
+            return _FakeCursor(rowcount=0)
         if normalized.startswith("select response_id from hermes_gw.responses"):
             if "where response_id = %s" in normalized:
                 response_id = params[0]
@@ -594,6 +604,24 @@ def test_pg_response_store_keeps_more_than_constructor_max_size(monkeypatch):
         assert len(store) == 4
         assert store.get("r0") == {"index": 0}
         assert store.get("r3") == {"index": 3}
+    finally:
+        store.close()
+
+
+def test_pg_get_coalesces_access_watermark_writes(monkeypatch):
+    _install_fake_psycopg_modules(monkeypatch)
+    store = PgResponseStore("postgresql://fake")
+    clock = iter((1_000.0, 1_100.0, 1_400.0))
+    monkeypatch.setattr(_mod.time, "time", lambda: next(clock))
+    try:
+        store.put("r1", {"response": {"id": "r1", "status": "completed"}})
+        conn = _FakePool.last_instance.conn
+
+        assert store.get("r1")["response"]["status"] == "completed"
+        assert conn.access_update_count == 0
+        assert store.get("r1")["response"]["status"] == "completed"
+        assert conn.access_update_count == 1
+        assert conn.responses["r1"]["accessed_at"] == 1_400.0
     finally:
         store.close()
 

@@ -36,6 +36,10 @@ logger = logging.getLogger(__name__)
 # AWS. It must not evict model-visible conversation state just because more
 # turns arrived later.
 DEFAULT_MAX_STORED_RESPONSES = None
+# A chained request can read the same completed response repeatedly while a
+# browser reconnects or retries. Retention needs an approximate last-access
+# watermark, not a heap rewrite (and WAL record) for every GET.
+ACCESS_TOUCH_INTERVAL_SECONDS = 300.0
 
 _SCHEMA = "hermes_gw"
 _SCHEMA_CONTRACT_VERSION = 2
@@ -955,9 +959,16 @@ class PgResponseStore:
                 ).fetchone()
                 if row is None:
                     return None
+                accessed_at = time.time()
                 conn.execute(
-                    f"UPDATE {_SCHEMA}.responses SET accessed_at = %s WHERE response_id = %s",
-                    (time.time(), response_id),
+                    f"""UPDATE {_SCHEMA}.responses SET accessed_at = %s
+                        WHERE response_id = %s
+                          AND accessed_at < %s""",
+                    (
+                        accessed_at,
+                        response_id,
+                        accessed_at - ACCESS_TOUCH_INTERVAL_SECONDS,
+                    ),
                 )
                 # psycopg adapts jsonb -> Python dict/list directly; no json.loads.
                 # (Postgres enforces valid JSON on write, so the SQLite store's
