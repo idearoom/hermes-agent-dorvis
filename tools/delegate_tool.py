@@ -1982,32 +1982,21 @@ def _build_child_agent(
     if isinstance(child_max_tokens, int):
         child_optional_kwargs["max_tokens"] = child_max_tokens
 
-    # Each child gets a DEDICATED SessionDB connection instead of the parent's
-    # live object. The parent's handle is owned by the parent's lifecycle
-    # (cron run_job's finally block, gateway session end, /new) and can be
-    # closed while a fire-and-forget background child is still flushing on a
-    # daemon thread — every subsequent flush then hits the closed handle and
-    # the child's transcript is silently dropped (#81267). A dedicated handle
-    # can't be closed out from under the child; it is released by the child's
-    # own close() via the owned flag set below. It MUST point at the same
-    # database FILE as the parent's handle: parents can hold non-default
-    # per-profile handles (tui_gateway opens SessionDB(db_path=<profile>/
-    # state.db) for non-launch profiles), and a bare SessionDB() would write
-    # the child's transcript into the launch profile's db, breaking
-    # parent_session_id lineage and session_search. AsyncSessionDB wrappers
-    # (gateway) forward .db_path via __getattr__, so this works through them.
+    # Each child gets an independently owned SessionDB handle instead of the
+    # parent's lifecycle-bound handle. SQLite parents open the same explicit
+    # profile file. Postgres parents return a reference-counted lease on their
+    # existing bounded pool: passing PgSessionDB.db_path back to SessionDB
+    # would explicitly select SQLite, splitting the child from its parent and
+    # making parent_session_id fail its FK. The lease also keeps the pool open
+    # if parent teardown races a fire-and-forget child (#81267), without adding
+    # a pool per delegated child. AsyncSessionDB is unwrapped by the factory.
     child_session_db = None
     parent_session_db = getattr(parent_agent, "_session_db", None)
     if parent_session_db is not None:
         try:
-            from hermes_state import SessionDB
+            from hermes_state import open_owned_session_db_sibling
 
-            _parent_db_path = getattr(parent_session_db, "db_path", None)
-            child_session_db = (
-                SessionDB(db_path=_parent_db_path)
-                if _parent_db_path is not None
-                else SessionDB()
-            )
+            child_session_db = open_owned_session_db_sibling(parent_session_db)
         except Exception:
             # A configured shared state store is a production contract, not an
             # optional enhancement. Falling back to an unpersisted child would

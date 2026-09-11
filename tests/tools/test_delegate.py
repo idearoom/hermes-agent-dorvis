@@ -31,7 +31,7 @@ from tools.delegate_tool import (
     _resolve_child_credential_pool,
     _resolve_delegation_credentials,
 )
-from hermes_state import SessionDB
+from hermes_state import AsyncSessionDB, SessionDB
 
 
 def _make_mock_parent(depth=0):
@@ -353,6 +353,33 @@ class TestDelegateTask(unittest.TestCase):
         finally:
             parent_db.close()
 
+    def test_child_uses_backend_owned_handle_through_async_wrapper(self):
+        """Gateway wrappers must not turn the sync sibling factory async."""
+        parent = _make_mock_parent(depth=0)
+        owned_child = MagicMock()
+        backend = MagicMock()
+        backend.open_owned_sibling.return_value = owned_child
+        parent._session_db = AsyncSessionDB(backend)
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            MockAgent.return_value = mock_child
+            _build_child_agent(
+                task_index=0,
+                goal="test",
+                context=None,
+                toolsets=None,
+                model="test-model",
+                max_iterations=5,
+                parent_agent=parent,
+                task_count=1,
+            )
+
+        _, kwargs = MockAgent.call_args
+        backend.open_owned_sibling.assert_called_once_with()
+        self.assertIs(kwargs["session_db"], owned_child)
+        self.assertTrue(mock_child._owns_session_db)
+
     def test_child_without_parent_db_still_degrades_to_none(self):
         """Parent without a SessionDB -> child gets None (pre-fix behaviour).
 
@@ -390,7 +417,10 @@ class TestDelegateTask(unittest.TestCase):
                 os.environ,
                 {"HERMES_STATE_STORE_DSN": "postgresql://configured/shared"},
             ),
-            patch("hermes_state.SessionDB", side_effect=RuntimeError("schema mismatch")),
+            patch(
+                "hermes_state.open_owned_session_db_sibling",
+                side_effect=RuntimeError("schema mismatch"),
+            ),
             patch("run_agent.AIAgent") as MockAgent,
         ):
             with self.assertRaisesRegex(RuntimeError, "schema mismatch"):
@@ -421,7 +451,10 @@ class TestDelegateTask(unittest.TestCase):
         import tempfile
         from pathlib import Path
 
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+            os.environ,
+            {"HERMES_STATE_STORE_DSN": "postgresql://configured/shared"},
+        ):
             profile_db_path = Path(tmp) / "profile-work" / "state.db"
             profile_db_path.parent.mkdir(parents=True)
             parent = _make_mock_parent(depth=0)
@@ -446,7 +479,7 @@ class TestDelegateTask(unittest.TestCase):
                     _, kwargs = MockAgent.call_args
 
                 child_db = kwargs["session_db"]
-                self.assertIsInstance(child_db, SessionDB)
+                self.assertIs(type(child_db), SessionDB)
                 self.assertIsNot(child_db, parent_db)
                 self.assertEqual(
                     str(child_db.db_path), str(parent_db.db_path)

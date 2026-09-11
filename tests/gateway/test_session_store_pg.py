@@ -12,12 +12,14 @@ throwaway database.
 
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 import textwrap
 import threading
 import time
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -36,7 +38,11 @@ if not _DSN:
     )
 
 import hermes_state
-from hermes_state import AsyncSessionDB, SessionDB
+from hermes_state import (
+    AsyncSessionDB,
+    SessionDB,
+    open_owned_session_db_sibling,
+)
 import hermes_state_pg
 from hermes_state_pg import _SCHEMA, EXPECTED_SCHEMA_VERSION, PgSessionDB
 
@@ -117,6 +123,148 @@ def test_full_crud_round_trip(pg_db):
     assert pg_db.delete_session(sid) is True
     assert pg_db.get_session(sid) is None
     assert pg_db.get_messages(sid) == []
+
+
+def test_owned_sibling_keeps_pg_backend_pool_bounded_after_parent_close(pg_db):
+    """Delegated children stay on PG without opening a pool per child.
+
+    PgSessionDB.db_path is vestigial. Reconstructing SessionDB with that
+    explicit path selects SQLite, where the PG-only parent row is absent and
+    both child creation and append fail their FKs. The backend-owned sibling
+    must instead lease this pool, survive parent close, and release it only
+    after the child is done.
+    """
+    parent_id = pg_db.create_session(
+        "pg-parent-for-delegate", "api_server", system_prompt="parent prompt"
+    )
+    pool = pg_db._pool
+    max_size = pool.max_size
+
+    child_db = open_owned_session_db_sibling(AsyncSessionDB(pg_db))
+    assert child_db is not pg_db
+    assert child_db._owner is pg_db
+    assert child_db._owner._pool is pool
+    assert child_db._owner._pool.max_size == max_size
+
+    pg_db.close()
+    assert pg_db._close_requested is True
+    assert pg_db._closed is False
+    with pytest.raises(RuntimeError, match="closing"):
+        pg_db.open_owned_sibling()
+
+    # A live delegate can create its own nested child after parent teardown
+    # starts. This is the fire-and-forget shape that originally lost the
+    # child's final transcript when the parent lifecycle closed first.
+    second_child_db = open_owned_session_db_sibling(child_db)
+    assert second_child_db._owner is pg_db
+
+    child_db.create_session(
+        "pg-child-for-delegate",
+        "subagent",
+        parent_session_id=parent_id,
+        system_prompt="child prompt",
+    )
+    child_db.append_message(
+        "pg-child-for-delegate", "assistant", "durable child result"
+    )
+    assert child_db.get_session("pg-child-for-delegate")["parent_session_id"] == parent_id
+    assert child_db.get_messages("pg-child-for-delegate")[0]["content"] == "durable child result"
+
+    # Child shutdown may be requested concurrently by its own finalizer and a
+    # parent cancellation path. One lease must be released exactly once so it
+    # cannot close the shared pool under the still-running nested child.
+    close_threads = [threading.Thread(target=child_db.close) for _ in range(8)]
+    for thread in close_threads:
+        thread.start()
+    for thread in close_threads:
+        thread.join(timeout=2)
+        assert not thread.is_alive()
+    assert pg_db._closed is False
+    second_child_db.create_session(
+        "pg-second-child-for-delegate",
+        "subagent",
+        parent_session_id=parent_id,
+    )
+    second_child_db.append_message(
+        "pg-second-child-for-delegate", "assistant", "second durable child"
+    )
+    second_child_db.close()
+    assert pg_db._closed is True
+    assert pool.closed is True
+
+
+def test_delegate_builder_persists_pg_child_against_pg_parent(pg_db, monkeypatch):
+    """The production builder must wire the backend-owned handle end to end."""
+    from tools.delegate_tool import _build_child_agent
+
+    parent_id = pg_db.create_session(
+        "pg-builder-parent", "api_server", system_prompt="parent prompt"
+    )
+    parent = MagicMock()
+    parent.base_url = "https://example.invalid/v1"
+    parent.api_key = "test"
+    parent.provider = "openrouter"
+    parent.api_mode = "chat_completions"
+    parent.model = "test-model"
+    parent.platform = "api_server"
+    parent.providers_allowed = None
+    parent.providers_ignored = None
+    parent.providers_order = None
+    parent.provider_sort = None
+    parent.enabled_toolsets = []
+    parent._session_db = AsyncSessionDB(pg_db)
+    parent.session_id = parent_id
+    parent._delegate_depth = 0
+    parent._print_fn = None
+    parent.tool_progress_callback = None
+    parent.thinking_callback = None
+    monkeypatch.setenv("HERMES_STATE_STORE_DSN", _DSN)
+
+    child_agent = MagicMock()
+    child_agent.session_id = "pg-builder-child"
+    with patch("run_agent.AIAgent", return_value=child_agent) as agent_cls:
+        built = _build_child_agent(
+            task_index=0,
+            goal="persist a delegated result",
+            context=None,
+            toolsets=None,
+            model="test-model",
+            max_iterations=2,
+            task_count=1,
+            parent_agent=parent,
+        )
+
+    child_db = agent_cls.call_args.kwargs["session_db"]
+    assert built is child_agent
+    assert child_agent._owns_session_db is True
+    assert child_db._owner is pg_db
+    child_db.create_session(
+        child_agent.session_id,
+        "subagent",
+        parent_session_id=parent_id,
+    )
+    child_db.append_message(child_agent.session_id, "assistant", "delegated result")
+    child_db.close()
+
+    assert pg_db.get_session(child_agent.session_id)["parent_session_id"] == parent_id
+    assert pg_db.get_messages(child_agent.session_id)[0]["content"] == "delegated result"
+
+
+def test_explicit_path_reproduces_cross_backend_foreign_keys(pg_db, tmp_path, monkeypatch):
+    """Retain the pre-fix failure shape so explicit-path dispatch stays visible."""
+    parent_id = pg_db.create_session("pg-only-parent", "api_server")
+    monkeypatch.setenv("HERMES_STATE_STORE_DSN", _DSN)
+    wrong_backend = SessionDB(db_path=tmp_path / "wrong-backend.db")
+    try:
+        assert type(wrong_backend) is SessionDB
+        with pytest.raises(sqlite3.IntegrityError, match="FOREIGN KEY constraint failed"):
+            wrong_backend.create_session(
+                "sqlite-child", "subagent", parent_session_id=parent_id
+            )
+        with pytest.raises(sqlite3.IntegrityError, match="FOREIGN KEY constraint failed"):
+            wrong_backend.append_message("sqlite-child", "assistant", "lost result")
+    finally:
+        wrong_backend.close()
 
 
 def test_second_current_schema_boot_is_catalog_neutral(pg_db):

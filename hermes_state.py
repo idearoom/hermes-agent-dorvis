@@ -431,6 +431,24 @@ def open_session_db_for_home(home, **kwargs) -> "SessionDB":
     return SessionDB(db_path=db_path, **kwargs)
 
 
+def open_owned_session_db_sibling(db) -> "SessionDB":
+    """Open an independently closable handle on *db*'s actual backend.
+
+    ``PgSessionDB.db_path`` is display-only. Passing it back to ``SessionDB``
+    explicitly forces SQLite and splits a delegated child from its Postgres
+    parent. AsyncSessionDB is unwrapped before dispatch because its generic
+    callable forwarding is asynchronous while child construction is sync.
+    """
+    if isinstance(db, AsyncSessionDB):
+        db = db._db
+    opener = getattr(db, "open_owned_sibling", None)
+    if callable(opener):
+        return opener()
+    raise TypeError(
+        f"Session DB backend {type(db).__name__} does not support owned sibling handles"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Live-DB test-isolation guard
 # ---------------------------------------------------------------------------
@@ -5473,6 +5491,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         that closes early still exits cleanly.
         """
         return self
+
+    def open_owned_sibling(self) -> "SessionDB":
+        """Return a separately owned handle to this SQLite database file."""
+        return SessionDB(db_path=self.db_path)
 
     def __exit__(self, exc_type, exc, tb) -> bool:
         """Close the handle, then let any exception propagate.
