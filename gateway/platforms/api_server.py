@@ -151,6 +151,7 @@ from gateway.platforms.base import (
 from agent.redact import redact_sensitive_text
 from agent.interrupt_compat import request_hard_interrupt
 from gateway.readiness import collect_runtime_readiness
+from gateway.platforms.api_server_executor import install_api_server_default_executor
 from gateway.browser_control_artifacts import (
     ArtifactError,
     ArtifactRateLimiter,
@@ -10452,6 +10453,14 @@ class APIServerAdapter(BasePlatformAdapter):
             return False
 
         try:
+            # Agent turns (run_in_executor(None, ...)) and asyncio.to_thread
+            # callers share the loop's default executor. asyncio sizes it from
+            # the CPU count (8 threads on a 4-vCPU task), which would cap live
+            # turns below max_concurrent_runs and queue auth/session-DB work
+            # behind them. Size it to the cap before the first request.
+            install_api_server_default_executor(
+                asyncio.get_running_loop(), self._max_concurrent_runs
+            )
             mws = [
                 mw
                 for mw in (

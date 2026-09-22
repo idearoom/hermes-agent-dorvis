@@ -21,6 +21,7 @@
     "tests/gateway/test_api_server.py",
     "tests/gateway/test_api_server_active_work_drain.py",
     "tests/gateway/test_api_server_drain.py",
+    "tests/gateway/test_api_server_executor.py",
     "tests/gateway/test_api_server_runs.py",
     "tests/gateway/test_async_delivery_capability.py",
     "tests/gateway/test_cron_active_work_drain.py",
